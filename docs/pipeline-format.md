@@ -35,7 +35,7 @@ Commands run from the directory where ForgeCI was invoked. The location selected
 
 A non-zero step stops the remaining steps in that job and marks it `FAILED`. Direct and transitive dependents become `BLOCKED`; independent jobs still run. Cancellation stops new admission, cancels active commands, waits for admitted workers, and marks affected jobs `CANCELED`. Final summaries remain in deterministic graph order.
 
-The process exits `0` for a successful pipeline, `1` for a pipeline with failed or blocked jobs, and `2` for invalid CLI usage, invalid configuration, graph compilation errors, or interruption.
+The process exits `0` for a successful pipeline, `1` for a pipeline with failed or blocked jobs, and `2` for invalid CLI usage (including an invalid `--jobs` limit), invalid configuration, graph compilation or process-start errors, or interruption.
 
 ## Security model
 

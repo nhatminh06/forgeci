@@ -22,6 +22,10 @@ Usage:
 
 Default pipeline file:
   forge.yaml
+
+Options:
+  --file <path>  pipeline YAML file (default forge.yaml)
+  --jobs <N>     maximum number of concurrently running jobs (default 1)
 `
 
 func Main(ctx context.Context, args []string, directory string, stdout, stderr io.Writer) int {
