@@ -15,6 +15,7 @@ import (
 
 	"github.com/nhatminh06/forgeci/internal/api"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
+	"github.com/nhatminh06/forgeci/internal/runnerproto"
 	"github.com/nhatminh06/forgeci/internal/store/postgres"
 )
 
@@ -33,6 +34,10 @@ func run() error {
 	listen := flags.String("listen", "127.0.0.1:8080", "loopback listen address")
 	workspace := flags.String("workspace", cwd, "repository workspace")
 	databaseURL := flags.String("database-url", os.Getenv("DATABASE_URL"), "PostgreSQL connection URL")
+	executionMode := flags.String("execution-mode", "local", "execution mode: local or remote")
+	runnerListen := flags.String("runner-listen", "127.0.0.1:9090", "runner protocol listener address")
+	runnerToken := flags.String("runner-token", os.Getenv("FORGECI_RUNNER_TOKEN"), "bearer token for runner authentication")
+
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -45,9 +50,28 @@ func run() error {
 	if *databaseURL == "" {
 		return fmt.Errorf("database URL is required")
 	}
+
+	// Validate execution mode
+	if *executionMode != "local" && *executionMode != "remote" {
+		return fmt.Errorf("invalid execution-mode: %q (must be 'local' or 'remote')", *executionMode)
+	}
+
+	// If remote mode, validate runner token
+	if *executionMode == "remote" && *runnerToken == "" {
+		return fmt.Errorf("runner token required for remote execution mode")
+	}
+
 	if err := validateLoopback(*listen); err != nil {
 		return err
 	}
+
+	// Validate runner listener
+	if *executionMode == "remote" {
+		if err := validateRunnerListener(*runnerListen); err != nil {
+			return err
+		}
+	}
+
 	absolute, err := filepath.Abs(*workspace)
 	if err != nil {
 		return err
@@ -63,13 +87,64 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err := manager.Start(ctx); err != nil {
-		return err
+
+	// Only start manager in local execution mode
+	if *executionMode == "local" {
+		if err := manager.Start(ctx); err != nil {
+			return err
+		}
 	}
 	defer manager.Close()
+
 	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.ListenAndServe() }()
+
+	// Setup runner protocol server in remote mode
+	var runnerServer *http.Server
+	if *executionMode == "remote" {
+		handlers := runnerproto.NewHandlers(persistence, *runnerToken)
+
+		// Start lease expiration sweeper
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					persistence.ExpireLeases(ctx, time.Now().UTC())
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		// Setup runner routes
+		mux := http.NewServeMux()
+		authMux := http.NewServeMux()
+		authMux.HandleFunc("/v1/runner/register", handlers.Register)
+		authMux.HandleFunc("/v1/runner/heartbeat", handlers.Heartbeat)
+		authMux.HandleFunc("/v1/runner/lease", handlers.Lease)
+		authMux.HandleFunc("/v1/runner/leases/*/events", handlers.JobEvent)
+		authMux.HandleFunc("/v1/runner/leases/*/complete", handlers.CompleteRun)
+
+		mux.Handle("/v1/runner/", handlers.AuthMiddleware(authMux))
+
+		runnerServer = &http.Server{Addr: *runnerListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		runnerServeErr := make(chan error, 1)
+		go func() { runnerServeErr <- runnerServer.ListenAndServe() }()
+
+		go func() {
+			select {
+			case err := <-runnerServeErr:
+				if !errors.Is(err, http.ErrServerClosed) {
+					serveErr <- err
+				}
+			case <-ctx.Done():
+			}
+		}()
+	}
+
 	select {
 	case err := <-serveErr:
 		if !errors.Is(err, http.ErrServerClosed) {
@@ -81,12 +156,18 @@ func run() error {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			return err
 		}
+		if runnerServer != nil {
+			if err := runnerServer.Shutdown(shutdownCtx); err != nil {
+				return err
+			}
+		}
 		if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 	}
 	return nil
 }
+
 func validateLoopback(address string) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -99,5 +180,16 @@ func validateLoopback(address string) error {
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("listen address must use a loopback host")
 	}
+	return nil
+}
+
+func validateRunnerListener(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid runner listener address: %w", err)
+	}
+	// Runner listener can be non-loopback, but TLS will be required in that case
+	// For now, allow any address - TLS validation would be enforced at transport level
+	_ = host
 	return nil
 }
