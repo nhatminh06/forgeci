@@ -1,0 +1,163 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/nhatminh06/forgeci/internal/controlplane"
+	"github.com/nhatminh06/forgeci/internal/store"
+)
+
+const maxBody = 1 << 20
+
+type Manager interface {
+	Ping(context.Context) error
+	Submit(context.Context, string, int) (*store.Run, error)
+	List(context.Context, int) ([]store.Run, error)
+	Get(context.Context, string) (*store.Run, error)
+	Cancel(context.Context, string) (store.RunStatus, error)
+}
+
+type Server struct{ Manager Manager }
+
+func (s Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
+
+func (s Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
+		s.health(w, r)
+	case r.URL.Path == "/v1/runs" && r.Method == http.MethodPost:
+		s.create(w, r)
+	case r.URL.Path == "/v1/runs" && r.Method == http.MethodGet:
+		s.list(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/runs/"):
+		s.run(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+func (s Server) health(w http.ResponseWriter, r *http.Request) {
+	if err := s.Manager.Ping(r.Context()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type createRequest struct {
+	PipelineFile string `json:"pipeline_file"`
+	MaxParallel  int    `json:"max_parallel"`
+}
+
+func (s Server) create(w http.ResponseWriter, r *http.Request) {
+	var req createRequest
+	if err := decodeStrict(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	run, err := s.Manager.Submit(r.Context(), req.PipelineFile, req.MaxParallel)
+	if err != nil {
+		var inputError controlplane.InputError
+		if errors.As(err, &inputError) {
+			writeError(w, http.StatusBadRequest, err.Error())
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		}
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"id": run.ID, "status": run.Status})
+}
+func (s Server) list(w http.ResponseWriter, r *http.Request) {
+	if len(r.URL.Query()) > 1 || r.URL.Query().Get("limit") == "" && r.URL.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "invalid query parameters")
+		return
+	}
+	limit := 20
+	if value := r.URL.Query().Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 100 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 100")
+			return
+		}
+		limit = parsed
+	}
+	runs, err := s.Manager.List(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+func (s Server) run(w http.ResponseWriter, r *http.Request) {
+	suffix := strings.TrimPrefix(r.URL.Path, "/v1/runs/")
+	cancel := strings.HasSuffix(suffix, "/cancel")
+	id := strings.TrimSuffix(suffix, "/cancel")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if cancel && r.Method == http.MethodPost {
+		status, err := s.Manager.Cancel(r.Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if errors.Is(err, store.ErrConflict) {
+			writeError(w, http.StatusConflict, fmt.Sprintf("run %s is already terminal", id))
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "database unavailable")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "status": status})
+		return
+	}
+	if !cancel && r.Method == http.MethodGet {
+		run, err := s.Manager.Get(r.Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "database unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, run)
+		return
+	}
+	writeError(w, http.StatusNotFound, "not found")
+}
+func decodeStrict(w http.ResponseWriter, r *http.Request, target any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("request must contain exactly one JSON value")
+	}
+	return nil
+}
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}

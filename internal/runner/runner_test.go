@@ -45,6 +45,26 @@ func TestRunSuccessAndMultipleSteps(t *testing.T) {
 	}
 }
 
+type recordingObserver struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (o *recordingObserver) OnJobState(name string, oldState, newState State) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, fmt.Sprintf("%s:%s>%s", name, oldState, newState))
+}
+
+func TestRunPublishesLiveJobTransitions(t *testing.T) {
+	observer := &recordingObserver{}
+	graph := graphFor(t, map[string]config.Job{"test": {Steps: []config.Step{{Run: "true"}}}})
+	result := (Runner{Executor: executor.Local{Directory: t.TempDir()}, Observer: observer}).Run(context.Background(), graph)
+	if !result.Succeeded() || !reflect.DeepEqual(observer.events, []string{"test:PENDING>RUNNING", "test:RUNNING>PASSED"}) {
+		t.Fatalf("result=%+v events=%v", result, observer.events)
+	}
+}
+
 func TestRunFailureBlocksDependentsAndContinuesIndependentJobs(t *testing.T) {
 	dir := t.TempDir()
 	var output bytes.Buffer

@@ -30,6 +30,10 @@ type JobExecutor interface {
 	RunJob(context.Context, string, config.Job, io.Writer, io.Writer) executor.Result
 }
 
+type JobStateObserver interface {
+	OnJobState(string, State, State)
+}
+
 type Result struct {
 	States        map[string]State
 	Interrupted   bool
@@ -53,6 +57,7 @@ type Runner struct {
 	Output      io.Writer
 	ErrorOutput io.Writer
 	MaxParallel int
+	Observer    JobStateObserver
 }
 
 type completion struct {
@@ -85,6 +90,7 @@ func (r Runner) Run(ctx context.Context, graph *pipeline.Graph) Result {
 			for _, name := range graph.Order {
 				if result.States[name] == Pending && hasFailedDependency(graph, result.States, name) {
 					result.States[name] = Blocked
+					r.observe(name, Pending, Blocked)
 					terminal++
 					fmt.Fprintf(output.stdout, "[%s] blocked by failed dependency\n\n", name)
 				}
@@ -95,6 +101,7 @@ func (r Runner) Run(ctx context.Context, graph *pipeline.Graph) Result {
 					break
 				}
 				result.States[name] = Running
+				r.observe(name, Pending, Running)
 				active++
 				fmt.Fprintf(output.stdout, "[%s]\n", name)
 				go func(name string) {
@@ -109,6 +116,7 @@ func (r Runner) Run(ctx context.Context, graph *pipeline.Graph) Result {
 				for _, name := range graph.Order {
 					if result.States[name] == Pending {
 						result.States[name] = Canceled
+						r.observe(name, Pending, Canceled)
 						terminal++
 					}
 				}
@@ -120,6 +128,7 @@ func (r Runner) Run(ctx context.Context, graph *pipeline.Graph) Result {
 			for _, name := range graph.Order {
 				if result.States[name] == Pending {
 					result.States[name] = Failed
+					r.observe(name, Pending, Failed)
 					terminal++
 				}
 			}
@@ -136,12 +145,20 @@ func (r Runner) Run(ctx context.Context, graph *pipeline.Graph) Result {
 				continue
 			}
 		}
+		oldState := result.States[completed.name]
 		result.States[completed.name] = completed.state
+		r.observe(completed.name, oldState, completed.state)
 		result.InternalError = result.InternalError || completed.internalError
 		active--
 		terminal++
 	}
 	return result
+}
+
+func (r Runner) observe(name string, oldState, newState State) {
+	if r.Observer != nil {
+		r.Observer.OnJobState(name, oldState, newState)
+	}
 }
 
 func nextReadyJob(graph *pipeline.Graph, states map[string]State) string {

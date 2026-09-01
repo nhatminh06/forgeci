@@ -3,10 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	controlclient "github.com/nhatminh06/forgeci/internal/client"
 )
 
 func TestMainExitCodes(t *testing.T) {
@@ -35,6 +39,49 @@ func TestMainExitCodes(t *testing.T) {
 		})
 	}
 }
+
+func TestControlPlaneCommands(t *testing.T) {
+	original := newControlClient
+	t.Cleanup(func() { newControlClient = original })
+	newControlClient = func(base string) *controlclient.Client {
+		return &controlclient.Client{BaseURL: base, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			status, body := http.StatusOK, ""
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+				status, body = http.StatusAccepted, `{"id":"00000000-0000-4000-8000-000000000001","status":"QUEUED"}`
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/runs":
+				body = `{"runs":[{"id":"00000000-0000-4000-8000-000000000001","status":"PASSED","created_at":"2026-01-01T00:00:00Z"}]}`
+			case r.Method == http.MethodGet:
+				body = `{"id":"00000000-0000-4000-8000-000000000001","status":"RUNNING","pipeline_file":"forge.yaml","created_at":"2026-01-01T00:00:00Z","jobs":[{"name":"test","status":"RUNNING","image":null}]}`
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel"):
+				status, body = http.StatusAccepted, `{"status":"RUNNING"}`
+			}
+			return &http.Response{StatusCode: status, Status: http.StatusText(status), Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		})}}
+	}
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"submit", []string{"submit", "--server", "http://server"}, "queued"},
+		{"runs", []string{"runs", "--server", "http://server", "--limit", "10"}, "PASSED"},
+		{"inspect", []string{"inspect", "00000000-0000-4000-8000-000000000001", "--server", "http://server"}, "test\tRUNNING"},
+		{"cancel", []string{"cancel", "00000000-0000-4000-8000-000000000001", "--server", "http://server"}, "Cancellation requested"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			if code := Main(context.Background(), tc.args, t.TempDir(), &output, &output); code != 0 || !strings.Contains(output.String(), tc.want) {
+				t.Fatalf("code=%d output=%q", code, output.String())
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestHelp(t *testing.T) {
 	var output bytes.Buffer
