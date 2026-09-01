@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 var jobNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -29,6 +30,14 @@ func Validate(cfg *Pipeline) error {
 		}
 		if len(job.Steps) == 0 {
 			return fmt.Errorf("job %q must contain at least one step", name)
+		}
+		if job.Image != nil {
+			image := *job.Image
+			if image == "" || strings.TrimSpace(image) != image || strings.IndexFunc(image, func(r rune) bool {
+				return unicode.IsSpace(r) || unicode.IsControl(r)
+			}) >= 0 {
+				return fmt.Errorf("job %q image must be a non-empty reference without whitespace or control characters", name)
+			}
 		}
 		for i, step := range job.Steps {
 			if strings.TrimSpace(step.Run) == "" {

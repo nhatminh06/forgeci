@@ -1,0 +1,8 @@
+version: 1
+
+jobs:
+  alpine:
+    image: alpine:3.22
+    steps:
+      - run: echo "running inside Docker"
+      - run: test "$(pwd)" = /workspace

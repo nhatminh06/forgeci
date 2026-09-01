@@ -2,7 +2,7 @@
 
 ForgeCI is a self-hosted CI/CD platform built from first principles to explore how pipeline engines, schedulers, runners, build systems, artifact stores, software-supply-chain controls, and deployment systems work internally.
 
-Milestone 2 implements a bounded parallel local scheduler. ForgeCI reads a repository-owned YAML file, validates it, compiles dependencies into a directed acyclic graph (DAG), and runs ready jobs on the current machine. Execution remains local; job concurrency is selected at runtime.
+Milestone 3 adds per-job Docker execution to the bounded parallel scheduler. Jobs without an `image` remain local; jobs with an `image` run all their steps sequentially in one container.
 
 ## Current capabilities
 
@@ -12,12 +12,15 @@ Milestone 2 implements a bounded parallel local scheduler. ForgeCI reads a repos
 - Deterministic admission and completion-driven scheduling
 - Cancellation with live, race-safe stdout and stderr
 - Failed-job propagation while independent jobs continue
+- Optional Docker jobs through the official Moby Go SDK
+- One container per Docker job with live, demultiplexed output
+- Repository workspace mounting and reliable container cleanup
 - Stable summaries and process exit codes
 
 ## Architecture
 
 ```text
-forge.yaml → parser → validation → DAG compiler → bounded scheduler → local executors
+forge.yaml → parser → validation → DAG compiler → bounded scheduler → local or Docker job executor
 ```
 
 Parsing, graph compilation, runtime state, and command execution are separate so commands never need to reinterpret raw YAML. See [docs/architecture.md](docs/architecture.md) for the component boundaries.
@@ -35,6 +38,7 @@ jobs:
   test:
     needs:
       - build
+    image: golang:1.27
     steps:
       - run: go test ./...
 ```
@@ -43,7 +47,7 @@ The complete schema is documented in [docs/pipeline-format.md](docs/pipeline-for
 
 ## Quick start
 
-Go 1.27 or newer is required.
+Go 1.27 or newer is required. Docker jobs additionally require a reachable Docker Engine; ForgeCI honors the standard Docker client environment variables and negotiates the daemon API version.
 
 ```bash
 go build -o build/forge ./cmd/forge
@@ -73,16 +77,16 @@ Exit code `0` means success, `1` means at least one job failed or was blocked, a
 
 `--jobs` must be greater than zero and defaults to `1`, preserving sequential Milestone 1 behavior.
 
-## What Milestone 2 demonstrates
+## What Milestone 3 demonstrates
 
-This milestone demonstrates the mechanics of a bounded scheduler: one owner for runtime state, deterministic ready-job admission, worker completion events, dependency gating, failure propagation, cancellation, and race-safe live output. Steps inside each job remain sequential. The example pipeline lets ForgeCI locally execute ForgeCI's own checks and build; this is preparation, not full self-hosting.
+This milestone preserves the scheduler's single runtime-state owner while routing each admitted job to one environment. A Docker job inspects or pulls its image, creates and starts one labeled container, runs every step with `/bin/sh -c` in `/workspace`, and force-removes the container on success, failure, internal error, or cancellation.
 
 ## Current limitations and security model
 
-ForgeCI assumes a trusted local repository, pipeline definition, and execution environment. Commands run with the privileges of the user invoking ForgeCI. There is no sandbox, container isolation, secret isolation, multi-tenant isolation, or remote execution isolation.
+ForgeCI assumes a trusted local repository, pipeline definition, and execution environment. Local commands run with the invoking user's privileges. Docker execution adds process/filesystem isolation but bind-mounts the repository read-write, and access to the Docker daemon is itself privileged. It is not a sandbox for hostile repositories.
 
-Milestone 2 has no process isolation, remote workers, persistent database, artifacts, cache, SCM-trigger integration, deployment system, web UI, or authentication. It is not yet a production-safe runner.
+ForgeCI has no secret isolation, multi-tenant isolation, remote workers, persistent database, artifacts, cache, SCM-trigger integration, deployment system, web UI, or authentication. It is not yet a production-safe runner.
 
 ## Roadmap
 
-The next logical milestone is a Docker job executor that adds per-job container isolation while preserving the scheduler and DAG semantics. Remote runners and distributed systems remain intentionally deferred.
+Remote runners and distributed systems remain intentionally deferred.
