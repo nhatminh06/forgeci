@@ -5,9 +5,14 @@ jobs:
     steps:
       - run: test -z "$(gofmt -l .)"
 
+  vet:
+    steps:
+      - run: go vet ./...
+
   test:
     needs:
       - format
+      - vet
     steps:
       - run: go test ./...
 
