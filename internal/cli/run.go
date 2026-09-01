@@ -8,10 +8,10 @@ import (
 	"io"
 	"os"
 
-	"github.com/forgeci/forgeci/internal/config"
-	"github.com/forgeci/forgeci/internal/executor"
-	"github.com/forgeci/forgeci/internal/pipeline"
-	"github.com/forgeci/forgeci/internal/runner"
+	"github.com/nhatminh06/forgeci/internal/config"
+	"github.com/nhatminh06/forgeci/internal/executor"
+	"github.com/nhatminh06/forgeci/internal/pipeline"
+	"github.com/nhatminh06/forgeci/internal/runner"
 )
 
 const helpText = `ForgeCI executes repository-local pipelines.
@@ -84,6 +84,10 @@ func run(ctx context.Context, args []string, directory string, stdout, stderr io
 	runner.PrintSummary(stdout, graph, result)
 	if result.Interrupted {
 		fmt.Fprintln(stderr, "pipeline interrupted")
+		return 2
+	}
+	if result.InternalError {
+		fmt.Fprintln(stderr, "pipeline execution could not start")
 		return 2
 	}
 	if !result.Succeeded() {

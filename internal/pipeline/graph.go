@@ -1,6 +1,6 @@
 package pipeline
 
-import "github.com/forgeci/forgeci/internal/config"
+import "github.com/nhatminh06/forgeci/internal/config"
 
 type Node struct {
 	Name       string

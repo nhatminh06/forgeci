@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/forgeci/forgeci/internal/executor"
-	"github.com/forgeci/forgeci/internal/pipeline"
+	"github.com/nhatminh06/forgeci/internal/executor"
+	"github.com/nhatminh06/forgeci/internal/pipeline"
 )
 
 type State string
@@ -24,12 +24,16 @@ type CommandExecutor interface {
 }
 
 type Result struct {
-	States      map[string]State
-	Interrupted bool
+	States        map[string]State
+	Interrupted   bool
+	InternalError bool
 }
 
 func (r Result) Succeeded() bool {
 	if r.Interrupted {
+		return false
+	}
+	if r.InternalError {
 		return false
 	}
 	for _, state := range r.States {
@@ -82,6 +86,7 @@ func (r Runner) Run(ctx context.Context, graph *pipeline.Graph) Result {
 				} else if execution.ExitCode >= 0 {
 					fmt.Fprintf(r.Output, "x %s (exit %d)\n\n", name, execution.ExitCode)
 				} else {
+					result.InternalError = true
 					fmt.Fprintf(r.Output, "x %s (%v)\n\n", name, execution.Err)
 				}
 				break

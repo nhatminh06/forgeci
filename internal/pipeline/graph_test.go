@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/forgeci/forgeci/internal/config"
+	"github.com/nhatminh06/forgeci/internal/config"
 )
 
 func job(needs ...string) config.Job {

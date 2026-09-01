@@ -1,4 +1,4 @@
-module github.com/forgeci/forgeci
+module github.com/nhatminh06/forgeci
 
 go 1.27
 

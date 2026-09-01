@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/forgeci/forgeci/internal/cli"
+	"github.com/nhatminh06/forgeci/internal/cli"
 )
 
 func main() {

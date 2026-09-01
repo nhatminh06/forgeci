@@ -74,9 +74,12 @@ func TestLoadInvalidPipelines(t *testing.T) {
 		{"self dependency", "version: 1\njobs:\n  test:\n    needs: [test]\n    steps: [{run: ok}]\n", "cannot depend on itself"},
 		{"duplicate dependency", "version: 1\njobs:\n  a:\n    steps: [{run: ok}]\n  b:\n    needs: [a, a]\n    steps: [{run: ok}]\n", "duplicate dependency"},
 		{"unknown field", "version: 1\njobs:\n  test:\n    magic-option: true\n    steps: [{run: ok}]\n", "field magic-option not found"},
+		{"unknown top-level field", "version: 1\nunknown: true\njobs:\n  test:\n    steps: [{run: ok}]\n", "field unknown not found"},
+		{"unknown image field", "version: 1\njobs:\n  test:\n    image: golang\n    steps: [{run: ok}]\n", "field image not found"},
 		{"malformed needs", "version: 1\njobs:\n  test:\n    needs: build\n    steps: [{run: ok}]\n", "cannot unmarshal"},
 		{"malformed steps", "version: 1\njobs:\n  test:\n    steps: nope\n", "cannot unmarshal"},
 		{"unknown step field", "version: 1\njobs:\n  test:\n    steps: [{run: ok, uses: thing}]\n", "field uses not found"},
+		{"unknown shell field", "version: 1\njobs:\n  test:\n    steps: [{run: ok, shell: bash}]\n", "field shell not found"},
 		{"multiple documents", "version: 1\njobs:\n  a:\n    steps: [{run: ok}]\n---\nversion: 1\n", "multiple YAML documents"},
 	}
 	for _, tc := range tests {
@@ -84,6 +87,29 @@ func TestLoadInvalidPipelines(t *testing.T) {
 			_, err := Load(writePipeline(t, tc.body))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Load() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestJobNamePolicy(t *testing.T) {
+	accepted := []string{"build", "test-1", "lint_job", "A", "0build"}
+	for _, name := range accepted {
+		t.Run("accept "+name, func(t *testing.T) {
+			cfg := &Pipeline{Version: 1, Jobs: map[string]Job{name: {Steps: []Step{{Run: "true"}}}}}
+			if err := Validate(cfg); err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
+	}
+
+	rejected := []string{"", " leading", "trailing ", "contains space", "build/test", `build\test`, "build:test", "build;rm", "new\nline", "has\ttab", "control\x01byte"}
+	for _, name := range rejected {
+		t.Run("reject "+name, func(t *testing.T) {
+			cfg := &Pipeline{Version: 1, Jobs: map[string]Job{name: {Steps: []Step{{Run: "true"}}}}}
+			err := Validate(cfg)
+			if err == nil || !strings.Contains(err.Error(), "invalid job name") {
+				t.Fatalf("Validate() error = %v, want invalid job name", err)
 			}
 		})
 	}

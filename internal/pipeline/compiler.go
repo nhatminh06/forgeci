@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/forgeci/forgeci/internal/config"
+	"github.com/nhatminh06/forgeci/internal/config"
 )
 
 func Compile(cfg *config.Pipeline) (*Graph, error) {
