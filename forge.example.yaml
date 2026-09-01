@@ -1,0 +1,18 @@
+version: 1
+
+jobs:
+  format:
+    steps:
+      - run: test -z "$(gofmt -l .)"
+
+  test:
+    needs:
+      - format
+    steps:
+      - run: go test ./...
+
+  build:
+    needs:
+      - test
+    steps:
+      - run: go build -o build/forge ./cmd/forge
