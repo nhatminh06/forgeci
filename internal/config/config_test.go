@@ -75,7 +75,17 @@ func TestLoadInvalidPipelines(t *testing.T) {
 		{"duplicate dependency", "version: 1\njobs:\n  a:\n    steps: [{run: ok}]\n  b:\n    needs: [a, a]\n    steps: [{run: ok}]\n", "duplicate dependency"},
 		{"unknown field", "version: 1\njobs:\n  test:\n    magic-option: true\n    steps: [{run: ok}]\n", "field magic-option not found"},
 		{"unknown top-level field", "version: 1\nunknown: true\njobs:\n  test:\n    steps: [{run: ok}]\n", "field unknown not found"},
-		{"unknown image field", "version: 1\njobs:\n  test:\n    image: golang\n    steps: [{run: ok}]\n", "field image not found"},
+		{"empty image", "version: 1\njobs:\n  test:\n    image: ''\n    steps: [{run: ok}]\n", "image must be"},
+		{"whitespace image", "version: 1\njobs:\n  test:\n    image: ' '\n    steps: [{run: ok}]\n", "image must be"},
+		{"leading image whitespace", "version: 1\njobs:\n  test:\n    image: ' alpine:3.22'\n    steps: [{run: ok}]\n", "image must be"},
+		{"trailing image whitespace", "version: 1\njobs:\n  test:\n    image: 'alpine:3.22 '\n    steps: [{run: ok}]\n", "image must be"},
+		{"embedded image space", "version: 1\njobs:\n  test:\n    image: 'alpine :3.22'\n    steps: [{run: ok}]\n", "image must be"},
+		{"image tab", "version: 1\njobs:\n  test:\n    image: \"alpine\\t:3.22\"\n    steps: [{run: ok}]\n", "image must be"},
+		{"image CR", "version: 1\njobs:\n  test:\n    image: \"alpine\\r:3.22\"\n    steps: [{run: ok}]\n", "image must be"},
+		{"image LF", "version: 1\njobs:\n  test:\n    image: \"alpine\\n:3.22\"\n    steps: [{run: ok}]\n", "image must be"},
+		{"image NUL", "version: 1\njobs:\n  test:\n    image: \"alpine\\0:3.22\"\n    steps: [{run: ok}]\n", "image must be"},
+		{"image control", "version: 1\njobs:\n  test:\n    image: \"alpine\\x01:3.22\"\n    steps: [{run: ok}]\n", "image must be"},
+		{"wrong image type", "version: 1\njobs:\n  test:\n    image: [alpine]\n    steps: [{run: ok}]\n", "cannot unmarshal"},
 		{"malformed needs", "version: 1\njobs:\n  test:\n    needs: build\n    steps: [{run: ok}]\n", "cannot unmarshal"},
 		{"malformed steps", "version: 1\njobs:\n  test:\n    steps: nope\n", "cannot unmarshal"},
 		{"unknown step field", "version: 1\njobs:\n  test:\n    steps: [{run: ok, uses: thing}]\n", "field uses not found"},
@@ -87,6 +97,21 @@ func TestLoadInvalidPipelines(t *testing.T) {
 			_, err := Load(writePipeline(t, tc.body))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Load() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadImageReferences(t *testing.T) {
+	images := []string{"alpine:3.22", "golang:1.27", "registry.example.com/team/image:v1", "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	for _, image := range images {
+		t.Run(image, func(t *testing.T) {
+			cfg, err := Load(writePipeline(t, "version: 1\njobs:\n  test:\n    image: "+image+"\n    steps: [{run: true}]\n"))
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Jobs["test"].Image == nil || *cfg.Jobs["test"].Image != image {
+				t.Fatalf("image = %#v, want %q", cfg.Jobs["test"].Image, image)
 			}
 		})
 	}

@@ -7,6 +7,7 @@ type Pipeline struct {
 
 type Job struct {
 	Needs []string `yaml:"needs,omitempty"`
+	Image *string  `yaml:"image,omitempty"`
 	Steps []Step   `yaml:"steps"`
 }
 
