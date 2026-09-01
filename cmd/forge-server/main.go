@@ -119,16 +119,12 @@ func run() error {
 			}
 		}()
 
-		// Setup runner routes
+		// Setup runner routes with auth
 		mux := http.NewServeMux()
-		authMux := http.NewServeMux()
-		authMux.HandleFunc("/v1/runner/register", handlers.Register)
-		authMux.HandleFunc("/v1/runner/heartbeat", handlers.Heartbeat)
-		authMux.HandleFunc("/v1/runner/lease", handlers.Lease)
-		authMux.HandleFunc("/v1/runner/leases/*/events", handlers.JobEvent)
-		authMux.HandleFunc("/v1/runner/leases/*/complete", handlers.CompleteRun)
-
-		mux.Handle("/v1/runner/", handlers.AuthMiddleware(authMux))
+		mux.HandleFunc("/v1/runner/register", handlers.AuthMiddleware(http.HandlerFunc(handlers.Register)).ServeHTTP)
+		mux.HandleFunc("/v1/runner/heartbeat", handlers.AuthMiddleware(http.HandlerFunc(handlers.Heartbeat)).ServeHTTP)
+		mux.HandleFunc("/v1/runner/lease", handlers.AuthMiddleware(http.HandlerFunc(handlers.Lease)).ServeHTTP)
+		mux.HandleFunc("/v1/runner/leases/", handlers.AuthMiddleware(http.HandlerFunc(handlers.HandleLeaseRoute)).ServeHTTP)
 
 		runnerServer = &http.Server{Addr: *runnerListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		runnerServeErr := make(chan error, 1)

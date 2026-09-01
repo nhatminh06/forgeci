@@ -458,3 +458,24 @@ func (h *Handlers) CompleteRun(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 }
+
+// Handle dynamic lease routes
+func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if pathContains(path, "/events") {
+		h.JobEvent(w, r)
+	} else if pathContains(path, "/complete") {
+		h.CompleteRun(w, r)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func pathContains(path, substr string) bool {
+	for i := 0; i < len(path)-len(substr)+1; i++ {
+		if path[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
