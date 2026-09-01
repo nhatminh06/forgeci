@@ -96,7 +96,7 @@ func run() error {
 	}
 	defer manager.Close()
 
-	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager}).Handler(), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager, Store: persistence}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.ListenAndServe() }()
 

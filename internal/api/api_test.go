@@ -21,6 +21,16 @@ type fakeManager struct {
 	pingErr    error
 }
 
+type fakeStore struct {
+	runners []store.Runner
+	pingErr error
+}
+
+func (s *fakeStore) Ping(ctx context.Context) error  { return s.pingErr }
+func (s *fakeStore) ListRunners(context.Context) ([]store.Runner, error) {
+	return s.runners, nil
+}
+
 func (m *fakeManager) Ping(context.Context) error { return m.pingErr }
 func (m *fakeManager) Submit(_ context.Context, file string, jobs int) (*store.Run, error) {
 	m.submitFile = file
@@ -102,5 +112,27 @@ func TestHealthReflectsDatabase(t *testing.T) {
 	manager.pingErr = errors.New("database down")
 	if got := request(t, handler, http.MethodGet, "/healthz", "").Code; got != http.StatusServiceUnavailable {
 		t.Fatal(got)
+	}
+}
+
+func TestRunnersList(t *testing.T) {
+	store := &fakeStore{
+		runners: []store.Runner{
+			{ID: "001", Name: "runner-1", Status: "ONLINE", OS: "linux", Arch: "amd64", DockerAvailable: true, MaxParallel: 2},
+			{ID: "002", Name: "runner-2", Status: "OFFLINE", OS: "linux", Arch: "arm64", DockerAvailable: false, MaxParallel: 1},
+		},
+	}
+	handler := (Server{Manager: &fakeManager{}, Store: store}).Handler()
+	response := request(t, handler, http.MethodGet, "/v1/runners", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	runners, ok := payload["runners"].([]any)
+	if !ok || len(runners) != 2 {
+		t.Fatalf("runners=%+v", payload)
 	}
 }

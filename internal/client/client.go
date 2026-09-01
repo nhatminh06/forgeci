@@ -70,6 +70,13 @@ func (c *Client) Runs(ctx context.Context, limit int) ([]store.Run, error) {
 	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/runs?limit=%d", limit), nil, &out)
 	return out.Runs, err
 }
+func (c *Client) Runners(ctx context.Context) ([]store.Runner, error) {
+	var out struct {
+		Runners []store.Runner `json:"runners"`
+	}
+	err := c.do(ctx, http.MethodGet, "/v1/runners", nil, &out)
+	return out.Runners, err
+}
 func (c *Client) Inspect(ctx context.Context, id string) (*store.Run, error) {
 	var out store.Run
 	err := c.do(ctx, http.MethodGet, "/v1/runs/"+id, nil, &out)
