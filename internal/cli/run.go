@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
+	controlclient "github.com/nhatminh06/forgeci/internal/client"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -18,6 +20,10 @@ const helpText = `ForgeCI executes repository-local pipelines.
 
 Usage:
   forge run [--file <path>] [--jobs <N>]
+  forge submit [--server <url>] [--file <path>] [--jobs <N>]
+  forge runs [--server <url>] [--limit <N>]
+  forge inspect <run-id> [--server <url>]
+  forge cancel <run-id> [--server <url>]
   forge --help
 
 Default pipeline file:
@@ -37,11 +43,118 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		fmt.Fprint(stdout, helpText)
 		return 0
 	}
-	if args[0] != "run" {
+	switch args[0] {
+	case "run":
+		return run(ctx, args[1:], directory, stdout, stderr)
+	case "submit":
+		return submit(ctx, args[1:], stdout, stderr)
+	case "runs":
+		return runs(ctx, args[1:], stdout, stderr)
+	case "inspect":
+		return inspect(ctx, args[1:], stdout, stderr)
+	case "cancel":
+		return cancelRun(ctx, args[1:], stdout, stderr)
+	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], helpText)
 		return 2
 	}
-	return run(ctx, args[1:], directory, stdout, stderr)
+}
+
+const defaultServer = "http://127.0.0.1:8080"
+
+func submit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("submit", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", defaultServer, "control-plane URL")
+	file := flags.String("file", "forge.yaml", "pipeline file relative to server workspace")
+	jobs := flags.Int("jobs", 1, "maximum concurrent jobs")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *jobs < 1 {
+		fmt.Fprintln(stderr, "invalid submit arguments")
+		return 2
+	}
+	id, err := controlclient.New(*server).Submit(ctx, *file, *jobs)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	fmt.Fprintf(stdout, "Run %s queued\n", id)
+	return 0
+}
+func runs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("runs", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", defaultServer, "control-plane URL")
+	limit := flags.Int("limit", 20, "maximum runs")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *limit < 1 || *limit > 100 {
+		fmt.Fprintln(stderr, "limit must be between 1 and 100")
+		return 2
+	}
+	items, err := controlclient.New(*server).Runs(ctx, *limit)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	fmt.Fprintln(stdout, "ID\tSTATUS\tCREATED")
+	for _, item := range items {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\n", item.ID, item.Status, item.CreatedAt.Format(time.RFC3339))
+	}
+	return 0
+}
+func inspect(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "inspect requires one run ID")
+		return 2
+	}
+	id := args[0]
+	flags := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", defaultServer, "control-plane URL")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+		return 2
+	}
+	item, err := controlclient.New(*server).Inspect(ctx, id)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	fmt.Fprintf(stdout, "Run\nID: %s\nStatus: %s\nPipeline: %s\nCreated: %s\n", item.ID, item.Status, item.PipelineFile, item.CreatedAt.Format(time.RFC3339))
+	if item.StartedAt != nil {
+		fmt.Fprintf(stdout, "Started: %s\n", item.StartedAt.Format(time.RFC3339))
+	}
+	if item.FinishedAt != nil {
+		fmt.Fprintf(stdout, "Finished: %s\n", item.FinishedAt.Format(time.RFC3339))
+	}
+	fmt.Fprintln(stdout, "\nJobs\nNAME\tSTATUS")
+	for _, job := range item.Jobs {
+		fmt.Fprintf(stdout, "%s\t%s\n", job.Name, job.Status)
+	}
+	return 0
+}
+
+func cancelRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "cancel requires one run ID")
+		return 2
+	}
+	id := args[0]
+	flags := flag.NewFlagSet("cancel", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", defaultServer, "control-plane URL")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+		return 2
+	}
+	if err := controlclient.New(*server).Cancel(ctx, id); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	fmt.Fprintf(stdout, "Cancellation requested for %s\n", id)
+	return 0
 }
 
 func run(ctx context.Context, args []string, directory string, stdout, stderr io.Writer) int {
