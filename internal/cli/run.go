@@ -62,6 +62,8 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 
 const defaultServer = "http://127.0.0.1:8080"
 
+var newControlClient = controlclient.New
+
 func submit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("submit", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -75,7 +77,7 @@ func submit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "invalid submit arguments")
 		return 2
 	}
-	id, err := controlclient.New(*server).Submit(ctx, *file, *jobs)
+	id, err := newControlClient(*server).Submit(ctx, *file, *jobs)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -95,7 +97,7 @@ func runs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "limit must be between 1 and 100")
 		return 2
 	}
-	items, err := controlclient.New(*server).Runs(ctx, *limit)
+	items, err := newControlClient(*server).Runs(ctx, *limit)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -118,7 +120,7 @@ func inspect(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
 		return 2
 	}
-	item, err := controlclient.New(*server).Inspect(ctx, id)
+	item, err := newControlClient(*server).Inspect(ctx, id)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -149,7 +151,7 @@ func cancelRun(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
 		return 2
 	}
-	if err := controlclient.New(*server).Cancel(ctx, id); err != nil {
+	if err := newControlClient(*server).Cancel(ctx, id); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
