@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -100,7 +101,19 @@ const runColumns = `id::text,status,pipeline_file,pipeline_yaml,pipeline_sha256,
 func scanRun(row pgx.Row) (*store.Run, error) {
 	r := &store.Run{}
 	err := row.Scan(&r.ID, &r.Status, &r.PipelineFile, &r.PipelineYAML, &r.PipelineSHA256, &r.Workspace, &r.MaxParallel, &r.CreatedAt, &r.StartedAt, &r.FinishedAt, &r.CancelRequestedAt, &r.ErrorMessage)
+	r.CreatedAt = r.CreatedAt.UTC()
+	r.StartedAt = utcTime(r.StartedAt)
+	r.FinishedAt = utcTime(r.FinishedAt)
+	r.CancelRequestedAt = utcTime(r.CancelRequestedAt)
 	return r, err
+}
+
+func utcTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	utc := value.UTC()
+	return &utc
 }
 
 func (s *Store) GetRun(ctx context.Context, id string) (*store.Run, error) {
@@ -121,6 +134,8 @@ func (s *Store) GetRun(ctx context.Context, id string) (*store.Run, error) {
 		if err := rows.Scan(&j.Name, &j.Status, &j.Image, &j.StartedAt, &j.FinishedAt, &j.ErrorMessage); err != nil {
 			return nil, err
 		}
+		j.StartedAt = utcTime(j.StartedAt)
+		j.FinishedAt = utcTime(j.FinishedAt)
 		r.Jobs = append(r.Jobs, j)
 	}
 	return r, rows.Err()
