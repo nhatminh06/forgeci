@@ -15,15 +15,13 @@ type Result struct {
 
 type Local struct {
 	Directory string
-	Stdout    io.Writer
-	Stderr    io.Writer
 }
 
-func (l Local) Run(ctx context.Context, command string) Result {
+func (l Local) Run(ctx context.Context, command string, stdout, stderr io.Writer) Result {
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	cmd.Dir = l.Directory
-	cmd.Stdout = l.Stdout
-	cmd.Stderr = l.Stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err := cmd.Run()
 	if err == nil {
 		return Result{ExitCode: 0}

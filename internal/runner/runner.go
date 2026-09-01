@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -12,15 +13,16 @@ import (
 type State string
 
 const (
-	Pending State = "PENDING"
-	Running State = "RUNNING"
-	Passed  State = "PASSED"
-	Failed  State = "FAILED"
-	Blocked State = "BLOCKED"
+	Pending  State = "PENDING"
+	Running  State = "RUNNING"
+	Passed   State = "PASSED"
+	Failed   State = "FAILED"
+	Blocked  State = "BLOCKED"
+	Canceled State = "CANCELED"
 )
 
 type CommandExecutor interface {
-	Run(context.Context, string) executor.Result
+	Run(context.Context, string, io.Writer, io.Writer) executor.Result
 }
 
 type Result struct {
@@ -30,10 +32,7 @@ type Result struct {
 }
 
 func (r Result) Succeeded() bool {
-	if r.Interrupted {
-		return false
-	}
-	if r.InternalError {
+	if r.Interrupted || r.InternalError {
 		return false
 	}
 	for _, state := range r.States {
@@ -45,59 +44,175 @@ func (r Result) Succeeded() bool {
 }
 
 type Runner struct {
-	Executor CommandExecutor
-	Output   io.Writer
+	Executor    CommandExecutor
+	Output      io.Writer
+	ErrorOutput io.Writer
+	MaxParallel int
+}
+
+type completion struct {
+	name          string
+	state         State
+	internalError bool
 }
 
 func (r Runner) Run(ctx context.Context, graph *pipeline.Graph) Result {
+	maxParallel := r.MaxParallel
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+	output := newSynchronizedOutput(r.Output, r.ErrorOutput)
 	result := Result{States: make(map[string]State, len(graph.Nodes))}
 	for name := range graph.Nodes {
 		result.States[name] = Pending
 	}
-	for _, name := range graph.Order {
-		if ctx.Err() != nil {
+
+	completions := make(chan completion, len(graph.Nodes))
+	active, terminal := 0, 0
+	canceling := false
+	for terminal < len(graph.Nodes) {
+		if !canceling && ctx.Err() != nil {
+			canceling = true
 			result.Interrupted = true
-			break
-		}
-		node := graph.Nodes[name]
-		blocked := false
-		for _, dependency := range node.Needs {
-			if result.States[dependency] != Passed {
-				blocked = true
-				break
-			}
-		}
-		if blocked {
-			result.States[name] = Blocked
-			fmt.Fprintf(r.Output, "[%s] blocked by failed dependency\n\n", name)
-			continue
 		}
 
-		result.States[name] = Running
-		fmt.Fprintf(r.Output, "[%s]\n", name)
-		for _, step := range node.Job.Steps {
-			fmt.Fprintf(r.Output, "$ %s\n", step.Run)
-			execution := r.Executor.Run(ctx, step.Run)
-			if execution.Err != nil {
-				result.States[name] = Failed
-				if ctx.Err() != nil {
-					result.Interrupted = true
-					fmt.Fprintf(r.Output, "x %s interrupted\n\n", name)
-				} else if execution.ExitCode >= 0 {
-					fmt.Fprintf(r.Output, "x %s (exit %d)\n\n", name, execution.ExitCode)
-				} else {
-					result.InternalError = true
-					fmt.Fprintf(r.Output, "x %s (%v)\n\n", name, execution.Err)
+		if !canceling {
+			for _, name := range graph.Order {
+				if result.States[name] == Pending && hasFailedDependency(graph, result.States, name) {
+					result.States[name] = Blocked
+					terminal++
+					fmt.Fprintf(output.stdout, "[%s] blocked by failed dependency\n\n", name)
 				}
+			}
+			for active < maxParallel {
+				name := nextReadyJob(graph, result.States)
+				if name == "" {
+					break
+				}
+				result.States[name] = Running
+				active++
+				fmt.Fprintf(output.stdout, "[%s]\n", name)
+				go func(name string) {
+					state, internalError := r.executeJob(ctx, graph.Nodes[name], output)
+					completions <- completion{name: name, state: state, internalError: internalError}
+				}(name)
+			}
+		}
+
+		if active == 0 {
+			if canceling {
+				for _, name := range graph.Order {
+					if result.States[name] == Pending {
+						result.States[name] = Canceled
+						terminal++
+					}
+				}
+			}
+			if terminal == len(graph.Nodes) {
+				break
+			}
+			result.InternalError = true
+			for _, name := range graph.Order {
+				if result.States[name] == Pending {
+					result.States[name] = Failed
+					terminal++
+				}
+			}
+			break
+		}
+
+		var completed completion
+		if canceling {
+			completed = <-completions
+		} else {
+			select {
+			case completed = <-completions:
+			case <-ctx.Done():
+				continue
+			}
+		}
+		result.States[completed.name] = completed.state
+		result.InternalError = result.InternalError || completed.internalError
+		active--
+		terminal++
+	}
+	return result
+}
+
+func nextReadyJob(graph *pipeline.Graph, states map[string]State) string {
+	for _, name := range graph.Order {
+		if states[name] != Pending {
+			continue
+		}
+		ready := true
+		for _, dependency := range graph.Nodes[name].Needs {
+			if states[dependency] != Passed {
+				ready = false
 				break
 			}
 		}
-		if result.States[name] == Running {
-			result.States[name] = Passed
-			fmt.Fprintf(r.Output, "✓ %s\n\n", name)
+		if ready {
+			return name
 		}
 	}
-	return result
+	return ""
+}
+
+func hasFailedDependency(graph *pipeline.Graph, states map[string]State, name string) bool {
+	for _, dependency := range graph.Nodes[name].Needs {
+		if states[dependency] == Failed || states[dependency] == Blocked {
+			return true
+		}
+	}
+	return false
+}
+
+func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output synchronizedOutput) (State, bool) {
+	for _, step := range node.Job.Steps {
+		fmt.Fprintf(output.stdout, "$ %s\n", step.Run)
+		execution := r.Executor.Run(ctx, step.Run, output.stdout, output.stderr)
+		if execution.Err == nil {
+			continue
+		}
+		if ctx.Err() != nil {
+			fmt.Fprintf(output.stdout, "x %s canceled\n\n", node.Name)
+			return Canceled, false
+		}
+		if execution.ExitCode >= 0 {
+			fmt.Fprintf(output.stdout, "x %s (exit %d)\n\n", node.Name, execution.ExitCode)
+			return Failed, false
+		}
+		fmt.Fprintf(output.stdout, "x %s (%v)\n\n", node.Name, execution.Err)
+		return Failed, true
+	}
+	fmt.Fprintf(output.stdout, "✓ %s\n\n", node.Name)
+	return Passed, false
+}
+
+type synchronizedOutput struct {
+	stdout io.Writer
+	stderr io.Writer
+}
+type lockedWriter struct {
+	mu     *sync.Mutex
+	target io.Writer
+}
+
+func (w lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.target.Write(p)
+}
+
+func newSynchronizedOutput(stdout, stderr io.Writer) synchronizedOutput {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = stdout
+	}
+	mu := &sync.Mutex{}
+	return synchronizedOutput{stdout: lockedWriter{mu: mu, target: stdout}, stderr: lockedWriter{mu: mu, target: stderr}}
 }
 
 func PrintSummary(w io.Writer, graph *pipeline.Graph, result Result) {

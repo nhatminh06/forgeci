@@ -17,7 +17,7 @@ import (
 const helpText = `ForgeCI executes repository-local pipelines.
 
 Usage:
-  forge run [--file <path>]
+  forge run [--file <path>] [--jobs <N>]
   forge --help
 
 Default pipeline file:
@@ -44,11 +44,12 @@ func run(ctx context.Context, args []string, directory string, stdout, stderr io
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	file := flags.String("file", "forge.yaml", "pipeline YAML file")
+	jobs := flags.Int("jobs", 1, "maximum number of concurrently running jobs")
 	flags.Usage = func() {
 		fmt.Fprintln(flags.Output(), "ForgeCI executes repository-local pipelines.")
 		fmt.Fprintln(flags.Output())
 		fmt.Fprintln(flags.Output(), "Usage:")
-		fmt.Fprintln(flags.Output(), "  forge run [--file <path>]")
+		fmt.Fprintln(flags.Output(), "  forge run [--file <path>] [--jobs <N>]")
 		fmt.Fprintln(flags.Output())
 		fmt.Fprintln(flags.Output(), "Default pipeline file:")
 		fmt.Fprintln(flags.Output(), "  forge.yaml")
@@ -65,6 +66,10 @@ func run(ctx context.Context, args []string, directory string, stdout, stderr io
 		fmt.Fprintf(stderr, "unexpected argument %q\n", flags.Arg(0))
 		return 2
 	}
+	if *jobs < 1 {
+		fmt.Fprintln(stderr, "jobs must be greater than zero")
+		return 2
+	}
 
 	fmt.Fprintln(stdout, "ForgeCI")
 	fmt.Fprintln(stdout)
@@ -79,8 +84,8 @@ func run(ctx context.Context, args []string, directory string, stdout, stderr io
 		fmt.Fprintf(stderr, "compile pipeline: %v\n", err)
 		return 2
 	}
-	local := executor.Local{Directory: directory, Stdout: stdout, Stderr: stderr}
-	result := (runner.Runner{Executor: local, Output: stdout}).Run(ctx, graph)
+	local := executor.Local{Directory: directory}
+	result := (runner.Runner{Executor: local, Output: stdout, ErrorOutput: stderr, MaxParallel: *jobs}).Run(ctx, graph)
 	runner.PrintSummary(stdout, graph, result)
 	if result.Interrupted {
 		fmt.Fprintln(stderr, "pipeline interrupted")
