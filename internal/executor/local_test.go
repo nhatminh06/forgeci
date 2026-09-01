@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,8 +13,8 @@ import (
 
 func TestLocalRunStreamsOutput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	result := (Local{Directory: t.TempDir(), Stdout: &stdout, Stderr: &stderr}).Run(
-		context.Background(), "echo visible; echo warning >&2",
+	result := (Local{Directory: t.TempDir()}).Run(
+		context.Background(), "echo visible; echo warning >&2", &stdout, &stderr,
 	)
 	if result.Err != nil || result.ExitCode != 0 {
 		t.Fatalf("Run() = %+v", result)
@@ -26,7 +27,7 @@ func TestLocalRunStreamsOutput(t *testing.T) {
 func TestLocalRunUsesConfiguredDirectory(t *testing.T) {
 	directory := t.TempDir()
 	var stdout bytes.Buffer
-	result := (Local{Directory: directory, Stdout: &stdout}).Run(context.Background(), "pwd")
+	result := (Local{Directory: directory}).Run(context.Background(), "pwd", &stdout, io.Discard)
 	if result.Err != nil {
 		t.Fatalf("Run() error = %v", result.Err)
 	}
@@ -37,7 +38,7 @@ func TestLocalRunUsesConfiguredDirectory(t *testing.T) {
 
 func TestLocalRunDistinguishesStartupFailure(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "missing")
-	result := (Local{Directory: directory}).Run(context.Background(), "exit 7")
+	result := (Local{Directory: directory}).Run(context.Background(), "exit 7", io.Discard, io.Discard)
 	if result.Err == nil || result.ExitCode != -1 {
 		t.Fatalf("Run() = %+v, want startup failure with exit code -1", result)
 	}
@@ -48,7 +49,7 @@ func TestLocalRunDistinguishesStartupFailure(t *testing.T) {
 }
 
 func TestLocalRunReturnsExitCode(t *testing.T) {
-	result := (Local{Directory: t.TempDir()}).Run(context.Background(), "exit 7")
+	result := (Local{Directory: t.TempDir()}).Run(context.Background(), "exit 7", io.Discard, io.Discard)
 	if result.Err == nil || result.ExitCode != 7 {
 		t.Fatalf("Run() = %+v, want exit code 7", result)
 	}
