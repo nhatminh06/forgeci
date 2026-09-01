@@ -89,7 +89,19 @@ func run(ctx context.Context, args []string, directory string, stdout, stderr io
 		return 2
 	}
 	local := executor.Local{Directory: directory}
-	result := (runner.Runner{Executor: local, Output: stdout, ErrorOutput: stderr, MaxParallel: *jobs}).Run(ctx, graph)
+	var docker *executor.Docker
+	for _, job := range cfg.Jobs {
+		if job.Image != nil {
+			docker, err = executor.NewDocker(directory)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 2
+			}
+			break
+		}
+	}
+	jobExecutor := executor.Job{Local: local, Docker: docker}
+	result := (runner.Runner{Executor: jobExecutor, Output: stdout, ErrorOutput: stderr, MaxParallel: *jobs}).Run(ctx, graph)
 	runner.PrintSummary(stdout, graph, result)
 	if result.Interrupted {
 		fmt.Fprintln(stderr, "pipeline interrupted")

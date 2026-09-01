@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
 )
@@ -23,6 +24,10 @@ const (
 
 type CommandExecutor interface {
 	Run(context.Context, string, io.Writer, io.Writer) executor.Result
+}
+
+type JobExecutor interface {
+	RunJob(context.Context, string, config.Job, io.Writer, io.Writer) executor.Result
 }
 
 type Result struct {
@@ -168,6 +173,10 @@ func hasFailedDependency(graph *pipeline.Graph, states map[string]State, name st
 }
 
 func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output synchronizedOutput) (State, bool) {
+	if jobExecutor, ok := r.Executor.(JobExecutor); ok {
+		execution := jobExecutor.RunJob(ctx, node.Name, node.Job, output.stdout, output.stderr)
+		return finishJob(ctx, node.Name, execution, output.stdout)
+	}
 	for _, step := range node.Job.Steps {
 		fmt.Fprintf(output.stdout, "$ %s\n", step.Run)
 		execution := r.Executor.Run(ctx, step.Run, output.stdout, output.stderr)
@@ -187,6 +196,23 @@ func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output sync
 	}
 	fmt.Fprintf(output.stdout, "✓ %s\n\n", node.Name)
 	return Passed, false
+}
+
+func finishJob(ctx context.Context, name string, execution executor.Result, output io.Writer) (State, bool) {
+	if execution.Err == nil {
+		fmt.Fprintf(output, "✓ %s\n\n", name)
+		return Passed, false
+	}
+	if ctx.Err() != nil {
+		fmt.Fprintf(output, "x %s canceled\n\n", name)
+		return Canceled, false
+	}
+	if execution.ExitCode >= 0 {
+		fmt.Fprintf(output, "x %s (exit %d)\n\n", name, execution.ExitCode)
+		return Failed, false
+	}
+	fmt.Fprintf(output, "x %s (%v)\n\n", name, execution.Err)
+	return Failed, true
 }
 
 type synchronizedOutput struct {
