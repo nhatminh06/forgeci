@@ -54,16 +54,23 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("create migration table: %w", err)
 	}
 
-	for version := 1; version <= 2; version++ {
+	files, err := migrations.ReadDir("migrations")
+	if err != nil {
+		return fmt.Errorf("read migrations: %w", err)
+	}
+	for version := 1; version <= len(files); version++ {
 		var exists bool
 		err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&exists)
 		if err != nil {
 			return fmt.Errorf("read migration version %d: %w", version, err)
 		}
 		if !exists {
-			filename := fmt.Sprintf("migrations/%03d_initial.sql", version)
-			if version == 2 {
-				filename = "migrations/002_runners_and_leases.sql"
+			filename := fmt.Sprintf("migrations/%03d_", version)
+			for _, file := range files {
+				if len(file.Name()) >= 4 && file.Name()[:4] == fmt.Sprintf("%03d_", version) {
+					filename = "migrations/" + file.Name()
+					break
+				}
 			}
 			sql, err := migrations.ReadFile(filename)
 			if err != nil {
@@ -89,7 +96,24 @@ func (s *Store) CreateRun(ctx context.Context, in store.CreateRun) (*store.Run, 
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, `INSERT INTO pipeline_runs(id,status,pipeline_file,pipeline_yaml,pipeline_sha256,workspace,max_parallel) VALUES($1,'QUEUED',$2,$3,$4,$5,$6)`, in.ID, in.PipelineFile, in.PipelineYAML, in.PipelineSHA256, in.Workspace, in.MaxParallel)
+	if in.Snapshot == nil {
+		return nil, fmt.Errorf("source snapshot is required for new runs")
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO source_snapshots(source_digest,blob_digest,format,archive_size_bytes,logical_size_bytes,entry_count,created_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(source_digest) DO NOTHING`, in.Snapshot.SourceDigest, in.Snapshot.BlobDigest, in.Snapshot.Format, in.Snapshot.ArchiveSizeBytes, in.Snapshot.LogicalSizeBytes, in.Snapshot.EntryCount, in.Snapshot.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("insert source snapshot: %w", err)
+	}
+	var blob, format string
+	var archive, logical int64
+	var entries int
+	if err = tx.QueryRow(ctx, `SELECT blob_digest,format,archive_size_bytes,logical_size_bytes,entry_count FROM source_snapshots WHERE source_digest=$1`, in.Snapshot.SourceDigest).Scan(&blob, &format, &archive, &logical, &entries); err != nil {
+		return nil, err
+	}
+	if blob != in.Snapshot.BlobDigest || format != in.Snapshot.Format || archive != in.Snapshot.ArchiveSizeBytes || logical != in.Snapshot.LogicalSizeBytes || entries != in.Snapshot.EntryCount {
+		return nil, fmt.Errorf("conflicting source snapshot metadata")
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO pipeline_runs(id,status,pipeline_file,pipeline_yaml,pipeline_sha256,workspace,max_parallel,source_snapshot_sha256) VALUES($1,'QUEUED',$2,$3,$4,$5,$6,$7)`, in.ID, in.PipelineFile, in.PipelineYAML, in.PipelineSHA256, in.Workspace, in.MaxParallel, in.Snapshot.SourceDigest)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
 	}
@@ -104,11 +128,11 @@ func (s *Store) CreateRun(ctx context.Context, in store.CreateRun) (*store.Run, 
 	return s.GetRun(ctx, in.ID)
 }
 
-const runColumns = `id::text,status,pipeline_file,pipeline_yaml,pipeline_sha256,workspace,max_parallel,created_at,started_at,finished_at,cancel_requested_at,error_message,runner_id::text,lease_id::text,lease_generation,lease_expires_at,effective_parallel`
+const runColumns = `p.id::text,p.status,p.pipeline_file,p.pipeline_yaml,p.pipeline_sha256,p.source_snapshot_sha256,COALESCE(s.blob_digest,''),COALESCE(s.format,''),COALESCE(s.archive_size_bytes,0),COALESCE(s.logical_size_bytes,0),COALESCE(s.entry_count,0),p.workspace,p.max_parallel,p.created_at,p.started_at,p.finished_at,p.cancel_requested_at,p.error_message,p.runner_id::text,p.lease_id::text,p.lease_generation,p.lease_expires_at,p.effective_parallel`
 
 func scanRun(row pgx.Row) (*store.Run, error) {
 	r := &store.Run{}
-	err := row.Scan(&r.ID, &r.Status, &r.PipelineFile, &r.PipelineYAML, &r.PipelineSHA256, &r.Workspace, &r.MaxParallel, &r.CreatedAt, &r.StartedAt, &r.FinishedAt, &r.CancelRequestedAt, &r.ErrorMessage, &r.RunnerID, &r.LeaseID, &r.LeaseGeneration, &r.LeaseExpiresAt, &r.EffectiveParallel)
+	err := row.Scan(&r.ID, &r.Status, &r.PipelineFile, &r.PipelineYAML, &r.PipelineSHA256, &r.SourceSnapshotSHA256, &r.SnapshotBlobSHA256, &r.SnapshotFormat, &r.SnapshotArchiveSize, &r.SnapshotLogicalSize, &r.SnapshotEntryCount, &r.Workspace, &r.MaxParallel, &r.CreatedAt, &r.StartedAt, &r.FinishedAt, &r.CancelRequestedAt, &r.ErrorMessage, &r.RunnerID, &r.LeaseID, &r.LeaseGeneration, &r.LeaseExpiresAt, &r.EffectiveParallel)
 	r.CreatedAt = r.CreatedAt.UTC()
 	r.StartedAt = utcTime(r.StartedAt)
 	r.FinishedAt = utcTime(r.FinishedAt)
@@ -126,7 +150,7 @@ func utcTime(value *time.Time) *time.Time {
 }
 
 func (s *Store) GetRun(ctx context.Context, id string) (*store.Run, error) {
-	r, err := scanRun(s.pool.QueryRow(ctx, `SELECT `+runColumns+` FROM pipeline_runs WHERE id=$1`, id))
+	r, err := scanRun(s.pool.QueryRow(ctx, `SELECT `+runColumns+` FROM pipeline_runs p LEFT JOIN source_snapshots s ON s.source_digest=p.source_snapshot_sha256 WHERE p.id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -151,7 +175,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (*store.Run, error) {
 }
 
 func (s *Store) ListRuns(ctx context.Context, limit int) ([]store.Run, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+runColumns+` FROM pipeline_runs ORDER BY created_at DESC,id DESC LIMIT $1`, limit)
+	rows, err := s.pool.Query(ctx, `SELECT `+runColumns+` FROM pipeline_runs p LEFT JOIN source_snapshots s ON s.source_digest=p.source_snapshot_sha256 ORDER BY p.created_at DESC,p.id DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
