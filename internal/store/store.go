@@ -33,19 +33,25 @@ var (
 )
 
 type Run struct {
-	ID                string     `json:"id"`
-	Status            RunStatus  `json:"status"`
-	PipelineFile      string     `json:"pipeline_file"`
-	PipelineYAML      []byte     `json:"-"`
-	PipelineSHA256    string     `json:"pipeline_sha256"`
-	Workspace         string     `json:"workspace"`
-	MaxParallel       int        `json:"max_parallel"`
-	CreatedAt         time.Time  `json:"created_at"`
-	StartedAt         *time.Time `json:"started_at"`
-	FinishedAt        *time.Time `json:"finished_at"`
-	CancelRequestedAt *time.Time `json:"cancel_requested_at"`
-	ErrorMessage      *string    `json:"error_message,omitempty"`
-	Jobs              []Job      `json:"jobs,omitempty"`
+	ID                   string     `json:"id"`
+	Status               RunStatus  `json:"status"`
+	PipelineFile         string     `json:"pipeline_file"`
+	PipelineYAML         []byte     `json:"-"`
+	PipelineSHA256       string     `json:"pipeline_sha256"`
+	SourceSnapshotSHA256 *string    `json:"source_snapshot_sha256,omitempty"`
+	SnapshotBlobSHA256   string     `json:"-"`
+	SnapshotFormat       string     `json:"-"`
+	SnapshotArchiveSize  int64      `json:"-"`
+	SnapshotLogicalSize  int64      `json:"-"`
+	SnapshotEntryCount   int        `json:"-"`
+	Workspace            string     `json:"workspace"`
+	MaxParallel          int        `json:"max_parallel"`
+	CreatedAt            time.Time  `json:"created_at"`
+	StartedAt            *time.Time `json:"started_at"`
+	FinishedAt           *time.Time `json:"finished_at"`
+	CancelRequestedAt    *time.Time `json:"cancel_requested_at"`
+	ErrorMessage         *string    `json:"error_message,omitempty"`
+	Jobs                 []Job      `json:"jobs,omitempty"`
 	// Remote runner fields
 	RunnerID          *string    `json:"runner_id,omitempty"`
 	LeaseID           *string    `json:"lease_id,omitempty"`
@@ -89,6 +95,14 @@ type CreateRun struct {
 	PipelineYAML                                []byte
 	MaxParallel                                 int
 	Jobs                                        []Job
+	Snapshot                                    *SourceSnapshot
+}
+
+type SourceSnapshot struct {
+	SourceDigest, BlobDigest, Format   string
+	ArchiveSizeBytes, LogicalSizeBytes int64
+	EntryCount                         int
+	CreatedAt                          time.Time
 }
 
 type Store interface {

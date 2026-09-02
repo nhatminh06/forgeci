@@ -28,9 +28,13 @@ func integrationStore(t *testing.T) *Store {
 	return s
 }
 
+func testSnapshot() *store.SourceSnapshot {
+	return &store.SourceSnapshot{SourceDigest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", BlobDigest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Format: "tar-gzip-v1", ArchiveSizeBytes: 10, LogicalSizeBytes: 5, EntryCount: 1, CreatedAt: time.Now().UTC()}
+}
+
 func createRemoteRun(t *testing.T, s *Store, image *string) *store.Run {
 	t.Helper()
-	r, err := s.CreateRun(context.Background(), store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1"), PipelineSHA256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", Workspace: "/workspace", MaxParallel: 4, Jobs: []store.Job{{Name: "job", Image: image}}})
+	r, err := s.CreateRun(context.Background(), store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1"), PipelineSHA256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", Workspace: "/workspace", MaxParallel: 4, Jobs: []store.Job{{Name: "job", Image: image}}, Snapshot: testSnapshot()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +213,7 @@ func TestMigrationIsIdempotentAndCreateRunIsAtomic(t *testing.T) {
 	second.Close()
 
 	id := uuid.NewString()
-	_, err = s.CreateRun(context.Background(), store.CreateRun{ID: id, PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1"), PipelineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "same"}, {Name: "same"}}})
+	_, err = s.CreateRun(context.Background(), store.CreateRun{ID: id, PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1"), PipelineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "same"}, {Name: "same"}}, Snapshot: testSnapshot()})
 	if err == nil {
 		t.Fatal("duplicate job insertion unexpectedly succeeded")
 	}
@@ -229,7 +233,7 @@ func TestClaimCancelAndRecovery(t *testing.T) {
 	s := integrationStore(t)
 	create := func() string {
 		id := uuid.NewString()
-		_, err := s.CreateRun(context.Background(), store.CreateRun{ID: id, PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1"), PipelineSHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "job"}}})
+		_, err := s.CreateRun(context.Background(), store.CreateRun{ID: id, PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1"), PipelineSHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "job"}}, Snapshot: testSnapshot()})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,18 +26,24 @@ import (
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
 	runnerpkg "github.com/nhatminh06/forgeci/internal/runner"
+	"github.com/nhatminh06/forgeci/internal/runworkspace"
+	"github.com/nhatminh06/forgeci/internal/snapshot"
 )
 
 const protocolVersion = 1
 
 type Config struct {
-	ServerAddr  string
-	ServerToken string
-	Name        string
-	Workspace   string
-	StateDir    string
-	MaxParallel int
-	TLSCA       string
+	ServerAddr         string
+	ServerToken        string
+	Name               string
+	WorkspaceRoot      string
+	Workspace          string // deprecated programmatic alias
+	StateDir           string
+	MaxParallel        int
+	TLSCA              string
+	MaxSnapshotArchive int64
+	MaxSnapshotLogical int64
+	MaxSnapshotEntries int
 }
 
 type RemoteRunner struct {
@@ -47,6 +54,7 @@ type RemoteRunner struct {
 	currentRunID    string
 	currentPipeline []byte
 	currentParallel int
+	currentSnapshot snapshot.Metadata
 	leaseExpiresAt  time.Time
 	activeCancel    context.CancelFunc
 	generation      int
@@ -64,10 +72,14 @@ func main() {
 	flag.StringVar(&cfg.ServerAddr, "server", "http://localhost:9090", "Control plane runner listener address")
 	cfg.ServerToken = os.Getenv("FORGECI_RUNNER_TOKEN")
 	flag.StringVar(&cfg.Name, "name", hostname(), "Runner name (default: hostname)")
-	flag.StringVar(&cfg.Workspace, "workspace", ".", "Pipeline workspace directory")
+	flag.StringVar(&cfg.WorkspaceRoot, "workspace-root", "", "Root for isolated run workspaces")
+	flag.StringVar(&cfg.WorkspaceRoot, "workspace", "", "Deprecated alias for --workspace-root")
 	flag.StringVar(&cfg.StateDir, "state-dir", filepath.Join(homeDir, ".forgeci", "runner"), "State directory for runner ID")
 	flag.IntVar(&cfg.MaxParallel, "max-parallel", runtime.NumCPU(), "Maximum parallel jobs")
 	flag.StringVar(&cfg.TLSCA, "ca-cert", "", "Path to CA certificate for TLS verification")
+	flag.Int64Var(&cfg.MaxSnapshotArchive, "snapshot-max-archive-bytes", 512<<20, "maximum downloaded snapshot bytes")
+	flag.Int64Var(&cfg.MaxSnapshotLogical, "snapshot-max-logical-bytes", 1<<30, "maximum extracted source bytes")
+	flag.IntVar(&cfg.MaxSnapshotEntries, "snapshot-max-entries", 100000, "maximum extracted source entries")
 	flag.Parse()
 
 	if cfg.ServerToken == "" {
@@ -77,6 +89,14 @@ func main() {
 
 	if cfg.MaxParallel < 1 {
 		fmt.Fprintf(os.Stderr, "Error: max-parallel must be > 0\n")
+		os.Exit(1)
+	}
+	if cfg.WorkspaceRoot == "" {
+		fmt.Fprintln(os.Stderr, "Error: workspace-root is required")
+		os.Exit(1)
+	}
+	if cfg.MaxSnapshotArchive < 0 || cfg.MaxSnapshotLogical < 0 || cfg.MaxSnapshotEntries < 0 {
+		fmt.Fprintln(os.Stderr, "Error: snapshot limits must not be negative")
 		os.Exit(1)
 	}
 
@@ -111,6 +131,43 @@ func hostname() string {
 }
 
 func newRemoteRunner(ctx context.Context, cancel context.CancelFunc, cfg *Config) (*RemoteRunner, error) {
+	if cfg.MaxSnapshotArchive < 0 || cfg.MaxSnapshotLogical < 0 || cfg.MaxSnapshotEntries < 0 {
+		return nil, fmt.Errorf("snapshot limits must not be negative")
+	}
+	if cfg.WorkspaceRoot == "" {
+		cfg.WorkspaceRoot = cfg.Workspace
+	}
+	root, err := filepath.Abs(cfg.WorkspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace root: %w", err)
+	}
+	cfg.WorkspaceRoot = root
+	state, err := filepath.Abs(cfg.StateDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return nil, fmt.Errorf("create workspace root: %w", err)
+	}
+	if err := os.MkdirAll(state, 0700); err != nil {
+		return nil, fmt.Errorf("create state directory: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize workspace root: %w", err)
+	}
+	state, err = filepath.EvalSymlinks(state)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize state directory: %w", err)
+	}
+	if root == state || strings.HasPrefix(root, state+string(filepath.Separator)) || strings.HasPrefix(state, root+string(filepath.Separator)) {
+		return nil, fmt.Errorf("workspace root and state directory must not contain one another")
+	}
+	cfg.WorkspaceRoot = root
+	cfg.StateDir = state
+	if err := runworkspace.CleanupStale(root); err != nil {
+		return nil, fmt.Errorf("clean stale workspaces: %w", err)
+	}
 	// Load or create runner identity
 	id, err := loadOrCreateRunnerID(cfg.StateDir)
 	if err != nil {
@@ -388,17 +445,34 @@ func (rr *RemoteRunner) requestLease() {
 	}
 
 	var lease struct {
-		RunID             string    `json:"run_id"`
-		LeaseID           string    `json:"lease_id"`
-		Generation        int       `json:"generation"`
-		PipelineYAML      []byte    `json:"pipeline_yaml"`
-		EffectiveParallel int       `json:"effective_parallel"`
-		ExpiresAt         time.Time `json:"expires_at"`
+		RunID                string    `json:"run_id"`
+		LeaseID              string    `json:"lease_id"`
+		Generation           int       `json:"generation"`
+		PipelineYAML         []byte    `json:"pipeline_yaml"`
+		EffectiveParallel    int       `json:"effective_parallel"`
+		ExpiresAt            time.Time `json:"expires_at"`
+		SourceSnapshotSHA256 string    `json:"source_snapshot_sha256"`
+		BlobSHA256           string    `json:"blob_sha256"`
+		ArchiveSizeBytes     int64     `json:"archive_size_bytes"`
+		LogicalSizeBytes     int64     `json:"logical_size_bytes"`
+		EntryCount           int       `json:"entry_count"`
+		ArchiveFormat        string    `json:"archive_format"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&lease); err != nil {
 		return
 	}
 	if lease.RunID == "" {
+		return
+	}
+	if lease.ArchiveFormat != snapshot.Format || lease.SourceSnapshotSHA256 == "" || lease.BlobSHA256 == "" || lease.ArchiveSizeBytes < 1 || lease.EntryCount < 0 || lease.LogicalSizeBytes < 0 {
+		message := "invalid snapshot lease metadata"
+		_ = rr.sendComplete(lease.RunID, lease.LeaseID, lease.Generation, "ERROR", &message)
+		return
+	}
+	limits := rr.snapshotLimits()
+	if lease.ArchiveSizeBytes > limits.MaxArchiveBytes || lease.LogicalSizeBytes > limits.MaxLogicalBytes || lease.EntryCount > limits.MaxEntries {
+		message := "snapshot exceeds runner limits"
+		_ = rr.sendComplete(lease.RunID, lease.LeaseID, lease.Generation, "ERROR", &message)
 		return
 	}
 
@@ -409,6 +483,7 @@ func (rr *RemoteRunner) requestLease() {
 	rr.currentPipeline = append([]byte(nil), lease.PipelineYAML...)
 	rr.currentParallel = lease.EffectiveParallel
 	rr.leaseExpiresAt = lease.ExpiresAt
+	rr.currentSnapshot = snapshot.Metadata{SourceDigest: lease.SourceSnapshotSHA256, BlobDigest: lease.BlobSHA256, Format: lease.ArchiveFormat, ArchiveSizeBytes: lease.ArchiveSizeBytes, LogicalSizeBytes: lease.LogicalSizeBytes, EntryCount: lease.EntryCount}
 	rr.leaseMutex.Unlock()
 }
 
@@ -430,9 +505,58 @@ func (rr *RemoteRunner) processCurrentRun() {
 	leaseID := rr.currentLeaseID
 	generation := rr.generation
 	pipelineYAML := append([]byte(nil), rr.currentPipeline...)
+	snapshotMeta := rr.currentSnapshot
 	rr.leaseMutex.Unlock()
 
 	if runID == "" || leaseID == "" || len(pipelineYAML) == 0 {
+		return
+	}
+	executionCtx, cancel := context.WithCancel(rr.ctx)
+	rr.leaseMutex.Lock()
+	rr.activeCancel = cancel
+	parallel := rr.currentParallel
+	rr.leaseMutex.Unlock()
+	defer cancel()
+	marker := runworkspace.Marker{RunID: runID, LeaseID: leaseID, Generation: generation, SourceDigest: snapshotMeta.SourceDigest}
+	workspace, err := runworkspace.Create(rr.config.WorkspaceRoot, marker)
+	if err != nil {
+		rr.completeError(runID, leaseID, generation, err)
+		return
+	}
+	defer func() {
+		if err := runworkspace.Remove(rr.config.WorkspaceRoot, workspace, marker); err != nil {
+			fmt.Fprintf(os.Stderr, "workspace cleanup failed: %v\n", err)
+		}
+	}()
+	sourceDir := filepath.Join(workspace, "source")
+	if err := os.Mkdir(sourceDir, 0700); err != nil {
+		rr.completeError(runID, leaseID, generation, err)
+		return
+	}
+	archive, err := os.CreateTemp(workspace, ".source-*.tar.gz")
+	if err != nil {
+		rr.completeError(runID, leaseID, generation, err)
+		return
+	}
+	archivePath := archive.Name()
+	if err := rr.downloadSnapshot(executionCtx, runID, leaseID, generation, snapshotMeta, archive); err != nil {
+		archive.Close()
+		os.Remove(archivePath)
+		rr.completeError(runID, leaseID, generation, err)
+		return
+	}
+	if err := archive.Close(); err != nil {
+		os.Remove(archivePath)
+		rr.completeError(runID, leaseID, generation, err)
+		return
+	}
+	if err := snapshot.Extract(archivePath, sourceDir, snapshotMeta, rr.snapshotLimits()); err != nil {
+		os.Remove(archivePath)
+		rr.completeError(runID, leaseID, generation, err)
+		return
+	}
+	if err := os.Remove(archivePath); err != nil {
+		rr.completeError(runID, leaseID, generation, err)
 		return
 	}
 
@@ -452,20 +576,14 @@ func (rr *RemoteRunner) processCurrentRun() {
 		return
 	}
 
-	executionCtx, cancel := context.WithCancel(rr.ctx)
-	rr.leaseMutex.Lock()
-	rr.activeCancel = cancel
-	parallel := rr.currentParallel
-	rr.leaseMutex.Unlock()
-	defer cancel()
 	if parallel < 1 || parallel > rr.config.MaxParallel {
 		parallel = rr.config.MaxParallel
 	}
-	local := executor.Local{Directory: rr.config.Workspace}
+	local := executor.Local{Directory: sourceDir}
 	var docker *executor.Docker
 	for _, job := range cfg.Jobs {
 		if job.Image != nil {
-			docker, err = executor.NewDocker(rr.config.Workspace)
+			docker, err = executor.NewDocker(sourceDir)
 			break
 		}
 	}
@@ -515,9 +633,59 @@ func (rr *RemoteRunner) clearLease() {
 	rr.generation = 0
 	rr.currentPipeline = nil
 	rr.currentParallel = 0
+	rr.currentSnapshot = snapshot.Metadata{}
 	rr.leaseExpiresAt = time.Time{}
 	rr.activeCancel = nil
 	rr.leaseMutex.Unlock()
+}
+
+func (rr *RemoteRunner) completeError(runID, leaseID string, generation int, err error) {
+	message := err.Error()
+	_ = rr.sendComplete(runID, leaseID, generation, "ERROR", &message)
+	rr.clearLease()
+}
+
+func (rr *RemoteRunner) downloadSnapshot(ctx context.Context, runID, leaseID string, generation int, meta snapshot.Metadata, destination io.Writer) error {
+	url := fmt.Sprintf("%s/v1/runner/leases/%s/source?runner_id=%s&run_id=%s&generation=%d", rr.config.ServerAddr, leaseID, rr.id, runID, generation)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", rr.config.ServerToken))
+	resp, err := rr.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download source snapshot: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("download source snapshot: %d: %s", resp.StatusCode, string(body))
+	}
+	if resp.Header.Get("Content-Type") != "application/vnd.forgeci.source+gzip" {
+		return fmt.Errorf("unexpected snapshot content type")
+	}
+	if value := resp.Header.Get("Content-Length"); value != "" {
+		size, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || size != meta.ArchiveSizeBytes {
+			return fmt.Errorf("snapshot content length mismatch")
+		}
+	}
+	return snapshot.CopyVerified(destination, resp.Body, meta.ArchiveSizeBytes, meta.BlobDigest, rr.snapshotLimits().MaxArchiveBytes)
+}
+
+func (rr *RemoteRunner) snapshotLimits() snapshot.Limits {
+	limits := snapshot.DefaultLimits()
+	if rr.config.MaxSnapshotArchive > 0 {
+		limits.MaxArchiveBytes = rr.config.MaxSnapshotArchive
+	}
+	if rr.config.MaxSnapshotLogical > 0 {
+		limits.MaxLogicalBytes = rr.config.MaxSnapshotLogical
+		limits.MaxFileBytes = rr.config.MaxSnapshotLogical
+	}
+	if rr.config.MaxSnapshotEntries > 0 {
+		limits.MaxEntries = rr.config.MaxSnapshotEntries
+	}
+	return limits
 }
 
 func (rr *RemoteRunner) shutdown() {

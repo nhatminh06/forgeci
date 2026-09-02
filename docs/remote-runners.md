@@ -1,15 +1,42 @@
-# Remote runners and run leases
+# Remote runners, source transfer, and run leases
 
-In remote mode, `forge-server` persists queued runs but never executes them locally. An outbound-only `forge-runner` registers a stable UUID, reports OS, architecture, Docker availability, and capacity, then long-polls for compatible work.
+In remote mode, `forge-server` queues a whole pipeline for one registered runner. The runner root starts empty; repository pre-provisioning is neither required nor used. A lease contains stored pipeline YAML plus source digest, archive blob digest, archive format, compressed and logical sizes, and entry count.
 
-ForgeCI leases an entire pipeline run to one runner. This preserves shared-workspace semantics between jobs. Jobs inside the run may execute concurrently but never move between runners. Effective concurrency is the smaller of the run limit and runner capacity.
+```bash
+mkdir -p /var/lib/forgeci/runner-workspaces
+FORGECI_RUNNER_TOKEN=... ./build/forge-runner \
+  --server http://127.0.0.1:9090 \
+  --workspace-root /var/lib/forgeci/runner-workspaces \
+  --state-dir /var/lib/forgeci/runner-state \
+  --name runner-1
+```
 
-An assignment atomically records the run ID, runner ID, random lease UUID, generation, and expiration. Heartbeats renew only that exact current lease. Events and completion present the same ownership tuple. Expired, replaced, wrong-runner, and stale messages cannot alter durable state. Expiration marks the runner OFFLINE, the run ABORTED, and unfinished jobs ABORTED; uncertain work is never automatically reassigned.
+`--workspace` remains a deprecated alias for `--workspace-root`. The workspace root is canonicalized, created with restrictive permissions, and must not contain or be contained by the runner state directory.
 
-Cancellation is persisted and returned on heartbeat. The runner cancels its scheduler context, terminates local or Docker work, reports CANCELED, and releases the lease. If it disappears first, expiration conservatively produces ABORTED.
+Runner-side bounds default to 512 MiB compressed, 1 GiB extracted, and 100,000 entries. They can be reduced with `--snapshot-max-archive-bytes`, `--snapshot-max-logical-bytes`, and `--snapshot-max-entries`.
 
-Runner endpoints use a shared bearer token from `FORGECI_RUNNER_TOKEN` or the server's `--runner-token-file`. Tokens are not stored or logged. Plain HTTP is loopback-only. Non-loopback listeners require user-provided TLS certificate and key; runners can use `--ca-cert` for a private CA.
+## Download and verification
 
-The restricted runner state directory contains its stable UUID. Restarting with the same directory reuses the same database identity. One runner holds at most one run because its configured workspace is shared.
+The runner requests `GET /v1/runner/leases/{lease-id}/source` with its runner ID, run ID, and generation. The shared bearer token is necessary but insufficient: the server also requires the exact current owner, live run, matching lease/generation, and unexpired deadline. There is no generic public digest endpoint.
 
-The server sends the stored pipeline YAML snapshot, not repository contents. Runner workspaces must already contain the intended source. ForgeCI does not yet verify or synchronize source revisions, create isolated run workspaces, transfer artifacts, persist logs, retry runner-loss failures, or distribute individual jobs across runners.
+Archive bytes stream to a temporary file while the runner enforces the expected size, its own maximum, and the blob SHA-256. A mismatch prevents extraction and reports `ERROR`. Extraction rejects absolute, empty, control-byte, non-canonical, and traversal paths; hard links and special entries are unsupported. Regular files are created only through verified directory parents. Validated relative symlinks are created last, preventing an archive symlink from redirecting earlier writes. Entry and extracted-byte limits bound decompression.
+
+After extraction the runner rebuilds the canonical source manifest. Execution begins only when its logical digest equals the leased source digest.
+
+## Isolated workspaces and cleanup
+
+Each lease executes below:
+
+```text
+<workspace-root>/runs/<run-id>/<lease-id>/
+  .forgeci-workspace.json
+  source/
+```
+
+Local jobs run in `source/`; Docker jobs mount it read-write at `/workspace`. Passed, failed, canceled, error, shutdown, and lease-loss paths remove temporary downloads and the isolated workspace. Deletion fails closed unless the path is beneath the configured root, matches the run/lease shape, and its ownership marker matches. On restart, the runner removes stale marked workspaces left by a crash and preserves unmarked user directories.
+
+## Lease and security model
+
+Heartbeats renew only the exact current lease. Expired, replaced, wrong-runner, and stale ownership tuples cannot download source, report events, or complete a run. Runner loss remains conservative: the run becomes `ABORTED` and is not automatically reassigned.
+
+The shared bearer token is still not per-runner cryptographic identity. Pipelines and sources are trusted; workspaces are writable; Docker daemon access is privileged; and ForgeCI provides no hostile multi-tenant sandbox, secret isolation, artifact transfer, cache, job-level leases, retries, or cross-runner job scheduling.

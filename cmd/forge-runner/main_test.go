@@ -3,16 +3,33 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nhatminh06/forgeci/internal/snapshot"
 )
 
 func TestRemoteRunnerExecutesPipelineAndSignalsCompletion(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "input.txt"), []byte("snapshot"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, err := snapshot.Open(t.TempDir(), source, snapshot.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := snapshots.Capture(source)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var mu sync.Mutex
 	var completionStatus string
 	var jobEvents []string
@@ -27,13 +44,23 @@ func TestRemoteRunnerExecutesPipelineAndSignalsCompletion(t *testing.T) {
 		case r.URL.Path == "/v1/runner/lease":
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"run_id":             "run-123",
-				"lease_id":           "lease-123",
-				"generation":         1,
-				"pipeline_yaml":      "version: 1\njobs:\n  hello:\n    steps:\n      - run: echo hello\n",
-				"effective_parallel": 1,
-				"expires_at":         time.Now().Add(30 * time.Second).Format(time.RFC3339),
+				"run_id":                 "run-123",
+				"lease_id":               "lease-123",
+				"generation":             1,
+				"pipeline_yaml":          "version: 1\njobs:\n  hello:\n    steps:\n      - run: echo hello\n",
+				"effective_parallel":     1,
+				"expires_at":             time.Now().Add(30 * time.Second).Format(time.RFC3339),
+				"source_snapshot_sha256": meta.SourceDigest, "blob_sha256": meta.BlobDigest, "archive_size_bytes": meta.ArchiveSizeBytes, "logical_size_bytes": meta.LogicalSizeBytes, "entry_count": meta.EntryCount, "archive_format": meta.Format,
 			})
+		case strings.HasSuffix(r.URL.Path, "/source"):
+			f, err := snapshots.OpenBlob(meta.SourceDigest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			w.Header().Set("Content-Type", "application/vnd.forgeci.source+gzip")
+			w.Header().Set("Content-Length", fmt.Sprint(meta.ArchiveSizeBytes))
+			io.Copy(w, f)
 		case strings.HasPrefix(r.URL.Path, "/v1/runner/leases/") && strings.Contains(r.URL.Path, "/events"):
 			var payload map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
@@ -60,7 +87,7 @@ func TestRemoteRunnerExecutesPipelineAndSignalsCompletion(t *testing.T) {
 	workDir := t.TempDir()
 	rr := &RemoteRunner{
 		id:              "runner-1",
-		config:          Config{ServerAddr: server.URL, ServerToken: "token", Workspace: workDir, MaxParallel: 1},
+		config:          Config{ServerAddr: server.URL, ServerToken: "token", WorkspaceRoot: workDir, MaxParallel: 1},
 		httpClient:      server.Client(),
 		currentRunID:    "run-123",
 		currentLeaseID:  "lease-123",
@@ -68,6 +95,7 @@ func TestRemoteRunnerExecutesPipelineAndSignalsCompletion(t *testing.T) {
 		shutdownChan:    make(chan struct{}),
 		currentPipeline: []byte("version: 1\njobs:\n  hello:\n    steps:\n      - run: echo hello\n"),
 		ctx:             context.Background(),
+		currentSnapshot: meta,
 	}
 
 	rr.processCurrentRun()

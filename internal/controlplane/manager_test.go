@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -30,6 +32,15 @@ func (f *fakeStore) CreateRun(_ context.Context, in store.CreateRun) (*store.Run
 	defer f.mu.Unlock()
 	now := time.Now().UTC()
 	r := &store.Run{ID: in.ID, Status: store.RunQueued, PipelineFile: in.PipelineFile, PipelineYAML: append([]byte(nil), in.PipelineYAML...), PipelineSHA256: in.PipelineSHA256, Workspace: in.Workspace, MaxParallel: in.MaxParallel, CreatedAt: now, Jobs: append([]store.Job(nil), in.Jobs...)}
+	if in.Snapshot != nil {
+		digest := in.Snapshot.SourceDigest
+		r.SourceSnapshotSHA256 = &digest
+		r.SnapshotBlobSHA256 = in.Snapshot.BlobDigest
+		r.SnapshotFormat = in.Snapshot.Format
+		r.SnapshotArchiveSize = in.Snapshot.ArchiveSizeBytes
+		r.SnapshotLogicalSize = in.Snapshot.LogicalSizeBytes
+		r.SnapshotEntryCount = in.Snapshot.EntryCount
+	}
 	f.runs[in.ID] = r
 	f.order = append(f.order, in.ID)
 	return cloneRun(r), nil
@@ -260,6 +271,53 @@ func TestManagerExecutesPersistedPipelineSnapshot(t *testing.T) {
 	data, err := os.ReadFile(output)
 	if err != nil || string(data) != "VERSION_A\n" {
 		t.Fatalf("output=%q err=%v", data, err)
+	}
+}
+
+func TestManagerExecutesFrozenSourceSnapshotInIsolatedWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	output := filepath.Join(t.TempDir(), "result")
+	gate := make(chan struct{})
+	persistence := newFakeStore()
+	persistence.claimGate = gate
+	writeConfig(t, dir, "forge.yaml", "test \"$(cat version.txt)\" = A && test -e required.txt && test ! -e late.txt && pwd > "+output)
+	os.WriteFile(filepath.Join(dir, "version.txt"), []byte("A\n"), 0600)
+	os.WriteFile(filepath.Join(dir, "required.txt"), []byte("required\n"), 0600)
+	snapshotRoot := t.TempDir()
+	snapshots, err := snapshot.Open(snapshotRoot, dir, snapshot.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(context.Background(), persistence, dir, nil, snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	run, err := manager.Submit(context.Background(), "forge.yaml", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dir, "version.txt"), []byte("B\n"), 0600)
+	os.Remove(filepath.Join(dir, "required.txt"))
+	os.WriteFile(filepath.Join(dir, "late.txt"), []byte("late"), 0600)
+	close(gate)
+	waitStatus(t, persistence, run.ID, store.RunPassed)
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(string(bytes.TrimSpace(data))) == dir {
+		t.Fatal("server run executed in mutable source workspace")
+	}
+	if run.SourceSnapshotSHA256 == nil {
+		t.Fatal("run did not expose source digest")
+	}
+	matches, _ := filepath.Glob(filepath.Join(snapshotRoot, "workspaces", "server", "runs", run.ID, "*"))
+	if len(matches) != 0 {
+		t.Fatalf("workspace not cleaned: %v", matches)
 	}
 }
 

@@ -19,22 +19,26 @@ import (
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
 	"github.com/nhatminh06/forgeci/internal/runner"
+	"github.com/nhatminh06/forgeci/internal/runworkspace"
+	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
 type Manager struct {
-	store        store.Store
-	workspace    string
-	output       io.Writer
-	wake         chan struct{}
-	workMu       sync.Mutex
-	workSignal   chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	mu           sync.Mutex
-	activeID     string
-	activeCancel context.CancelFunc
+	store         store.Store
+	workspace     string
+	snapshots     *snapshot.Store
+	workspaceRoot string
+	output        io.Writer
+	wake          chan struct{}
+	workMu        sync.Mutex
+	workSignal    chan struct{}
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	mu            sync.Mutex
+	activeID      string
+	activeCancel  context.CancelFunc
 }
 
 type InputError struct{ Err error }
@@ -43,7 +47,7 @@ func (e InputError) Error() string { return e.Err.Error() }
 func (e InputError) Unwrap() error { return e.Err }
 func inputError(err error) error   { return InputError{Err: err} }
 
-func New(parent context.Context, persistence store.Store, workspace string, output io.Writer) (*Manager, error) {
+func New(parent context.Context, persistence store.Store, workspace string, output io.Writer, snapshots ...*snapshot.Store) (*Manager, error) {
 	resolved, err := filepath.EvalSymlinks(workspace)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace: %w", err)
@@ -56,7 +60,12 @@ func New(parent context.Context, persistence store.Store, workspace string, outp
 	if output == nil {
 		output = io.Discard
 	}
-	return &Manager{store: persistence, workspace: resolved, output: output, wake: make(chan struct{}, 1), workSignal: make(chan struct{}), ctx: ctx, cancel: cancel}, nil
+	m := &Manager{store: persistence, workspace: resolved, output: output, wake: make(chan struct{}, 1), workSignal: make(chan struct{}), ctx: ctx, cancel: cancel}
+	if len(snapshots) > 0 {
+		m.snapshots = snapshots[0]
+		m.workspaceRoot = filepath.Join(snapshots[0].Root(), "workspaces", "server")
+	}
+	return m, nil
 }
 
 func (m *Manager) Start(ctx context.Context) error {
@@ -128,6 +137,13 @@ func (m *Manager) Submit(ctx context.Context, pipelineFile string, maxParallel i
 	}
 	sum := sha256.Sum256(data)
 	in := store.CreateRun{ID: uuid.NewString(), PipelineFile: pipelineFile, PipelineYAML: data, PipelineSHA256: hex.EncodeToString(sum[:]), Workspace: m.workspace, MaxParallel: maxParallel}
+	if m.snapshots != nil {
+		meta, err := m.snapshots.Capture(m.workspace)
+		if err != nil {
+			return nil, inputError(fmt.Errorf("capture source snapshot: %w", err))
+		}
+		in.Snapshot = &store.SourceSnapshot{SourceDigest: meta.SourceDigest, BlobDigest: meta.BlobDigest, Format: meta.Format, ArchiveSizeBytes: meta.ArchiveSizeBytes, LogicalSizeBytes: meta.LogicalSizeBytes, EntryCount: meta.EntryCount, CreatedAt: meta.CreatedAt}
+	}
 	for _, name := range graph.Order {
 		job := graph.Nodes[name].Job
 		in.Jobs = append(in.Jobs, store.Job{Name: name, Status: store.JobPending, Image: job.Image})
@@ -242,6 +258,43 @@ func (m *Manager) execute(runRecord *store.Run) {
 		m.mu.Unlock()
 		m.Notify()
 	}()
+	executionWorkspace := runRecord.Workspace
+	var marker runworkspace.Marker
+	if m.snapshots != nil && runRecord.SourceSnapshotSHA256 != nil {
+		marker = runworkspace.Marker{RunID: runRecord.ID, LeaseID: "local", Generation: 0, SourceDigest: *runRecord.SourceSnapshotSHA256}
+		workspace, err := runworkspace.Create(m.workspaceRoot, marker)
+		if err != nil {
+			message := err.Error()
+			m.finish(runRecord.ID, store.RunError, &message)
+			return
+		}
+		defer func() {
+			if err := runworkspace.Remove(m.workspaceRoot, workspace, marker); err != nil {
+				fmt.Fprintf(m.output, "workspace cleanup failed: %v\n", err)
+			}
+		}()
+		sourceDir := filepath.Join(workspace, "source")
+		if err := os.Mkdir(sourceDir, 0700); err != nil {
+			message := err.Error()
+			m.finish(runRecord.ID, store.RunError, &message)
+			return
+		}
+		blob, err := m.snapshots.OpenBlob(*runRecord.SourceSnapshotSHA256)
+		if err != nil {
+			message := err.Error()
+			m.finish(runRecord.ID, store.RunError, &message)
+			return
+		}
+		blobPath := blob.Name()
+		blob.Close()
+		meta := snapshot.Metadata{SourceDigest: *runRecord.SourceSnapshotSHA256, BlobDigest: runRecord.SnapshotBlobSHA256, Format: runRecord.SnapshotFormat, ArchiveSizeBytes: runRecord.SnapshotArchiveSize, LogicalSizeBytes: runRecord.SnapshotLogicalSize, EntryCount: runRecord.SnapshotEntryCount}
+		if err := snapshot.Extract(blobPath, sourceDir, meta, m.snapshots.Limits()); err != nil {
+			message := err.Error()
+			m.finish(runRecord.ID, store.RunError, &message)
+			return
+		}
+		executionWorkspace = sourceDir
+	}
 	cfg, err := config.ParseBytes(runRecord.PipelineYAML, "stored pipeline snapshot")
 	if err != nil {
 		message := err.Error()
@@ -254,11 +307,11 @@ func (m *Manager) execute(runRecord *store.Run) {
 		m.finish(runRecord.ID, store.RunError, &message)
 		return
 	}
-	local := executor.Local{Directory: runRecord.Workspace}
+	local := executor.Local{Directory: executionWorkspace}
 	var docker *executor.Docker
 	for _, job := range cfg.Jobs {
 		if job.Image != nil {
-			docker, err = executor.NewDocker(runRecord.Workspace)
+			docker, err = executor.NewDocker(executionWorkspace)
 			break
 		}
 	}
