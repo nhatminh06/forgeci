@@ -168,15 +168,18 @@ func TestRenewalReaperRaceHasConsistentOutcome(t *testing.T) {
 		deadline := time.Now().Add(100 * time.Millisecond)
 		_, _ = s.pool.Exec(ctx, `UPDATE pipeline_runs SET lease_expires_at=$2 WHERE id=$1`, run.ID, deadline)
 		start := make(chan struct{})
-		outcomes := make(chan error, 2)
+		renewed := make(chan error, 1)
+		reaped := make(chan error, 1)
 		go func() {
 			<-start
-			outcomes <- s.RenewLease(ctx, run.ID, runner.ID, *lease.LeaseID, lease.LeaseGeneration, time.Now().Add(time.Minute))
+			renewed <- s.RenewLease(ctx, run.ID, runner.ID, *lease.LeaseID, lease.LeaseGeneration, time.Now().Add(time.Minute))
 		}()
-		go func() { <-start; outcomes <- s.ExpireLeases(ctx, deadline.Add(time.Nanosecond)) }()
+		go func() { <-start; reaped <- s.ExpireLeases(ctx, deadline.Add(time.Nanosecond)) }()
 		close(start)
-		<-outcomes
-		<-outcomes
+		renewErr := <-renewed
+		if err := <-reaped; err != nil {
+			t.Fatal(err)
+		}
 		got, err := s.GetRun(ctx, run.ID)
 		if err != nil {
 			t.Fatal(err)
@@ -186,6 +189,9 @@ func TestRenewalReaperRaceHasConsistentOutcome(t *testing.T) {
 		}
 		if got.Status != store.RunRunning && got.Status != store.RunAborted {
 			t.Fatalf("invalid outcome %s", got.Status)
+		}
+		if renewErr == nil && got.Status == store.RunAborted {
+			t.Fatal("renewal succeeded but stale reaper aborted the run")
 		}
 	}
 }
