@@ -50,6 +50,14 @@ jobs:
       - run: test -f RUNNER_ONLY_MARKER
       - run: test "$(pwd)" = /workspace
 YAML
+cat >"$tmp/server/long.yaml" <<'YAML'
+version: 1
+jobs:
+  long:
+    steps:
+      - run: sleep 60
+      - run: touch SHOULD_NOT_EXIST
+YAML
 touch "$tmp/server/SERVER_ONLY_MARKER"
 printf '%s\n' integration-token >"$tmp/token"
 chmod 600 "$tmp/token"
@@ -74,7 +82,7 @@ done
 
 submit() { "$tmp/bin/forge" submit --server "http://127.0.0.1:$api_port" --file "$1" --jobs "${2:-1}" | awk '{print $2}'; }
 status() { "$tmp/bin/forge" inspect "$1" --server "http://127.0.0.1:$api_port" 2>/dev/null | sed -n 's/^Status: //p'; }
-wait_status() { id=$1; wanted=$2; i=0; while [ "$(status "$id")" != "$wanted" ]; do i=$((i+1)); [ "$i" -lt 300 ] || { "$tmp/bin/forge" inspect "$id" --server "http://127.0.0.1:$api_port"; exit 1; }; sleep .1; done; }
+wait_status() { id=$1; wanted=$2; i=0; while [ "$(status "$id")" != "$wanted" ]; do i=$((i+1)); [ "$i" -lt 450 ] || { "$tmp/bin/forge" inspect "$id" --server "http://127.0.0.1:$api_port"; exit 1; }; sleep .1; done; }
 
 queued=$(submit remote.yaml)
 sleep 1
@@ -98,8 +106,19 @@ wait_status "$first" PASSED; wait_status "$second" PASSED
 docker_run=$(submit docker.yaml)
 wait_status "$docker_run" PASSED
 
+canceled=$(submit long.yaml)
+i=0; while [ "$(status "$canceled")" != RUNNING ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
+"$tmp/bin/forge" cancel "$canceled" --server "http://127.0.0.1:$api_port" >/dev/null
+wait_status "$canceled" CANCELED
+[ ! -e "$tmp/runner-a/SHOULD_NOT_EXIST" ]
+[ ! -e "$tmp/runner-b/SHOULD_NOT_EXIST" ]
+
 identity=$(tr -d '\n' <"$tmp/state-a/runner-id")
-kill "$runner_a_pid"; wait "$runner_a_pid" || true; runner_a_pid=
+kill "$runner_b_pid"; wait "$runner_b_pid" || true; runner_b_pid=
+lost=$(submit long.yaml)
+i=0; while [ "$(status "$lost")" != RUNNING ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
+kill -9 "$runner_a_pid"; wait "$runner_a_pid" >/dev/null 2>&1 || true; runner_a_pid=
+wait_status "$lost" ABORTED
 FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace "$tmp/runner-a" --state-dir "$tmp/state-a" --name runner-a --max-parallel 2 >"$tmp/runner-a-2.log" 2>&1 & runner_a_pid=$!
 [ "$(tr -d '\n' <"$tmp/state-a/runner-id")" = "$identity" ]
 
