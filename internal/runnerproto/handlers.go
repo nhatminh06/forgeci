@@ -26,12 +26,12 @@ type RegisterRequest struct {
 }
 
 type RegisterResponse struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Status        string    `json:"status"`
-	RegisteredAt  time.Time `json:"registered_at"`
-	LastSeenAt    time.Time `json:"last_seen_at"`
-	CurrentRunID  *string   `json:"current_run_id,omitempty"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Status       string    `json:"status"`
+	RegisteredAt time.Time `json:"registered_at"`
+	LastSeenAt   time.Time `json:"last_seen_at"`
+	CurrentRunID *string   `json:"current_run_id,omitempty"`
 }
 
 type HeartbeatRequest struct {
@@ -41,9 +41,10 @@ type HeartbeatRequest struct {
 }
 
 type HeartbeatResponse struct {
-	LeaseValid       bool `json:"lease_valid"`
-	CancelRequested  bool `json:"cancel_requested"`
-	ServerShutdown   bool `json:"server_shutdown"`
+	LeaseValid      bool       `json:"lease_valid"`
+	CancelRequested bool       `json:"cancel_requested"`
+	ServerShutdown  bool       `json:"server_shutdown"`
+	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
 }
 
 type LeaseRequest struct {
@@ -51,20 +52,20 @@ type LeaseRequest struct {
 }
 
 type LeaseResponse struct {
-	RunID             string `json:"run_id"`
-	LeaseID           string `json:"lease_id"`
-	Generation        int    `json:"generation"`
-	PipelineYAML      []byte `json:"pipeline_yaml"`
-	EffectiveParallel int    `json:"effective_parallel"`
+	RunID             string    `json:"run_id"`
+	LeaseID           string    `json:"lease_id"`
+	Generation        int       `json:"generation"`
+	PipelineYAML      []byte    `json:"pipeline_yaml"`
+	EffectiveParallel int       `json:"effective_parallel"`
 	ExpiresAt         time.Time `json:"expires_at"`
 }
 
 type JobEventRequest struct {
-	RunID     string `json:"run_id"`
-	LeaseID   string `json:"lease_id"`
+	RunID      string `json:"run_id"`
+	LeaseID    string `json:"lease_id"`
 	Generation int    `json:"generation"`
-	JobName   string `json:"job_name"`
-	Status    string `json:"status"`
+	JobName    string `json:"job_name"`
+	Status     string `json:"status"`
 }
 
 type JobEventResponse struct {
@@ -232,6 +233,7 @@ func (h *Handlers) Heartbeat(w http.ResponseWriter, r *http.Request) {
 
 	// Check if lease is still valid and renew if requested
 	var leaseValid bool
+	var renewedUntil *time.Time
 	if req.ActiveLeaseID != nil && *req.ActiveLeaseID != "" {
 		// Get the run to check lease status
 		runner, err := h.store.GetRunner(r.Context(), req.RunnerID)
@@ -244,7 +246,11 @@ func (h *Handlers) Heartbeat(w http.ResponseWriter, r *http.Request) {
 				// Renew lease
 				ttl := 30 * time.Second
 				newExpiry := time.Now().UTC().Add(ttl)
-				h.store.RenewLease(r.Context(), *runner.CurrentRunID, req.RunnerID, run.LeaseGeneration, newExpiry)
+				if h.store.RenewLease(r.Context(), *runner.CurrentRunID, req.RunnerID, run.LeaseGeneration, newExpiry) == nil {
+					renewedUntil = &newExpiry
+				} else {
+					leaseValid = false
+				}
 			}
 		}
 	}
@@ -265,6 +271,7 @@ func (h *Handlers) Heartbeat(w http.ResponseWriter, r *http.Request) {
 		LeaseValid:      leaseValid,
 		CancelRequested: cancelRequested,
 		ServerShutdown:  h.shutting,
+		LeaseExpiresAt:  renewedUntil,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
