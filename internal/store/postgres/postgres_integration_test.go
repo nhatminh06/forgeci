@@ -90,6 +90,9 @@ func TestRemoteLeaseOwnershipTransitionsAndExpiration(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `UPDATE pipeline_runs SET lease_expires_at=now()-interval '1 second' WHERE id=$1`, run.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.CompleteRun(ctx, run.ID, owner.ID, id, generation, store.RunPassed, nil); err == nil {
+		t.Fatal("expired running lease completed run")
+	}
 	if err := s.ExpireLeases(ctx, time.Now()); err != nil {
 		t.Fatal(err)
 	}
