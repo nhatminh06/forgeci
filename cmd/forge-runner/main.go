@@ -37,7 +37,6 @@ type Config struct {
 	StateDir    string
 	MaxParallel int
 	TLSCA       string
-	Insecure    bool
 }
 
 type RemoteRunner struct {
@@ -63,17 +62,16 @@ func main() {
 	homeDir, _ := os.UserHomeDir()
 	cfg := &Config{}
 	flag.StringVar(&cfg.ServerAddr, "server", "http://localhost:9090", "Control plane runner listener address")
-	flag.StringVar(&cfg.ServerToken, "token", os.Getenv("FORGECI_RUNNER_TOKEN"), "Bearer token for authentication")
+	cfg.ServerToken = os.Getenv("FORGECI_RUNNER_TOKEN")
 	flag.StringVar(&cfg.Name, "name", hostname(), "Runner name (default: hostname)")
 	flag.StringVar(&cfg.Workspace, "workspace", ".", "Pipeline workspace directory")
 	flag.StringVar(&cfg.StateDir, "state-dir", filepath.Join(homeDir, ".forgeci", "runner"), "State directory for runner ID")
 	flag.IntVar(&cfg.MaxParallel, "max-parallel", runtime.NumCPU(), "Maximum parallel jobs")
 	flag.StringVar(&cfg.TLSCA, "ca-cert", "", "Path to CA certificate for TLS verification")
-	flag.BoolVar(&cfg.Insecure, "insecure", false, "Skip TLS verification (development only)")
 	flag.Parse()
 
 	if cfg.ServerToken == "" {
-		fmt.Fprintf(os.Stderr, "Error: runner token required (set --token or FORGECI_RUNNER_TOKEN)\n")
+		fmt.Fprintln(os.Stderr, "Error: runner token required (set FORGECI_RUNNER_TOKEN)")
 		os.Exit(1)
 	}
 
@@ -124,9 +122,9 @@ func newRemoteRunner(ctx context.Context, cancel context.CancelFunc, cfg *Config
 		Timeout: 30 * time.Second,
 	}
 
-	if cfg.TLSCA != "" || cfg.Insecure {
+	if cfg.TLSCA != "" {
 		tlsConfig := &tls.Config{
-			InsecureSkipVerify: cfg.Insecure,
+			MinVersion: tls.VersionTLS12,
 		}
 		if cfg.TLSCA != "" {
 			pem, err := os.ReadFile(cfg.TLSCA)
