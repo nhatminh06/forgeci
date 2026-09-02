@@ -160,6 +160,10 @@ func inspect(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	fmt.Fprintf(stdout, "Run\nID: %s\nStatus: %s\nPipeline: %s\nCreated: %s\n", item.ID, item.Status, item.PipelineFile, item.CreatedAt.Format(time.RFC3339))
+	fmt.Fprintf(stdout, "Pipeline SHA-256: %s\n", item.PipelineSHA256)
+	if item.SourceSnapshotSHA256 != nil {
+		fmt.Fprintf(stdout, "Source snapshot SHA-256: %s\n", *item.SourceSnapshotSHA256)
+	}
 	if item.StartedAt != nil {
 		fmt.Fprintf(stdout, "Started: %s\n", item.StartedAt.Format(time.RFC3339))
 	}

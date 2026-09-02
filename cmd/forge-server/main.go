@@ -18,6 +18,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/api"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
 	"github.com/nhatminh06/forgeci/internal/runnerproto"
+	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store/postgres"
 )
 
@@ -35,6 +36,10 @@ func run() error {
 	flags := flag.NewFlagSet("forge-server", flag.ContinueOnError)
 	listen := flags.String("listen", "127.0.0.1:8080", "loopback listen address")
 	workspace := flags.String("workspace", cwd, "repository workspace")
+	snapshotDir := flags.String("snapshot-dir", "", "source snapshot store directory (required, outside workspace)")
+	maxSnapshotEntries := flags.Int("snapshot-max-entries", 100000, "maximum source snapshot entries")
+	maxSnapshotLogical := flags.Int64("snapshot-max-logical-bytes", 1<<30, "maximum logical source bytes")
+	maxSnapshotArchive := flags.Int64("snapshot-max-archive-bytes", 512<<20, "maximum compressed snapshot bytes")
 	databaseURL := flags.String("database-url", os.Getenv("DATABASE_URL"), "PostgreSQL connection URL")
 	executionMode := flags.String("execution-mode", "local", "execution mode: local or remote")
 	runnerListen := flags.String("runner-listen", "127.0.0.1:9090", "runner protocol listener address")
@@ -53,6 +58,9 @@ func run() error {
 	}
 	if *databaseURL == "" {
 		return fmt.Errorf("database URL is required")
+	}
+	if *snapshotDir == "" {
+		return fmt.Errorf("snapshot directory is required")
 	}
 
 	// Validate execution mode
@@ -87,6 +95,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	limits := snapshot.DefaultLimits()
+	limits.MaxEntries = *maxSnapshotEntries
+	limits.MaxLogicalBytes = *maxSnapshotLogical
+	limits.MaxArchiveBytes = *maxSnapshotArchive
+	if limits.MaxEntries < 1 || limits.MaxLogicalBytes < 1 || limits.MaxArchiveBytes < 1 {
+		return fmt.Errorf("snapshot limits must be greater than zero")
+	}
+	snapshotStore, err := snapshot.Open(*snapshotDir, absolute, limits)
+	if err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	persistence, err := postgres.Open(ctx, *databaseURL)
@@ -94,7 +113,7 @@ func run() error {
 		return err
 	}
 	defer persistence.Close()
-	manager, err := controlplane.New(ctx, persistence, absolute, os.Stdout)
+	manager, err := controlplane.New(ctx, persistence, absolute, os.Stdout, snapshotStore)
 	if err != nil {
 		return err
 	}
@@ -115,6 +134,7 @@ func run() error {
 	var runnerServer *http.Server
 	if *executionMode == "remote" {
 		handlers := runnerproto.NewHandlers(persistence, runnerToken, manager.WorkAvailable)
+		handlers.SetSnapshotOpener(snapshotStore.OpenBlob)
 
 		// Start lease expiration sweeper
 		go func() {
