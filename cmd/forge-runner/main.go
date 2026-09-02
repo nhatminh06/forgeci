@@ -54,6 +54,7 @@ type RemoteRunner struct {
 	leaseMutex      sync.Mutex
 	shutdownOnce    sync.Once
 	shutdownChan    chan struct{}
+	workers         sync.WaitGroup
 	ctx             context.Context
 	cancel          context.CancelFunc
 }
@@ -215,17 +216,14 @@ func (rr *RemoteRunner) run() error {
 	fmt.Printf("Runner %s registered with control plane\n", rr.config.Name)
 
 	// Start heartbeat loop
-	go rr.heartbeatLoop()
-	go rr.leaseDeadlineLoop()
-
-	// Start work acquisition loop
-	go rr.workLoop()
-
-	// Start execution loop
-	go rr.executionLoop()
+	for _, worker := range []func(){rr.heartbeatLoop, rr.leaseDeadlineLoop, rr.workLoop, rr.executionLoop} {
+		rr.workers.Add(1)
+		go func() { defer rr.workers.Done(); worker() }()
+	}
 
 	// Wait for shutdown
 	<-rr.shutdownChan
+	rr.workers.Wait()
 	return nil
 }
 
