@@ -277,7 +277,7 @@ func (s *Store) RegisterRunner(ctx context.Context, r store.Runner) (*store.Runn
 
 	_, err = tx.Exec(ctx, `INSERT INTO runners(id,name,protocol_version,os,arch,docker_available,max_parallel,status,registered_at,last_seen_at)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8,now(),now())
-		ON CONFLICT(id) DO UPDATE SET 
+		ON CONFLICT(id) DO UPDATE SET
 			name=EXCLUDED.name,
 			protocol_version=EXCLUDED.protocol_version,
 			os=EXCLUDED.os,
@@ -475,7 +475,7 @@ func (s *Store) CompleteRun(ctx context.Context, runID, runnerID, leaseID string
 	// Verify lease before accepting completion
 	var leaseValid bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM pipeline_runs 
+		SELECT 1 FROM pipeline_runs
 		WHERE id=$1 AND runner_id=$2 AND lease_id=$3 AND lease_generation=$4 AND status='RUNNING' AND lease_expires_at > now()
 	)`, runID, runnerID, leaseID, expectedGeneration).Scan(&leaseValid)
 	if err != nil {
