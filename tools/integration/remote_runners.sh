@@ -50,6 +50,15 @@ jobs:
       - run: test -f RUNNER_ONLY_MARKER
       - run: test "$(pwd)" = /workspace
 YAML
+cat >"$tmp/server/partition.yaml" <<'YAML'
+version: 1
+jobs:
+  partition:
+    image: alpine:3.20
+    steps:
+      - run: sleep 60
+      - run: touch SHOULD_NOT_EXIST
+YAML
 cat >"$tmp/server/long.yaml" <<'YAML'
 version: 1
 jobs:
@@ -121,6 +130,22 @@ kill -9 "$runner_a_pid"; wait "$runner_a_pid" >/dev/null 2>&1 || true; runner_a_
 wait_status "$lost" ABORTED
 FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace "$tmp/runner-a" --state-dir "$tmp/state-a" --name runner-a --max-parallel 2 >"$tmp/runner-a-2.log" 2>&1 & runner_a_pid=$!
 [ "$(tr -d '\n' <"$tmp/state-a/runner-id")" = "$identity" ]
+
+partitioned=$(submit partition.yaml)
+i=0; while [ "$(status "$partitioned")" != RUNNING ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
+lease_row=$(docker exec "$pg" psql -U postgres -d forgeci -At -F ' ' -c "SELECT runner_id,lease_id,lease_generation FROM pipeline_runs WHERE id='$partitioned'")
+partition_runner=$(printf '%s' "$lease_row" | awk '{print $1}')
+partition_lease=$(printf '%s' "$lease_row" | awk '{print $2}')
+partition_generation=$(printf '%s' "$lease_row" | awk '{print $3}')
+kill -STOP "$server_pid"
+sleep 36
+test -z "$(docker ps -q --filter label=forgeci.managed=true)"
+[ ! -e "$tmp/runner-a/SHOULD_NOT_EXIST" ]
+kill -CONT "$server_pid"
+wait_status "$partitioned" ABORTED
+stale_code=$(curl -sS -o "$tmp/stale.json" -w '%{http_code}' -X POST -H 'Authorization: Bearer integration-token' -H 'Content-Type: application/json' --data "{\"runner_id\":\"$partition_runner\",\"run_id\":\"$partitioned\",\"lease_id\":\"$partition_lease\",\"generation\":$partition_generation,\"status\":\"PASSED\"}" "http://127.0.0.1:$runner_port/v1/runner/leases/$partition_lease/complete")
+[ "$stale_code" = 409 ]
+[ "$(status "$partitioned")" = ABORTED ]
 
 if grep -F integration-token "$tmp"/*.log >/dev/null 2>&1; then echo "runner token leaked" >&2; exit 1; fi
 test -z "$(docker ps -q --filter label=forgeci.managed=true)"
