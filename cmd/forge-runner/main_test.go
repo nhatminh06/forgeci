@@ -82,3 +82,21 @@ func TestRemoteRunnerExecutesPipelineAndSignalsCompletion(t *testing.T) {
 		// optional; no-op
 	}
 }
+
+func TestLocalLeaseDeadlineCancelsActiveWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	rr := &RemoteRunner{currentRunID: "run", leaseExpiresAt: time.Now().Add(20 * time.Millisecond), activeCancel: cancel, shutdownChan: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { rr.leaseDeadlineLoop(); close(done) }()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expired local lease did not cancel work")
+	}
+	close(rr.shutdownChan)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("deadline loop leaked")
+	}
+}
