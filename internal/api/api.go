@@ -25,7 +25,15 @@ type Manager interface {
 	Cancel(context.Context, string) (store.RunStatus, error)
 }
 
-type Server struct{ Manager Manager }
+type Store interface {
+	Ping(context.Context) error
+	ListRunners(context.Context) ([]store.Runner, error)
+}
+
+type Server struct {
+	Manager Manager
+	Store   Store
+}
 
 func (s Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 
@@ -38,6 +46,8 @@ func (s Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.create(w, r)
 	case r.URL.Path == "/v1/runs" && r.Method == http.MethodGet:
 		s.list(w, r)
+	case r.URL.Path == "/v1/runners" && r.Method == http.MethodGet:
+		s.runners(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/runs/"):
 		s.run(w, r)
 	default:
@@ -95,6 +105,21 @@ func (s Server) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+func (s Server) runners(w http.ResponseWriter, r *http.Request) {
+	if s.Store == nil {
+		writeError(w, http.StatusServiceUnavailable, "runner management unavailable")
+		return
+	}
+	runners, err := s.Store.ListRunners(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	if runners == nil {
+		runners = []store.Runner{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runners": runners})
 }
 func (s Server) run(w http.ResponseWriter, r *http.Request) {
 	suffix := strings.TrimPrefix(r.URL.Path, "/v1/runs/")

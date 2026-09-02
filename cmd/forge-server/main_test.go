@@ -14,3 +14,25 @@ func TestValidateLoopback(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRunnerListener(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:9090", "[::1]:9090", "localhost:9090"} {
+		if err := validateRunnerListener(address, "", ""); err != nil {
+			t.Fatalf("%s: %v", address, err)
+		}
+	}
+	for _, address := range []string{"0.0.0.0:9090", "[::]:9090", "192.0.2.1:9090"} {
+		if err := validateRunnerListener(address, "", ""); err == nil {
+			t.Fatalf("accepted plaintext %s", address)
+		}
+	}
+	if err := validateRunnerListener("127.0.0.1:9090", "cert.pem", ""); err == nil {
+		t.Fatal("accepted certificate without key")
+	}
+	if err := validateRunnerListener("127.0.0.1:9090", "", "key.pem"); err == nil {
+		t.Fatal("accepted key without certificate")
+	}
+	if err := validateRunnerListener("0.0.0.0:9090", "missing.pem", "missing-key.pem"); err == nil {
+		t.Fatal("accepted missing TLS files")
+	}
+}

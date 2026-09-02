@@ -111,6 +111,35 @@ func (f *fakeStore) UpdateJob(_ context.Context, id, name string, status store.J
 	return errors.New("unknown job")
 }
 
+// Remote runner methods (stubs for local execution mode)
+func (f *fakeStore) RegisterRunner(context.Context, store.Runner) (*store.Runner, error) {
+	return nil, nil
+}
+func (f *fakeStore) GetRunner(context.Context, string) (*store.Runner, error) {
+	return nil, store.ErrNotFound
+}
+func (f *fakeStore) ListRunners(context.Context) ([]store.Runner, error) {
+	return nil, nil
+}
+func (f *fakeStore) UpdateRunnerLiveness(context.Context, string, time.Time) error {
+	return nil
+}
+func (f *fakeStore) LeaseRun(context.Context, string, string) (*store.Run, error) {
+	return nil, nil
+}
+func (f *fakeStore) RenewLease(context.Context, string, string, string, int, time.Time) error {
+	return nil
+}
+func (f *fakeStore) ReportJobEvent(context.Context, string, string, string, int, string, store.JobStatus) error {
+	return nil
+}
+func (f *fakeStore) CompleteRun(context.Context, string, string, string, int, store.RunStatus, *string) error {
+	return nil
+}
+func (f *fakeStore) ExpireLeases(context.Context, time.Time) error {
+	return nil
+}
+
 func TestPersistenceFailureStopsRunWithError(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "forge.yaml", "touch "+filepath.Join(dir, "must-not-complete"))

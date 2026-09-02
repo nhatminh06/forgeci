@@ -46,6 +46,12 @@ type Run struct {
 	CancelRequestedAt *time.Time `json:"cancel_requested_at"`
 	ErrorMessage      *string    `json:"error_message,omitempty"`
 	Jobs              []Job      `json:"jobs,omitempty"`
+	// Remote runner fields
+	RunnerID          *string    `json:"runner_id,omitempty"`
+	LeaseID           *string    `json:"lease_id,omitempty"`
+	LeaseGeneration   int        `json:"lease_generation"`
+	LeaseExpiresAt    *time.Time `json:"lease_expires_at,omitempty"`
+	EffectiveParallel *int       `json:"effective_parallel,omitempty"`
 }
 
 type Job struct {
@@ -55,6 +61,27 @@ type Job struct {
 	StartedAt    *time.Time `json:"started_at"`
 	FinishedAt   *time.Time `json:"finished_at"`
 	ErrorMessage *string    `json:"error_message,omitempty"`
+}
+
+type RunnerStatus string
+
+const (
+	RunnerOnline  RunnerStatus = "ONLINE"
+	RunnerOffline RunnerStatus = "OFFLINE"
+)
+
+type Runner struct {
+	ID              string       `json:"id"`
+	Name            string       `json:"name"`
+	ProtocolVersion int          `json:"protocol_version"`
+	OS              string       `json:"os"`
+	Arch            string       `json:"arch"`
+	DockerAvailable bool         `json:"docker"`
+	MaxParallel     int          `json:"max_parallel"`
+	Status          RunnerStatus `json:"status"`
+	RegisteredAt    time.Time    `json:"registered_at"`
+	LastSeenAt      time.Time    `json:"last_seen_at"`
+	CurrentRunID    *string      `json:"current_run_id,omitempty"`
 }
 
 type CreateRun struct {
@@ -75,6 +102,17 @@ type Store interface {
 	CancelQueued(context.Context, string) error
 	RequestCancel(context.Context, string) (RunStatus, error)
 	RecoverInterrupted(context.Context) error
+	// Runner management
+	RegisterRunner(context.Context, Runner) (*Runner, error)
+	GetRunner(context.Context, string) (*Runner, error)
+	ListRunners(context.Context) ([]Runner, error)
+	UpdateRunnerLiveness(context.Context, string, time.Time) error
+	// Lease management
+	LeaseRun(context.Context, string, string) (*Run, error)
+	RenewLease(context.Context, string, string, string, int, time.Time) error
+	ReportJobEvent(context.Context, string, string, string, int, string, JobStatus) error
+	CompleteRun(context.Context, string, string, string, int, RunStatus, *string) error
+	ExpireLeases(context.Context, time.Time) error
 	Close()
 }
 

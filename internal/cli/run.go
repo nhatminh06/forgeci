@@ -22,6 +22,7 @@ Usage:
   forge run [--file <path>] [--jobs <N>]
   forge submit [--server <url>] [--file <path>] [--jobs <N>]
   forge runs [--server <url>] [--limit <N>]
+  forge runners [--server <url>]
   forge inspect <run-id> [--server <url>]
   forge cancel <run-id> [--server <url>]
   forge --help
@@ -50,6 +51,8 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		return submit(ctx, args[1:], stdout, stderr)
 	case "runs":
 		return runs(ctx, args[1:], stdout, stderr)
+	case "runners":
+		return runners(ctx, args[1:], stdout, stderr)
 	case "inspect":
 		return inspect(ctx, args[1:], stdout, stderr)
 	case "cancel":
@@ -105,6 +108,37 @@ func runs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "ID\tSTATUS\tCREATED")
 	for _, item := range items {
 		fmt.Fprintf(stdout, "%s\t%s\t%s\n", item.ID, item.Status, item.CreatedAt.Format(time.RFC3339))
+	}
+	return 0
+}
+func runners(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("runners", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", defaultServer, "control-plane URL")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "unexpected arguments")
+		return 2
+	}
+	runners, err := newControlClient(*server).Runners(ctx)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	fmt.Fprintln(stdout, "NAME\tSTATUS\tOS\tARCH\tDOCKER\tCAPACITY\tCURRENT_RUN")
+	for _, runner := range runners {
+		docker := "no"
+		if runner.DockerAvailable {
+			docker = "yes"
+		}
+		currentRun := "-"
+		if runner.CurrentRunID != nil && *runner.CurrentRunID != "" {
+			currentRun = *runner.CurrentRunID
+		}
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+			runner.Name, runner.Status, runner.OS, runner.Arch, docker, runner.MaxParallel, currentRun)
 	}
 	return 0
 }
