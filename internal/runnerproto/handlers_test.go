@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +36,45 @@ func TestAuthenticationBoundary(t *testing.T) {
 	h.AuthMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true })).ServeHTTP(response, req)
 	if !called {
 		t.Fatal("valid token rejected")
+	}
+}
+
+type sourceStore struct {
+	RunnerStore
+	run *store.Run
+}
+
+func (s sourceStore) GetRun(context.Context, string) (*store.Run, error) { return s.run, nil }
+
+func TestSourceRequiresCurrentLeaseOwnership(t *testing.T) {
+	runnerID := "00000000-0000-4000-8000-000000000001"
+	runID := "00000000-0000-4000-8000-000000000002"
+	leaseID := "00000000-0000-4000-8000-000000000003"
+	digest := strings.Repeat("a", 64)
+	expiry := time.Now().Add(time.Minute)
+	run := &store.Run{ID: runID, Status: store.RunRunning, RunnerID: &runnerID, LeaseID: &leaseID, LeaseGeneration: 2, LeaseExpiresAt: &expiry, SourceSnapshotSHA256: &digest, SnapshotArchiveSize: 4, SnapshotBlobSHA256: strings.Repeat("b", 64)}
+	file := t.TempDir() + "/blob"
+	os.WriteFile(file, []byte("data"), 0600)
+	h := NewHandlers(sourceStore{run: run}, "token")
+	h.SetSnapshotOpener(func(string) (*os.File, error) { return os.Open(file) })
+	request := func(query string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/v1/runner/leases/"+leaseID+"/source?"+query, nil)
+		w := httptest.NewRecorder()
+		h.Source(w, r)
+		return w
+	}
+	valid := request("runner_id=" + runnerID + "&run_id=" + runID + "&generation=2")
+	if valid.Code != http.StatusOK || valid.Body.String() != "data" {
+		t.Fatalf("valid source: %d %q", valid.Code, valid.Body.String())
+	}
+	for _, query := range []string{"runner_id=00000000-0000-4000-8000-000000000099&run_id=" + runID + "&generation=2", "runner_id=" + runnerID + "&run_id=" + runID + "&generation=1"} {
+		if got := request(query); got.Code != http.StatusConflict {
+			t.Fatalf("ownership bypass: %d", got.Code)
+		}
+	}
+	run.LeaseExpiresAt = func() *time.Time { v := time.Now().Add(-time.Second); return &v }()
+	if got := request("runner_id=" + runnerID + "&run_id=" + runID + "&generation=2"); got.Code != http.StatusConflict {
+		t.Fatalf("expired lease accepted: %d", got.Code)
 	}
 }
 

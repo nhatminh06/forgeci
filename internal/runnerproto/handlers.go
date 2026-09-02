@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -57,12 +60,18 @@ type LeaseRequest struct {
 }
 
 type LeaseResponse struct {
-	RunID             string    `json:"run_id"`
-	LeaseID           string    `json:"lease_id"`
-	Generation        int       `json:"generation"`
-	PipelineYAML      []byte    `json:"pipeline_yaml"`
-	EffectiveParallel int       `json:"effective_parallel"`
-	ExpiresAt         time.Time `json:"expires_at"`
+	RunID                string    `json:"run_id"`
+	LeaseID              string    `json:"lease_id"`
+	Generation           int       `json:"generation"`
+	PipelineYAML         []byte    `json:"pipeline_yaml"`
+	EffectiveParallel    int       `json:"effective_parallel"`
+	ExpiresAt            time.Time `json:"expires_at"`
+	SourceSnapshotSHA256 string    `json:"source_snapshot_sha256"`
+	BlobSHA256           string    `json:"blob_sha256"`
+	ArchiveSizeBytes     int64     `json:"archive_size_bytes"`
+	LogicalSizeBytes     int64     `json:"logical_size_bytes"`
+	EntryCount           int       `json:"entry_count"`
+	ArchiveFormat        string    `json:"archive_format"`
 }
 
 type JobEventRequest struct {
@@ -114,7 +123,10 @@ type Handlers struct {
 	shutting    atomic.Bool
 	longPollTTL time.Duration
 	workSignal  func() <-chan struct{}
+	openBlob    func(string) (*os.File, error)
 }
+
+func (h *Handlers) SetSnapshotOpener(open func(string) (*os.File, error)) { h.openBlob = open }
 
 func NewHandlers(store RunnerStore, token string, signals ...func() <-chan struct{}) *Handlers {
 	h := &Handlers{
@@ -366,6 +378,10 @@ func (h *Handlers) Lease(w http.ResponseWriter, r *http.Request) {
 				PipelineYAML:      run.PipelineYAML,
 				EffectiveParallel: *run.EffectiveParallel,
 				ExpiresAt:         *run.LeaseExpiresAt,
+				BlobSHA256:        run.SnapshotBlobSHA256, ArchiveSizeBytes: run.SnapshotArchiveSize, LogicalSizeBytes: run.SnapshotLogicalSize, EntryCount: run.SnapshotEntryCount, ArchiveFormat: run.SnapshotFormat,
+			}
+			if run.SourceSnapshotSHA256 != nil {
+				resp.SourceSnapshotSHA256 = *run.SourceSnapshotSHA256
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -507,12 +523,53 @@ func (h *Handlers) CompleteRun(w http.ResponseWriter, r *http.Request) {
 // Handle dynamic lease routes
 func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-	if pathContains(path, "/events") {
+	if strings.HasSuffix(path, "/source") {
+		h.Source(w, r)
+	} else if pathContains(path, "/events") {
 		h.JobEvent(w, r)
 	} else if pathContains(path, "/complete") {
 		h.CompleteRun(w, r)
 	} else {
 		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func (h *Handlers) Source(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || h.openBlob == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 5 || parts[0] != "v1" || parts[1] != "runner" || parts[2] != "leases" || parts[4] != "source" || !validUUID(parts[3]) {
+		writeError(w, http.StatusBadRequest, "invalid source request")
+		return
+	}
+	runnerID, runID := r.URL.Query().Get("runner_id"), r.URL.Query().Get("run_id")
+	generation, err := strconv.Atoi(r.URL.Query().Get("generation"))
+	if !validUUID(runnerID) || !validUUID(runID) || err != nil || generation < 1 {
+		writeError(w, http.StatusBadRequest, "invalid source ownership")
+		return
+	}
+	run, err := h.store.GetRun(r.Context(), runID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if run.Status != store.RunRunning || run.RunnerID == nil || *run.RunnerID != runnerID || run.LeaseID == nil || *run.LeaseID != parts[3] || run.LeaseGeneration != generation || run.LeaseExpiresAt == nil || !time.Now().UTC().Before(*run.LeaseExpiresAt) || run.SourceSnapshotSHA256 == nil {
+		writeError(w, http.StatusConflict, "invalid or expired lease")
+		return
+	}
+	f, err := h.openBlob(*run.SourceSnapshotSHA256)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "source unavailable")
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/vnd.forgeci.source+gzip")
+	w.Header().Set("Content-Length", strconv.FormatInt(run.SnapshotArchiveSize, 10))
+	w.Header().Set("X-ForgeCI-Blob-SHA256", run.SnapshotBlobSHA256)
+	if _, err := io.CopyN(w, f, run.SnapshotArchiveSize); err != nil {
+		return
 	}
 }
 
