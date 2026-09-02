@@ -1,4 +1,4 @@
-# Milestone 4 architecture
+# Milestone 5 architecture
 
 ```text
 HTTP API
@@ -28,7 +28,7 @@ completion events and state updates
 
 The control plane atomically stores each run and all of its jobs before execution. It retains the exact pipeline YAML bytes and their SHA-256 digest. The dispatcher reconstructs the DAG from those stored bytes rather than rereading the submitted path.
 
-The control plane decides which pipeline run is active. The existing scheduler remains a separate layer that decides which jobs inside that run are ready. A narrow observer reports live job-state transitions to the manager without introducing SQL into the runner.
+Milestone 5 adds a runner protocol layer. Registered runners announce capabilities, send heartbeats, request a lease, and then execute a whole pipeline payload that has already been assigned to them. The control plane still decides which pipeline run is active, but a remote runner is now the execution owner for the leased run. A narrow observer reports live job-state transitions to the manager without introducing SQL into the runner.
 
 The `pipeline` package compiles validated configuration into graph nodes containing sorted dependency and dependent lists. Kahn's algorithm creates a topological order, using lexicographic job names whenever multiple nodes are ready. If not every node can be ordered, compilation reports the jobs involved in a dependency cycle.
 
@@ -48,4 +48,4 @@ Direct `forge run` still enters the parser/compiler/scheduler path directly and 
 
 ## Intentionally absent
 
-Milestone 4 has no remote workers, persistent logs, source snapshot, artifacts, cache, SCM integrations, authentication, deployments, or distributed control plane. Docker execution remains unsuitable as hostile-code isolation.
+Milestone 5 has no multi-run runner scheduling, artifact distribution, persistent log streaming, source snapshot replication, artifact or cache services, SCM triggers, deployment orchestration, authentication beyond a shared runner bearer token, or distributed control-plane coordination. Docker execution remains unsuitable as hostile-code isolation.
