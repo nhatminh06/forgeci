@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,21 +111,25 @@ type RunnerStore interface {
 type Handlers struct {
 	store       RunnerStore
 	token       string
-	shutting    bool
+	shutting    atomic.Bool
 	longPollTTL time.Duration
+	workSignal  func() <-chan struct{}
 }
 
-func NewHandlers(store RunnerStore, token string) *Handlers {
-	return &Handlers{
+func NewHandlers(store RunnerStore, token string, signals ...func() <-chan struct{}) *Handlers {
+	h := &Handlers{
 		store:       store,
 		token:       token,
-		shutting:    false,
 		longPollTTL: 20 * time.Second,
 	}
+	if len(signals) > 0 {
+		h.workSignal = signals[0]
+	}
+	return h
 }
 
 func (h *Handlers) SetShuttingDown(value bool) {
-	h.shutting = value
+	h.shutting.Store(value)
 }
 
 // Middleware to check bearer token
@@ -312,7 +317,7 @@ func (h *Handlers) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	resp := HeartbeatResponse{
 		LeaseValid:      leaseValid,
 		CancelRequested: cancelRequested,
-		ServerShutdown:  h.shutting,
+		ServerShutdown:  h.shutting.Load(),
 		LeaseExpiresAt:  renewedUntil,
 	}
 
@@ -340,12 +345,11 @@ func (h *Handlers) Lease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try to get a run, with long polling
-	deadline := time.Now().Add(h.longPollTTL)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
 	for {
+		var signal <-chan struct{}
+		if h.workSignal != nil {
+			signal = h.workSignal()
+		}
 		run, err := h.store.LeaseRun(r.Context(), req.RunnerID, "")
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
@@ -369,17 +373,21 @@ func (h *Handlers) Lease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if time.Now().After(deadline) {
-			// No work available, return empty
+		timer := time.NewTimer(h.longPollTTL)
+		select {
+		case <-signal:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			continue
+		case <-timer.C:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNoContent)
 			return
-		}
-
-		select {
-		case <-ticker.C:
-			// Try again
 		case <-r.Context().Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			w.WriteHeader(http.StatusRequestTimeout)
 			return
 		}

@@ -27,6 +27,8 @@ type Manager struct {
 	workspace    string
 	output       io.Writer
 	wake         chan struct{}
+	workMu       sync.Mutex
+	workSignal   chan struct{}
 	ctx          context.Context
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
@@ -54,7 +56,7 @@ func New(parent context.Context, persistence store.Store, workspace string, outp
 	if output == nil {
 		output = io.Discard
 	}
-	return &Manager{store: persistence, workspace: resolved, output: output, wake: make(chan struct{}, 1), ctx: ctx, cancel: cancel}, nil
+	return &Manager{store: persistence, workspace: resolved, output: output, wake: make(chan struct{}, 1), workSignal: make(chan struct{}), ctx: ctx, cancel: cancel}, nil
 }
 
 func (m *Manager) Start(ctx context.Context) error {
@@ -80,6 +82,15 @@ func (m *Manager) Notify() {
 	case m.wake <- struct{}{}:
 	default:
 	}
+	m.workMu.Lock()
+	close(m.workSignal)
+	m.workSignal = make(chan struct{})
+	m.workMu.Unlock()
+}
+func (m *Manager) WorkAvailable() <-chan struct{} {
+	m.workMu.Lock()
+	defer m.workMu.Unlock()
+	return m.workSignal
 }
 func (m *Manager) Ping(ctx context.Context) error { return m.store.Ping(ctx) }
 func (m *Manager) Get(ctx context.Context, id string) (*store.Run, error) {

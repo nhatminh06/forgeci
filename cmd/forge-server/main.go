@@ -114,7 +114,7 @@ func run() error {
 	// Setup runner protocol server in remote mode
 	var runnerServer *http.Server
 	if *executionMode == "remote" {
-		handlers := runnerproto.NewHandlers(persistence, runnerToken)
+		handlers := runnerproto.NewHandlers(persistence, runnerToken, manager.WorkAvailable)
 
 		// Start lease expiration sweeper
 		go func() {
