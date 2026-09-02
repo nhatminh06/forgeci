@@ -39,7 +39,6 @@ trap cleanup EXIT INT TERM
 
 docker run -d --name "$name" -e POSTGRES_PASSWORD=forgeci -e POSTGRES_DB=forgeci -p 127.0.0.1::5432 postgres:17-alpine >/dev/null
 for _ in $(seq 1 50); do docker exec "$name" pg_isready -U postgres -d forgeci >/dev/null 2>&1 && break; sleep 0.1; done
-docker exec "$name" pg_isready -U postgres -d forgeci >/dev/null
 sleep 1
 for _ in $(seq 1 50); do docker exec "$name" psql -U postgres -d forgeci -At -c 'SELECT 1' >/dev/null 2>&1 && break; sleep 0.1; done
 docker exec "$name" psql -U postgres -d forgeci -At -c 'SELECT 1' >/dev/null
