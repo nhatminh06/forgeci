@@ -1,4 +1,4 @@
-# Milestone 5 architecture
+# Milestone 6 architecture
 
 ```text
 HTTP API
@@ -7,13 +7,13 @@ HTTP API
 run manager
     │
     ▼
-PostgreSQL store
+PostgreSQL store + filesystem snapshot CAS
     │
     ▼
 single-run FIFO dispatcher
     │
     ▼
-stored pipeline snapshot → parser → validation → DAG
+stored pipeline YAML + verified source snapshot → parser → validation → DAG
     │
     ▼
 bounded scheduler
@@ -26,9 +26,9 @@ bounded scheduler
 completion events and state updates
 ```
 
-The control plane atomically stores each run and all of its jobs before execution. It retains the exact pipeline YAML bytes and their SHA-256 digest. The dispatcher reconstructs the DAG from those stored bytes rather than rereading the submitted path.
+Before creating a run, the control plane captures a canonical source manifest, writes a deterministic `tar-gzip-v1` blob to temporary storage, verifies it, and publishes it atomically by source digest. One transaction upserts snapshot metadata and inserts the run and jobs. The pipeline YAML digest and source digest remain separate identities.
 
-Milestone 5 adds a runner protocol layer. Registered runners announce capabilities, send heartbeats, request a lease, and then execute a whole pipeline payload that has already been assigned to them. The control plane still decides which pipeline run is active, but a remote runner is now the execution owner for the leased run. A narrow observer reports live job-state transitions to the manager without introducing SQL into the runner.
+Remote leases include snapshot identity, blob identity, format, size, and entry metadata. The owning runner downloads through its authenticated live lease, verifies the blob while streaming to a temporary file, extracts without following archive-controlled symlinks, recomputes the logical manifest, and only then executes. Local server mode uses the same materialization invariant.
 
 The `pipeline` package compiles validated configuration into graph nodes containing sorted dependency and dependent lists. Kahn's algorithm creates a topological order, using lexicographic job names whenever multiple nodes are ready. If not every node can be ordered, compilation reports the jobs involved in a dependency cycle.
 
@@ -38,7 +38,7 @@ A `PENDING` job is ready only when every dependency is `PASSED`. A failed or blo
 
 Each admitted worker executes exactly one job. Jobs may overlap, but steps inside a job remain sequential. Workers report `PASSED`, `FAILED`, `CANCELED`, or internal startup failure to the state-owning event loop.
 
-The `executor` owns the job-level routing boundary. Local jobs use `/bin/sh -c` in the invocation directory. Docker jobs use the official Moby client through a narrow internal interface: inspect/pull image, create and start one ordinary labeled container, exec every step sequentially, and force-remove it with an independent bounded cleanup context. `/workspace` is the container working directory and a read-write bind mount of the invocation directory. Docker attach streams are demultiplexed before reaching the shared synchronized writers.
+The `executor` owns the job-level routing boundary. In server-backed mode, local jobs use the isolated materialized source directory and Docker bind-mounts that directory read-write at `/workspace`. Direct mode continues to use the invocation directory.
 
 On cancellation, admission stops first, running commands receive the canceled context, and the scheduler waits for their completion. Running and never-started jobs become `CANCELED`; completed terminal states remain unchanged. The CLI retains exit code `2` for interruption.
 
@@ -46,6 +46,8 @@ The scheduler knows only job results and never Docker lifecycle details. Its sin
 
 Direct `forge run` still enters the parser/compiler/scheduler path directly and imports no runtime database requirement.
 
+Each runner workspace is keyed by run and lease, uses restrictive permissions, and carries an ownership marker outside the extracted source directory. Cleanup verifies root containment, path shape, and marker identity before recursive deletion. Startup removes only stale marked workspaces and preserves unrelated directories.
+
 ## Intentionally absent
 
-Milestone 5 has no multi-run runner scheduling, artifact distribution, persistent log streaming, source snapshot replication, artifact or cache services, SCM triggers, deployment orchestration, authentication beyond a shared runner bearer token, or distributed control-plane coordination. Docker execution remains unsuitable as hostile-code isolation.
+Milestone 6 has no artifact or cache services, Git/SCM checkout, cross-runner jobs, retries, persistent logs, Kubernetes, secrets, RBAC, or distributed control-plane coordination. Docker execution remains unsuitable as hostile-code isolation.

@@ -2,7 +2,7 @@
 
 ForgeCI is a self-hosted CI/CD platform built from first principles to explore how pipeline engines, schedulers, runners, build systems, artifact stores, software-supply-chain controls, and deployment systems work internally.
 
-Milestone 5 adds a remote runner protocol with persistent registered runners and whole-run leasing. Direct execution remains available, while `forge-server` can queue runs, persist run and job state in PostgreSQL, and hand off an entire pipeline run to a registered remote runner over a runner-authenticated HTTP protocol.
+Milestone 6 adds deterministic source snapshots and isolated run workspaces. Every server-backed submission captures the exact source tree into an immutable content-addressed archive; local servers and empty remote runners materialize and verify that snapshot before execution. Direct `forge run` intentionally remains a live-workspace command.
 
 ## Current capabilities
 
@@ -16,6 +16,10 @@ Milestone 5 adds a remote runner protocol with persistent registered runners and
 - One container per Docker job with live, demultiplexed output
 - Repository workspace mounting and reliable container cleanup
 - Durable PostgreSQL run history and pipeline-definition snapshots
+- Deterministic source manifests with logical and archive SHA-256 identities
+- Immutable filesystem snapshot storage with deduplication and PostgreSQL metadata
+- Authenticated, lease-owned snapshot streaming and runner-side integrity verification
+- Isolated per-run local and Docker workspaces with marker-protected cleanup
 - FIFO dispatch with live job-state persistence; one local run or one remote run per runner
 - Remote runner registration, heartbeat, lease acquisition, and completion reporting
 - Persistent runner inventory with `GET /v1/runners`
@@ -26,12 +30,14 @@ Milestone 5 adds a remote runner protocol with persistent registered runners and
 ## Architecture
 
 ```text
-HTTP API → control plane → PostgreSQL → queued run
+HTTP API → control plane → PostgreSQL + snapshot CAS → queued run
     │
-    └── remote runner protocol → registered runner → leased pipeline payload → executor
+    └── runner protocol → lease → download + verify → isolated workspace → executor
 ```
 
 Parsing, graph compilation, runtime state, and command execution remain separate so the control plane never re-interprets raw YAML. The control plane owns queueing and run lifecycle, while a persistent remote runner owns a leased whole-run execution. See [docs/architecture.md](docs/architecture.md) for the component boundaries.
+
+Snapshot format, safety, and reproducibility rules are documented in [docs/source-snapshots.md](docs/source-snapshots.md).
 
 ## Pipeline example
 
@@ -80,18 +86,19 @@ go build -o build/forge-runner ./cmd/forge-runner
   --listen 127.0.0.1:8080 \
   --runner-listen 127.0.0.1:9090 \
   --workspace "$(pwd)" \
+  --snapshot-dir /var/lib/forgeci/snapshots \
   --execution-mode remote \
   --database-url 'postgres://postgres:forgeci@127.0.0.1:5432/forgeci?sslmode=disable' \
   --runner-token-file /path/to/runner-token
 
 ./build/forge-runner \
   --server http://127.0.0.1:9090 \
-  --workspace "$(pwd)"
+  --workspace-root /var/lib/forgeci/runner-workspaces
 ```
 
 Set `FORGECI_RUNNER_TOKEN` for the runner. Plain HTTP is accepted only on a loopback runner listener; non-loopback listeners require `--runner-tls-cert` and `--runner-tls-key`, and runners can trust a private CA with `--ca-cert`.
 
-ForgeCI executes commands from the directory where it was invoked, even when `--file` names a file in another directory.
+Direct `forge run` executes from the directory where it was invoked. Server-backed runs execute a captured source snapshot in a unique workspace, even if the original source changes after submission.
 
 ## CLI
 
@@ -111,16 +118,16 @@ Exit code `0` means success, `1` means at least one job failed or was blocked, a
 
 `--jobs` must be greater than zero and defaults to `1`, preserving sequential Milestone 1 behavior.
 
-## What Milestone 5 demonstrates
+## What Milestone 6 demonstrates
 
-This milestone separates the control plane, which chooses and records the active pipeline run, from remote runner processes that register, renew leases, execute a full pipeline payload, and report completion back to the server. Runner inventory and lease state survive process restarts, local mode remains available, and the remote runner path participates in the same durable run lifecycle.
+Pipeline identity and source identity are independent. The stored YAML digest identifies the execution definition, while the canonical source digest identifies files, directories, symlinks, modes, and file content. A second blob digest protects the exact compressed transport. Runners verify both before executing.
 
 ## Current limitations and security model
 
 ForgeCI assumes a trusted local repository, pipeline definition, and execution environment. Local commands run with the invoking user's privileges. Docker execution adds process/filesystem isolation but bind-mounts the repository read-write, and access to the Docker daemon is itself privileged. It is not a sandbox for hostile repositories.
 
-The HTTP API remains loopback-only for the control-plane surface, and the runner listener uses a bearer token for authentication. Remote workers are persistent and registered, but this milestone still has no strong secret isolation, multi-tenant isolation, persistent logs, artifacts, cache, SCM-trigger integration, deployment system, web UI, or production security model. It is not yet a production-safe runner.
+The HTTP API remains loopback-only for the control-plane surface, and the runner listener uses one shared bearer token. Source capture is not filesystem-atomic. `.git` is excluded; Git commit identity, SCM checkout, custom ignore rules, xattrs, and ACLs are not supported. Snapshot isolation does not provide hostile multi-tenant sandboxing: workspaces are writable, Docker daemon access is privileged, and secret isolation is absent.
 
 ## Roadmap
 
-Source synchronization, isolated per-run workspaces, distributed control-plane coordination, per-runner credentials, and broader platform features remain deferred beyond this milestone.
+Durable artifacts, caching, cross-runner job scheduling, retries, persistent logs, per-runner credentials, Kubernetes, multi-tenancy/RBAC, and high availability remain deferred.
