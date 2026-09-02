@@ -26,7 +26,7 @@ type fakeStore struct {
 	pingErr error
 }
 
-func (s *fakeStore) Ping(ctx context.Context) error  { return s.pingErr }
+func (s *fakeStore) Ping(ctx context.Context) error { return s.pingErr }
 func (s *fakeStore) ListRunners(context.Context) ([]store.Runner, error) {
 	return s.runners, nil
 }

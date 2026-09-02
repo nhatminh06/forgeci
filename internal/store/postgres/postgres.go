@@ -53,7 +53,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return fmt.Errorf("create migration table: %w", err)
 	}
-	
+
 	for version := 1; version <= 2; version++ {
 		var exists bool
 		err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&exists)
@@ -346,7 +346,7 @@ func (s *Store) UpdateRunnerLiveness(ctx context.Context, runnerID string, lastS
 
 // Lease management
 
-func (s *Store) LeaseRun(ctx context.Context, runnerID, runnerToken string) (*store.Run, error) {
+func (s *Store) LeaseRun(ctx context.Context, runnerID, _ string) (*store.Run, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -378,28 +378,14 @@ func (s *Store) LeaseRun(ctx context.Context, runnerID, runnerToken string) (*st
 	// Compatible means: if run has Docker jobs, runner must have Docker available
 	var runID string
 	err = tx.QueryRow(ctx, `
-		SELECT id FROM (
-			SELECT p.id
-			FROM pipeline_runs p
-			WHERE p.status='QUEUED'
-			AND NOT EXISTS (
-				SELECT 1 FROM job_runs j
-				WHERE j.run_id=p.id AND j.image IS NOT NULL
-			)
-			UNION ALL
-			SELECT p.id
-			FROM pipeline_runs p
-			WHERE p.status='QUEUED'
-			AND $1::int = 1
-			AND EXISTS (
-				SELECT 1 FROM job_runs j
-				WHERE j.run_id=p.id AND j.image IS NOT NULL
-			)
-			ORDER BY id
-		) compatible
-		ORDER BY id
+		SELECT p.id FROM pipeline_runs p
+		WHERE p.status='QUEUED'
+		AND ($1::int = 1 OR NOT EXISTS (
+			SELECT 1 FROM job_runs j WHERE j.run_id=p.id AND j.image IS NOT NULL
+		))
+		ORDER BY p.created_at,p.id
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF p SKIP LOCKED
 	`, runnerDockerAvail).Scan(&runID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // No compatible run available
@@ -428,7 +414,7 @@ func (s *Store) LeaseRun(ctx context.Context, runnerID, runnerToken string) (*st
 
 	// Atomically assign lease
 	tag, err := tx.Exec(ctx, `UPDATE pipeline_runs
-		SET status='RUNNING', started_at=now(), runner_id=$2, lease_id=$3, lease_generation=1, lease_expires_at=$4, effective_parallel=$5
+		SET status='RUNNING', started_at=now(), runner_id=$2, lease_id=$3, lease_generation=lease_generation+1, lease_expires_at=$4, effective_parallel=$5
 		WHERE id=$1 AND status='QUEUED'`, runID, runnerID, leaseID, leaseExpiresAt, effectiveParallel)
 	if err != nil {
 		return nil, err
@@ -450,11 +436,11 @@ func (s *Store) LeaseRun(ctx context.Context, runnerID, runnerToken string) (*st
 	return s.GetRun(ctx, runID)
 }
 
-func (s *Store) RenewLease(ctx context.Context, runID, runnerID string, expectedGeneration int, expiresAt time.Time) error {
+func (s *Store) RenewLease(ctx context.Context, runID, runnerID, leaseID string, expectedGeneration int, expiresAt time.Time) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE pipeline_runs
-		SET lease_expires_at=$4
-		WHERE id=$1 AND runner_id=$2 AND lease_generation=$3 AND status='RUNNING'`,
-		runID, runnerID, expectedGeneration, expiresAt.UTC())
+		SET lease_expires_at=$5
+		WHERE id=$1 AND runner_id=$2 AND lease_id=$3 AND lease_generation=$4 AND status='RUNNING' AND lease_expires_at > now()`,
+		runID, runnerID, leaseID, expectedGeneration, expiresAt.UTC())
 	if err != nil {
 		return err
 	}
@@ -464,24 +450,22 @@ func (s *Store) RenewLease(ctx context.Context, runID, runnerID string, expected
 	return nil
 }
 
-func (s *Store) ReportJobEvent(ctx context.Context, runID, jobName, runnerID string, status store.JobStatus) error {
-	// Verify lease is still valid
-	var leaseValid bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM pipeline_runs 
-		WHERE id=$1 AND runner_id=$2 AND status='RUNNING' AND lease_expires_at > now()
-	)`, runID, runnerID).Scan(&leaseValid)
-	if err != nil {
-		return err
-	}
-	if !leaseValid {
+func (s *Store) ReportJobEvent(ctx context.Context, runID, runnerID, leaseID string, generation int, jobName string, status store.JobStatus) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE job_runs j SET status=$6,
+		started_at=CASE WHEN $6='RUNNING' THEN COALESCE(j.started_at,now()) ELSE j.started_at END,
+		finished_at=CASE WHEN $6 IN ('PASSED','FAILED','BLOCKED','CANCELED') THEN COALESCE(j.finished_at,now()) ELSE j.finished_at END
+		FROM pipeline_runs p
+		WHERE j.run_id=p.id AND p.id=$1 AND p.runner_id=$2 AND p.lease_id=$3 AND p.lease_generation=$4
+		AND p.status='RUNNING' AND p.lease_expires_at > now() AND j.job_name=$5
+		AND (j.status=$6 OR (j.status='PENDING' AND $6 IN ('RUNNING','BLOCKED','CANCELED')) OR (j.status='RUNNING' AND $6 IN ('PASSED','FAILED','CANCELED')))`,
+		runID, runnerID, leaseID, generation, jobName, status)
+	if err == nil && tag.RowsAffected() != 1 {
 		return store.ErrConflict
 	}
-
-	return s.UpdateJob(ctx, runID, jobName, status, nil)
+	return err
 }
 
-func (s *Store) CompleteRun(ctx context.Context, runID, runnerID string, expectedGeneration int, status store.RunStatus, message *string) error {
+func (s *Store) CompleteRun(ctx context.Context, runID, runnerID, leaseID string, expectedGeneration int, status store.RunStatus, message *string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -492,8 +476,8 @@ func (s *Store) CompleteRun(ctx context.Context, runID, runnerID string, expecte
 	var leaseValid bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS (
 		SELECT 1 FROM pipeline_runs 
-		WHERE id=$1 AND runner_id=$2 AND lease_generation=$3 AND status='RUNNING'
-	)`, runID, runnerID, expectedGeneration).Scan(&leaseValid)
+		WHERE id=$1 AND runner_id=$2 AND lease_id=$3 AND lease_generation=$4 AND status='RUNNING' AND lease_expires_at > now()
+	)`, runID, runnerID, leaseID, expectedGeneration).Scan(&leaseValid)
 	if err != nil {
 		return err
 	}
@@ -503,7 +487,7 @@ func (s *Store) CompleteRun(ctx context.Context, runID, runnerID string, expecte
 
 	// Update run status
 	tag, err := tx.Exec(ctx, `UPDATE pipeline_runs
-		SET status=$2, finished_at=now(), error_message=$3, lease_id=NULL, runner_id=NULL
+		SET status=$2, finished_at=now(), error_message=$3, lease_id=NULL, runner_id=NULL, lease_expires_at=NULL, effective_parallel=NULL
 		WHERE id=$1 AND status='RUNNING'`, runID, status, message)
 	if err != nil {
 		return err
@@ -549,7 +533,7 @@ func (s *Store) ExpireLeases(ctx context.Context, now time.Time) error {
 	for _, runID := range expiredRunIDs {
 		// Mark run as ABORTED
 		_, err := tx.Exec(ctx, `UPDATE pipeline_runs
-			SET status='ABORTED', finished_at=now(), error_message='runner lease expired', lease_id=NULL, runner_id=NULL
+			SET status='ABORTED', finished_at=now(), error_message='runner lease expired', lease_id=NULL, runner_id=NULL, lease_expires_at=NULL, effective_parallel=NULL
 			WHERE id=$1`, runID)
 		if err != nil {
 			return err

@@ -127,13 +127,13 @@ func (f *fakeStore) UpdateRunnerLiveness(context.Context, string, time.Time) err
 func (f *fakeStore) LeaseRun(context.Context, string, string) (*store.Run, error) {
 	return nil, nil
 }
-func (f *fakeStore) RenewLease(context.Context, string, string, int, time.Time) error {
+func (f *fakeStore) RenewLease(context.Context, string, string, string, int, time.Time) error {
 	return nil
 }
-func (f *fakeStore) ReportJobEvent(context.Context, string, string, string, store.JobStatus) error {
+func (f *fakeStore) ReportJobEvent(context.Context, string, string, string, int, string, store.JobStatus) error {
 	return nil
 }
-func (f *fakeStore) CompleteRun(context.Context, string, string, int, store.RunStatus, *string) error {
+func (f *fakeStore) CompleteRun(context.Context, string, string, string, int, store.RunStatus, *string) error {
 	return nil
 }
 func (f *fakeStore) ExpireLeases(context.Context, time.Time) error {

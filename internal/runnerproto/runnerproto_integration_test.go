@@ -162,7 +162,7 @@ func TestLeaseAcquisitionAndCompletion(t *testing.T) {
 	// Complete the run
 	leaseID := *leased.LeaseID
 	generation := leased.LeaseGeneration
-	err = db.CompleteRun(ctx, run.ID, leaseID, generation, store.RunPassed, nil)
+	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, leaseID, generation, store.RunPassed, nil)
 	if err != nil {
 		t.Fatalf("CompleteRun failed: %v", err)
 	}
@@ -222,20 +222,20 @@ func TestStaleCompletionRejection(t *testing.T) {
 
 	// Try to complete with wrong lease ID
 	wrongLeaseID := uuid.New().String()
-	err = db.CompleteRun(ctx, run.ID, wrongLeaseID, leased.LeaseGeneration, store.RunPassed, nil)
+	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, wrongLeaseID, leased.LeaseGeneration, store.RunPassed, nil)
 	if err == nil {
 		t.Fatalf("should reject completion with wrong lease ID")
 	}
 
 	// Try to complete with wrong generation
 	leaseIDStr := *leased.LeaseID
-	err = db.CompleteRun(ctx, run.ID, leaseIDStr, 999, store.RunPassed, nil)
+	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, leaseIDStr, 999, store.RunPassed, nil)
 	if err == nil {
 		t.Fatalf("should reject completion with wrong generation")
 	}
 
 	// Valid completion should succeed
-	err = db.CompleteRun(ctx, run.ID, leaseIDStr, leased.LeaseGeneration, store.RunPassed, nil)
+	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, leaseIDStr, leased.LeaseGeneration, store.RunPassed, nil)
 	if err != nil {
 		t.Fatalf("valid completion failed: %v", err)
 	}

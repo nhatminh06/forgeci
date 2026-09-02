@@ -2,11 +2,15 @@ package runnerproto
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -61,6 +65,7 @@ type LeaseResponse struct {
 }
 
 type JobEventRequest struct {
+	RunnerID   string `json:"runner_id"`
 	RunID      string `json:"run_id"`
 	LeaseID    string `json:"lease_id"`
 	Generation int    `json:"generation"`
@@ -73,6 +78,7 @@ type JobEventResponse struct {
 }
 
 type CompleteRunRequest struct {
+	RunnerID   string  `json:"runner_id"`
 	RunID      string  `json:"run_id"`
 	LeaseID    string  `json:"lease_id"`
 	Generation int     `json:"generation"`
@@ -95,9 +101,9 @@ type RunnerStore interface {
 	ListRunners(context.Context) ([]store.Runner, error)
 	UpdateRunnerLiveness(context.Context, string, time.Time) error
 	LeaseRun(context.Context, string, string) (*store.Run, error)
-	RenewLease(context.Context, string, string, int, time.Time) error
-	ReportJobEvent(context.Context, string, string, string, store.JobStatus) error
-	CompleteRun(context.Context, string, string, int, store.RunStatus, *string) error
+	RenewLease(context.Context, string, string, string, int, time.Time) error
+	ReportJobEvent(context.Context, string, string, string, int, string, store.JobStatus) error
+	CompleteRun(context.Context, string, string, string, int, store.RunStatus, *string) error
 	GetRun(context.Context, string) (*store.Run, error)
 }
 
@@ -124,15 +130,57 @@ func (h *Handlers) SetShuttingDown(value bool) {
 // Middleware to check bearer token
 func (h *Handlers) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if auth != fmt.Sprintf("Bearer %s", h.token) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid or missing authorization"})
+		values := r.Header.Values("Authorization")
+		expected := "Bearer " + h.token
+		if len(values) != 1 || h.token == "" || subtle.ConstantTimeCompare([]byte(values[0]), []byte(expected)) != 1 {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+const smallRequestLimit int64 = 16 << 10
+
+var runnerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+func decodeStrict(w http.ResponseWriter, r *http.Request, value any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, smallRequestLimit)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return false
+	}
+	return true
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+func validUUID(value string) bool { _, err := uuid.Parse(value); return err == nil }
+
+func validJobEventStatus(status store.JobStatus) bool {
+	switch status {
+	case store.JobRunning, store.JobPassed, store.JobFailed, store.JobBlocked, store.JobCanceled:
+		return true
+	}
+	return false
+}
+
+func validCompletionStatus(status store.RunStatus) bool {
+	switch status {
+	case store.RunPassed, store.RunFailed, store.RunCanceled, store.RunError:
+		return true
+	}
+	return false
 }
 
 // Register runner
@@ -143,15 +191,12 @@ func (h *Handlers) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid request body"})
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 
 	// Validate
-	if req.ID == "" || req.Name == "" || req.OS == "" || req.Arch == "" || req.MaxParallel < 1 {
+	if !validUUID(req.ID) || !runnerNamePattern.MatchString(req.Name) || req.OS == "" || req.Arch == "" || req.MaxParallel < 1 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid runner configuration"})
@@ -208,14 +253,11 @@ func (h *Handlers) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req HeartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid request body"})
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 
-	if req.RunnerID == "" {
+	if !validUUID(req.RunnerID) || (req.ActiveLeaseID != nil && !validUUID(*req.ActiveLeaseID)) || req.Generation < 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "missing runner_id"})
@@ -246,7 +288,7 @@ func (h *Handlers) Heartbeat(w http.ResponseWriter, r *http.Request) {
 				// Renew lease
 				ttl := 30 * time.Second
 				newExpiry := time.Now().UTC().Add(ttl)
-				if h.store.RenewLease(r.Context(), *runner.CurrentRunID, req.RunnerID, run.LeaseGeneration, newExpiry) == nil {
+				if req.Generation == run.LeaseGeneration && h.store.RenewLease(r.Context(), *runner.CurrentRunID, req.RunnerID, *req.ActiveLeaseID, req.Generation, newExpiry) == nil {
 					renewedUntil = &newExpiry
 				} else {
 					leaseValid = false
@@ -287,14 +329,11 @@ func (h *Handlers) Lease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req LeaseRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid request body"})
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 
-	if req.RunnerID == "" {
+	if !validUUID(req.RunnerID) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "missing runner_id"})
@@ -355,14 +394,11 @@ func (h *Handlers) JobEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req JobEventRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid request body"})
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 
-	if req.RunID == "" || req.LeaseID == "" || req.JobName == "" || req.Status == "" {
+	if !validUUID(req.RunnerID) || !validUUID(req.RunID) || !validUUID(req.LeaseID) || req.Generation < 1 || req.JobName == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "missing required fields"})
@@ -371,6 +407,10 @@ func (h *Handlers) JobEvent(w http.ResponseWriter, r *http.Request) {
 
 	// Validate status
 	jobStatus := store.JobStatus(req.Status)
+	if !validJobEventStatus(jobStatus) {
+		writeError(w, http.StatusBadRequest, "invalid job status")
+		return
+	}
 	run, err := h.store.GetRun(r.Context(), req.RunID)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -387,11 +427,7 @@ func (h *Handlers) JobEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runnerID := ""
-	if run.RunnerID != nil && *run.RunnerID != "" {
-		runnerID = *run.RunnerID
-	}
-	err = h.store.ReportJobEvent(r.Context(), req.RunID, req.JobName, runnerID, jobStatus)
+	err = h.store.ReportJobEvent(r.Context(), req.RunID, req.RunnerID, req.LeaseID, req.Generation, req.JobName, jobStatus)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
@@ -413,14 +449,11 @@ func (h *Handlers) CompleteRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CompleteRunRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid request body"})
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 
-	if req.RunID == "" || req.LeaseID == "" || req.Status == "" {
+	if !validUUID(req.RunnerID) || !validUUID(req.RunID) || !validUUID(req.LeaseID) || req.Generation < 1 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "missing required fields"})
@@ -444,15 +477,12 @@ func (h *Handlers) CompleteRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	runStatus := store.RunStatus(req.Status)
-	runnerID := run.RunnerID
-	if runnerID == nil || *runnerID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "no runner assigned"})
+	if !validCompletionStatus(runStatus) {
+		writeError(w, http.StatusBadRequest, "invalid run status")
 		return
 	}
 
-	err = h.store.CompleteRun(r.Context(), req.RunID, *runnerID, req.Generation, runStatus, req.Error)
+	err = h.store.CompleteRun(r.Context(), req.RunID, req.RunnerID, req.LeaseID, req.Generation, runStatus, req.Error)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)

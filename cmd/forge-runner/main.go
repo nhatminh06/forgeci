@@ -558,6 +558,7 @@ func (o remoteJobObserver) OnJobState(name string, oldState, newState runnerpkg.
 
 func (rr *RemoteRunner) sendJobEvent(runID, leaseID string, generation int, jobName, status string) error {
 	payload := map[string]any{
+		"runner_id":  rr.id,
 		"run_id":     runID,
 		"lease_id":   leaseID,
 		"generation": generation,
@@ -588,6 +589,7 @@ func (rr *RemoteRunner) sendJobEvent(runID, leaseID string, generation int, jobN
 
 func (rr *RemoteRunner) sendComplete(runID, leaseID string, generation int, status string, message *string) error {
 	payload := map[string]any{
+		"runner_id":  rr.id,
 		"run_id":     runID,
 		"lease_id":   leaseID,
 		"generation": generation,

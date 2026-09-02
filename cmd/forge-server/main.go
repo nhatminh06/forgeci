@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,7 +38,9 @@ func run() error {
 	databaseURL := flags.String("database-url", os.Getenv("DATABASE_URL"), "PostgreSQL connection URL")
 	executionMode := flags.String("execution-mode", "local", "execution mode: local or remote")
 	runnerListen := flags.String("runner-listen", "127.0.0.1:9090", "runner protocol listener address")
-	runnerToken := flags.String("runner-token", os.Getenv("FORGECI_RUNNER_TOKEN"), "bearer token for runner authentication")
+	runnerTokenFile := flags.String("runner-token-file", "", "file containing the runner bearer token")
+	runnerTLSCert := flags.String("runner-tls-cert", "", "runner listener TLS certificate")
+	runnerTLSKey := flags.String("runner-tls-key", "", "runner listener TLS private key")
 
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -56,8 +60,15 @@ func run() error {
 		return fmt.Errorf("invalid execution-mode: %q (must be 'local' or 'remote')", *executionMode)
 	}
 
-	// If remote mode, validate runner token
-	if *executionMode == "remote" && *runnerToken == "" {
+	runnerToken := os.Getenv("FORGECI_RUNNER_TOKEN")
+	if *runnerTokenFile != "" {
+		data, err := os.ReadFile(*runnerTokenFile)
+		if err != nil {
+			return fmt.Errorf("read runner token file: %w", err)
+		}
+		runnerToken = strings.TrimSpace(string(data))
+	}
+	if *executionMode == "remote" && runnerToken == "" {
 		return fmt.Errorf("runner token required for remote execution mode")
 	}
 
@@ -67,7 +78,7 @@ func run() error {
 
 	// Validate runner listener
 	if *executionMode == "remote" {
-		if err := validateRunnerListener(*runnerListen); err != nil {
+		if err := validateRunnerListener(*runnerListen, *runnerTLSCert, *runnerTLSKey); err != nil {
 			return err
 		}
 	}
@@ -103,7 +114,7 @@ func run() error {
 	// Setup runner protocol server in remote mode
 	var runnerServer *http.Server
 	if *executionMode == "remote" {
-		handlers := runnerproto.NewHandlers(persistence, *runnerToken)
+		handlers := runnerproto.NewHandlers(persistence, runnerToken)
 
 		// Start lease expiration sweeper
 		go func() {
@@ -128,7 +139,13 @@ func run() error {
 
 		runnerServer = &http.Server{Addr: *runnerListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		runnerServeErr := make(chan error, 1)
-		go func() { runnerServeErr <- runnerServer.ListenAndServe() }()
+		go func() {
+			if *runnerTLSCert != "" {
+				runnerServeErr <- runnerServer.ListenAndServeTLS(*runnerTLSCert, *runnerTLSKey)
+			} else {
+				runnerServeErr <- runnerServer.ListenAndServe()
+			}
+		}()
 
 		go func() {
 			select {
@@ -179,13 +196,38 @@ func validateLoopback(address string) error {
 	return nil
 }
 
-func validateRunnerListener(address string) error {
+func validateRunnerListener(address, certFile, keyFile string) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("invalid runner listener address: %w", err)
 	}
-	// Runner listener can be non-loopback, but TLS will be required in that case
-	// For now, allow any address - TLS validation would be enforced at transport level
-	_ = host
-	return nil
+	if (certFile == "") != (keyFile == "") {
+		return fmt.Errorf("runner TLS certificate and key must be configured together")
+	}
+	if certFile != "" {
+		if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+			return fmt.Errorf("load runner TLS certificate: %w", err)
+		}
+		return nil
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	if ip == nil && host != "" {
+		addresses, err := net.LookupIP(host)
+		if err == nil && len(addresses) > 0 {
+			all := true
+			for _, address := range addresses {
+				all = all && address.IsLoopback()
+			}
+			if all {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("non-loopback runner listener requires TLS")
 }
