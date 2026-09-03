@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/store/postgres"
 )
 
-func setupTestDB(t *testing.T) store.Store {
+func setupTestDB(t *testing.T) *postgres.Store {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
 		t.Skip("TEST_DATABASE_URL not set")
@@ -28,6 +29,10 @@ func setupTestDB(t *testing.T) store.Store {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+func protocolSnapshot() *store.SourceSnapshot {
+	return &store.SourceSnapshot{SourceDigest: strings.Repeat("a", 64), BlobDigest: strings.Repeat("b", 64), Format: "tar-gzip-v1", ArchiveSizeBytes: 1, LogicalSizeBytes: 0, EntryCount: 0, CreatedAt: time.Now().UTC()}
 }
 
 func TestRunnerRegistrationAndHeartbeat(t *testing.T) {
@@ -51,7 +56,7 @@ func TestRunnerRegistrationAndHeartbeat(t *testing.T) {
 	registerReq := RegisterRequest{
 		ID:              runnerID,
 		Name:            "test-runner",
-		ProtocolVersion: 1,
+		ProtocolVersion: ProtocolVersion,
 		OS:              "linux",
 		Arch:            "amd64",
 		Docker:          true,
@@ -80,11 +85,7 @@ func TestRunnerRegistrationAndHeartbeat(t *testing.T) {
 	}
 
 	// Heartbeat
-	heartbeatReq := HeartbeatRequest{
-		RunnerID:      runnerID,
-		ActiveLeaseID: nil,
-		Generation:    0,
-	}
+	heartbeatReq := HeartbeatRequest{RunnerID: runnerID, Leases: []store.LeaseHeartbeat{}}
 	body, _ = json.Marshal(heartbeatReq)
 	req, _ = http.NewRequestWithContext(ctx, "POST", server.URL+"/v1/runner/heartbeat", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -118,6 +119,7 @@ func TestLeaseAcquisitionAndCompletion(t *testing.T) {
 				Status: store.JobPending,
 			},
 		},
+		Snapshot: protocolSnapshot(),
 	})
 	if err != nil {
 		t.Fatalf("CreateRun failed: %v", err)
@@ -127,7 +129,7 @@ func TestLeaseAcquisitionAndCompletion(t *testing.T) {
 	runner := store.Runner{
 		ID:              uuid.New().String(),
 		Name:            "test-runner",
-		ProtocolVersion: 1,
+		ProtocolVersion: ProtocolVersion,
 		OS:              "linux",
 		Arch:            "amd64",
 		DockerAvailable: true,
@@ -138,15 +140,15 @@ func TestLeaseAcquisitionAndCompletion(t *testing.T) {
 		t.Fatalf("RegisterRunner failed: %v", err)
 	}
 
-	// Lease the run
-	leased, err := db.LeaseRun(ctx, registeredRunner.ID, "docker")
+	// Lease one job
+	leased, err := db.LeaseJob(ctx, registeredRunner.ID)
 	if err != nil {
-		t.Fatalf("LeaseRun failed: %v", err)
+		t.Fatalf("LeaseJob failed: %v", err)
 	}
-	if leased == nil || leased.ID != run.ID {
-		t.Fatalf("leased run mismatch")
+	if leased == nil || leased.RunID != run.ID || leased.JobName != "test" {
+		t.Fatalf("leased job mismatch")
 	}
-	if leased.RunnerID == nil || *leased.RunnerID != registeredRunner.ID {
+	if leased.RunnerID != registeredRunner.ID {
 		t.Fatalf("runner_id not set on leased run")
 	}
 
@@ -155,14 +157,13 @@ func TestLeaseAcquisitionAndCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRunner failed: %v", err)
 	}
-	if updated.CurrentRunID == nil || *updated.CurrentRunID != run.ID {
-		t.Fatalf("runner CurrentRunID not set")
+	if updated.CurrentRunID != nil || updated.ActiveJobs != 1 {
+		t.Fatalf("runner active jobs=%d current run=%v", updated.ActiveJobs, updated.CurrentRunID)
 	}
 
 	// Complete the run
-	leaseID := *leased.LeaseID
-	generation := leased.LeaseGeneration
-	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, leaseID, generation, store.RunPassed, nil)
+	owner := store.ArtifactOwnership{RunID: run.ID, JobName: "test", RunnerID: registeredRunner.ID, LeaseID: leased.LeaseID, Generation: leased.Generation}
+	err = db.CompleteJob(ctx, owner, store.JobPassed, nil)
 	if err != nil {
 		t.Fatalf("CompleteRun failed: %v", err)
 	}
@@ -196,6 +197,7 @@ func TestStaleCompletionRejection(t *testing.T) {
 				Status: store.JobPending,
 			},
 		},
+		Snapshot: protocolSnapshot(),
 	})
 	if err != nil {
 		t.Fatalf("CreateRun failed: %v", err)
@@ -204,7 +206,7 @@ func TestStaleCompletionRejection(t *testing.T) {
 	runner := store.Runner{
 		ID:              uuid.New().String(),
 		Name:            "test-runner",
-		ProtocolVersion: 1,
+		ProtocolVersion: ProtocolVersion,
 		OS:              "linux",
 		Arch:            "amd64",
 		DockerAvailable: false,
@@ -215,27 +217,27 @@ func TestStaleCompletionRejection(t *testing.T) {
 		t.Fatalf("RegisterRunner failed: %v", err)
 	}
 
-	leased, err := db.LeaseRun(ctx, registeredRunner.ID, "")
+	leased, err := db.LeaseJob(ctx, registeredRunner.ID)
 	if err != nil {
 		t.Fatalf("LeaseRun failed: %v", err)
 	}
 
 	// Try to complete with wrong lease ID
 	wrongLeaseID := uuid.New().String()
-	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, wrongLeaseID, leased.LeaseGeneration, store.RunPassed, nil)
+	err = db.CompleteJob(ctx, store.ArtifactOwnership{RunID: run.ID, JobName: "test", RunnerID: registeredRunner.ID, LeaseID: wrongLeaseID, Generation: leased.Generation}, store.JobPassed, nil)
 	if err == nil {
 		t.Fatalf("should reject completion with wrong lease ID")
 	}
 
 	// Try to complete with wrong generation
-	leaseIDStr := *leased.LeaseID
-	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, leaseIDStr, 999, store.RunPassed, nil)
+	leaseIDStr := leased.LeaseID
+	err = db.CompleteJob(ctx, store.ArtifactOwnership{RunID: run.ID, JobName: "test", RunnerID: registeredRunner.ID, LeaseID: leaseIDStr, Generation: 999}, store.JobPassed, nil)
 	if err == nil {
 		t.Fatalf("should reject completion with wrong generation")
 	}
 
 	// Valid completion should succeed
-	err = db.CompleteRun(ctx, run.ID, registeredRunner.ID, leaseIDStr, leased.LeaseGeneration, store.RunPassed, nil)
+	err = db.CompleteJob(ctx, store.ArtifactOwnership{RunID: run.ID, JobName: "test", RunnerID: registeredRunner.ID, LeaseID: leaseIDStr, Generation: leased.Generation}, store.JobPassed, nil)
 	if err != nil {
 		t.Fatalf("valid completion failed: %v", err)
 	}

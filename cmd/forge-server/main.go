@@ -155,6 +155,8 @@ func run() error {
 		if err := manager.Start(ctx); err != nil {
 			return err
 		}
+	} else if err := persistence.RecoverRemoteJobs(ctx); err != nil {
+		return fmt.Errorf("recover remote jobs: %w", err)
 	}
 	defer manager.Close()
 
@@ -194,6 +196,7 @@ func run() error {
 		handlers := runnerproto.NewHandlers(persistence, runnerToken, manager.WorkAvailable)
 		handlers.SetSnapshotOpener(snapshotStore.OpenBlob)
 		handlers.SetArtifactStore(artifactStore)
+		handlers.SetNotifier(manager.Notify)
 
 		// Start lease expiration sweeper
 		go func() {
@@ -202,7 +205,9 @@ func run() error {
 			for {
 				select {
 				case <-ticker.C:
-					persistence.ExpireLeases(ctx, time.Now().UTC())
+					if persistence.ExpireJobLeases(ctx, time.Now().UTC()) == nil {
+						manager.Notify()
+					}
 				case <-ctx.Done():
 					return
 				}

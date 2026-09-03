@@ -106,30 +106,28 @@ func TestArtifactDownloadLookupIsRunAndLeaseScoped(t *testing.T) {
 	s := integrationStore(t)
 	ctx := context.Background()
 	yaml := []byte("version: 1\njobs:\n  build:\n    steps:\n      - run: true\n    artifacts:\n      upload:\n        - name: app\n          path: out/app\n  consume:\n    needs: [build]\n    artifacts:\n      download:\n        - from: build\n          name: app\n          into: input\n    steps:\n      - run: true\n")
-	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("c", 64), Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "build"}, {Name: "consume"}}, Snapshot: testSnapshot()})
+	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("c", 64), Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "build"}, {Name: "consume"}}, Dependencies: []store.JobDependency{{JobName: "consume", DependsOn: "build"}}, Snapshot: testSnapshot()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	worker := createRunner(t, s, "artifact-owner", false)
-	lease, err := s.LeaseRun(ctx, worker.ID, "")
-	if err != nil || lease.ID != run.ID {
+	lease, err := s.LeaseJob(ctx, worker.ID)
+	if err != nil || lease.RunID != run.ID {
 		t.Fatal(err)
 	}
-	owner := store.ArtifactOwnership{RunID: run.ID, RunnerID: worker.ID, LeaseID: *lease.LeaseID, Generation: lease.LeaseGeneration, JobName: "build"}
-	if err := s.ReportJobEvent(ctx, run.ID, worker.ID, *lease.LeaseID, lease.LeaseGeneration, "build", store.JobRunning); err != nil {
-		t.Fatal(err)
-	}
+	owner := store.ArtifactOwnership{RunID: run.ID, RunnerID: worker.ID, LeaseID: lease.LeaseID, Generation: lease.Generation, JobName: "build"}
 	item := store.Artifact{RunID: run.ID, ProducerJob: "build", Name: "app", RootName: "app", RootKind: "file", ContentSHA256: strings.Repeat("a", 64), BlobSHA256: strings.Repeat("b", 64), Format: artifact.Format, ArchiveSizeBytes: 10, LogicalSizeBytes: 5, EntryCount: 1, CreatedAt: time.Now().UTC()}
 	if err := s.CommitArtifacts(ctx, owner, []store.Artifact{item}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReportJobEvent(ctx, run.ID, worker.ID, *lease.LeaseID, lease.LeaseGeneration, "build", store.JobPassed); err != nil {
+	if err := s.CompleteJob(ctx, owner, store.JobPassed, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReportJobEvent(ctx, run.ID, worker.ID, *lease.LeaseID, lease.LeaseGeneration, "consume", store.JobRunning); err != nil {
-		t.Fatal(err)
+	consumer, err := s.LeaseJob(ctx, worker.ID)
+	if err != nil || consumer == nil || consumer.JobName != "consume" {
+		t.Fatalf("consumer=%+v err=%v", consumer, err)
 	}
-	owner.JobName = "consume"
+	owner = store.ArtifactOwnership{RunID: run.ID, RunnerID: worker.ID, LeaseID: consumer.LeaseID, Generation: consumer.Generation, JobName: "consume"}
 	if _, err := s.GetArtifactForLease(ctx, owner, "build", "app"); err != nil {
 		t.Fatalf("valid download: %v", err)
 	}
@@ -147,11 +145,304 @@ func TestArtifactDownloadLookupIsRunAndLeaseScoped(t *testing.T) {
 
 func createRunner(t *testing.T, s *Store, name string, docker bool) *store.Runner {
 	t.Helper()
-	r, err := s.RegisterRunner(context.Background(), store.Runner{ID: uuid.NewString(), Name: name, ProtocolVersion: 1, OS: "linux", Arch: "amd64", DockerAvailable: docker, MaxParallel: 2})
+	r, err := s.RegisterRunner(context.Background(), store.Runner{ID: uuid.NewString(), Name: name, ProtocolVersion: 2, OS: "linux", Arch: "amd64", DockerAvailable: docker, MaxParallel: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return r
+}
+
+func TestJobClaimsEnforceDependencyRunAndRunnerCapacity(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	yaml := []byte("version: 1\njobs:\n  a:\n    steps: [{run: true}]\n  b:\n    steps: [{run: true}]\n  c:\n    steps: [{run: true}]\n")
+	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("a", 64), Workspace: "/workspace", MaxParallel: 2, Jobs: []store.Job{{Name: "a"}, {Name: "b"}, {Name: "c"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := s.RegisterRunner(ctx, store.Runner{ID: uuid.NewString(), Name: "one", ProtocolVersion: 2, OS: "linux", Arch: "amd64", MaxParallel: 1, Status: store.RunnerOnline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := s.RegisterRunner(ctx, store.Runner{ID: uuid.NewString(), Name: "two", ProtocolVersion: 2, OS: "linux", Arch: "amd64", MaxParallel: 2, Status: store.RunnerOnline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	claimsCh := make(chan *store.JobLease, 12)
+	errs := make(chan error, 12)
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); <-start; l, e := s.LeaseJob(ctx, one.ID); claimsCh <- l; errs <- e }()
+	}
+	close(start)
+	wg.Wait()
+	close(claimsCh)
+	close(errs)
+	claims := 0
+	for e := range errs {
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	for l := range claimsCh {
+		if l != nil {
+			claims++
+		}
+	}
+	if claims != 1 {
+		t.Fatalf("single-capacity runner claims=%d", claims)
+	}
+	owned, err := s.pool.Query(ctx, `SELECT run_id::text,job_name,lease_id::text,lease_generation FROM job_runs WHERE runner_id=$1 AND status='RUNNING'`, one.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var heartbeat store.LeaseHeartbeat
+	if !owned.Next() {
+		t.Fatal("owned lease missing")
+	}
+	if err = owned.Scan(&heartbeat.RunID, &heartbeat.JobName, &heartbeat.LeaseID, &heartbeat.Generation); err != nil {
+		t.Fatal(err)
+	}
+	owned.Close()
+	heartbeatResults, err := s.HeartbeatJobLeases(ctx, one.ID, []store.LeaseHeartbeat{heartbeat, {RunID: heartbeat.RunID, JobName: heartbeat.JobName, LeaseID: uuid.NewString(), Generation: heartbeat.Generation}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heartbeatResults) != 2 || !heartbeatResults[0].Valid || heartbeatResults[1].Valid {
+		t.Fatalf("heartbeat results=%+v", heartbeatResults)
+	}
+	second, err := s.LeaseJob(ctx, two.ID)
+	if err != nil || second == nil {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	if third, err := s.LeaseJob(ctx, two.ID); err != nil || third != nil {
+		t.Fatalf("run max_parallel exceeded: %+v %v", third, err)
+	}
+	active, _ := s.GetRun(ctx, run.ID)
+	running := 0
+	for _, j := range active.Jobs {
+		if j.Status == store.JobRunning {
+			running++
+		}
+	}
+	if running != 2 {
+		t.Fatalf("running=%d", running)
+	}
+}
+
+func TestJobClaimMatchesDockerCapability(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	image := "alpine:3.22"
+	run, err := s.CreateRun(ctx, store.CreateRun{
+		ID: uuid.NewString(), PipelineFile: "forge.yaml",
+		PipelineYAML:   []byte("version: 1\njobs:\n  a-docker:\n    image: alpine:3.22\n    steps: [{run: true}]\n  z-local:\n    steps: [{run: true}]\n"),
+		PipelineSHA256: strings.Repeat("e", 64), Workspace: "/workspace", MaxParallel: 2,
+		Jobs: []store.Job{{Name: "a-docker", Image: &image}, {Name: "z-local"}}, Snapshot: testSnapshot(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := createRunner(t, s, "plain", false)
+	lease, err := s.LeaseJob(ctx, plain.ID)
+	if err != nil || lease == nil || lease.RunID != run.ID || lease.JobName != "z-local" {
+		t.Fatalf("non-Docker runner lease=%+v err=%v", lease, err)
+	}
+	docker := createRunner(t, s, "docker", true)
+	lease, err = s.LeaseJob(ctx, docker.ID)
+	if err != nil || lease == nil || lease.JobName != "a-docker" {
+		t.Fatalf("Docker runner lease=%+v err=%v", lease, err)
+	}
+}
+
+func TestJobHeartbeatReaperRaceHasConsistentOutcome(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	for i := 0; i < 20; i++ {
+		run := createRemoteRun(t, s, nil)
+		runner := createRunner(t, s, "race-"+uuid.NewString(), false)
+		lease, err := s.LeaseJob(ctx, runner.ID)
+		if err != nil || lease == nil {
+			t.Fatalf("lease=%+v err=%v", lease, err)
+		}
+		deadline := time.Now().UTC()
+		if _, err = s.pool.Exec(ctx, `UPDATE job_runs SET lease_expires_at=$3 WHERE run_id=$1 AND job_name=$2`, run.ID, lease.JobName, deadline); err != nil {
+			t.Fatal(err)
+		}
+		heartbeat := store.LeaseHeartbeat{RunID: run.ID, JobName: lease.JobName, LeaseID: lease.LeaseID, Generation: lease.Generation}
+		start := make(chan struct{})
+		renewed := make(chan []store.LeaseHeartbeatResult, 1)
+		errs := make(chan error, 2)
+		go func() {
+			<-start
+			results, e := s.HeartbeatJobLeases(ctx, runner.ID, []store.LeaseHeartbeat{heartbeat}, deadline.Add(-time.Nanosecond))
+			renewed <- results
+			errs <- e
+		}()
+		go func() { <-start; errs <- s.ExpireJobLeases(ctx, deadline.Add(time.Nanosecond)) }()
+		close(start)
+		firstErr, secondErr := <-errs, <-errs
+		if firstErr != nil || secondErr != nil {
+			t.Fatalf("race errors: %v %v", firstErr, secondErr)
+		}
+		results := <-renewed
+		got, err := s.GetRun(ctx, run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		valid := len(results) == 1 && results[0].Valid
+		if valid && got.Jobs[0].Status != store.JobRunning {
+			t.Fatalf("renewed job became %s", got.Jobs[0].Status)
+		}
+		if !valid && got.Jobs[0].Status != store.JobAborted {
+			t.Fatalf("lost renewal left job %s", got.Jobs[0].Status)
+		}
+	}
+}
+
+func TestJobDependencyReadinessFailureAndStaleCompletion(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	yaml := []byte("version: 1\njobs:\n  root:\n    steps: [{run: true}]\n  child:\n    needs: [root]\n    steps: [{run: true}]\n")
+	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("b", 64), Workspace: "/workspace", MaxParallel: 2, Jobs: []store.Job{{Name: "root"}, {Name: "child"}}, Dependencies: []store.JobDependency{{JobName: "child", DependsOn: "root"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := createRunner(t, s, "scheduler", false)
+	root, err := s.LeaseJob(ctx, r.ID)
+	if err != nil || root == nil || root.JobName != "root" {
+		t.Fatalf("root=%+v err=%v", root, err)
+	}
+	if early, err := s.LeaseJob(ctx, r.ID); err != nil || early != nil {
+		t.Fatalf("dependent leased early: %+v %v", early, err)
+	}
+	wrong := store.ArtifactOwnership{RunID: run.ID, JobName: "root", RunnerID: uuid.NewString(), LeaseID: root.LeaseID, Generation: root.Generation}
+	if err := s.CompleteJob(ctx, wrong, store.JobPassed, nil); err == nil {
+		t.Fatal("wrong runner completed job")
+	}
+	owner := wrong
+	owner.RunnerID = r.ID
+	staleGeneration := owner
+	staleGeneration.Generation++
+	if err := s.CompleteJob(ctx, staleGeneration, store.JobPassed, nil); err == nil {
+		t.Fatal("wrong generation completed live job")
+	}
+	if err := s.CompleteJob(ctx, owner, store.JobFailed, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteJob(ctx, owner, store.JobPassed, nil); err == nil {
+		t.Fatal("stale completion accepted")
+	}
+	got, _ := s.GetRun(ctx, run.ID)
+	if got.Status != store.RunFailed {
+		t.Fatalf("run status=%s", got.Status)
+	}
+	statuses := map[string]store.JobStatus{}
+	for _, j := range got.Jobs {
+		statuses[j.Name] = j.Status
+	}
+	if statuses["root"] != store.JobFailed || statuses["child"] != store.JobBlocked {
+		t.Fatalf("statuses=%v", statuses)
+	}
+}
+
+func TestExpiredJobIsAbortedAndNeverReassigned(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	run := createRemoteRun(t, s, nil)
+	r := createRunner(t, s, "lost", false)
+	lease, err := s.LeaseJob(ctx, r.ID)
+	if err != nil || lease == nil {
+		t.Fatal(err)
+	}
+	if _, err = s.pool.Exec(ctx, `UPDATE job_runs SET lease_expires_at=now()-interval '1 second' WHERE run_id=$1 AND job_name=$2`, lease.RunID, lease.JobName); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ExpireJobLeases(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetRun(ctx, run.ID)
+	if got.Status != store.RunAborted || got.Jobs[0].Status != store.JobAborted {
+		t.Fatalf("got=%+v", got)
+	}
+	if next, err := s.LeaseJob(ctx, r.ID); err != nil || next != nil {
+		t.Fatalf("aborted job reassigned: %+v %v", next, err)
+	}
+}
+
+func TestErrorBlocksDescendantWhileIndependentBranchContinues(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	yaml := []byte("version: 1\njobs:\n  bad:\n    steps: [{run: true}]\n  child:\n    needs: [bad]\n    steps: [{run: true}]\n  independent:\n    steps: [{run: true}]\n")
+	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("c", 64), Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "bad"}, {Name: "child"}, {Name: "independent"}}, Dependencies: []store.JobDependency{{JobName: "child", DependsOn: "bad"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := createRunner(t, s, "error-runner", false)
+	bad, err := s.LeaseJob(ctx, r.ID)
+	if err != nil || bad == nil || bad.JobName != "bad" {
+		t.Fatalf("lease=%+v err=%v", bad, err)
+	}
+	owner := store.ArtifactOwnership{RunID: run.ID, JobName: bad.JobName, RunnerID: r.ID, LeaseID: bad.LeaseID, Generation: bad.Generation}
+	if err = s.CompleteJob(ctx, owner, store.JobError, nil); err != nil {
+		t.Fatal(err)
+	}
+	mid, _ := s.GetRun(ctx, run.ID)
+	if mid.Status != store.RunRunning {
+		t.Fatalf("run finalized before independent branch: %s", mid.Status)
+	}
+	independent, err := s.LeaseJob(ctx, r.ID)
+	if err != nil || independent == nil || independent.JobName != "independent" {
+		t.Fatalf("independent=%+v err=%v", independent, err)
+	}
+	owner = store.ArtifactOwnership{RunID: run.ID, JobName: independent.JobName, RunnerID: r.ID, LeaseID: independent.LeaseID, Generation: independent.Generation}
+	if err = s.CompleteJob(ctx, owner, store.JobPassed, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetRun(ctx, run.ID)
+	if got.Status != store.RunError {
+		t.Fatalf("run status=%s", got.Status)
+	}
+}
+
+func TestCancellationWithLostJobResolvesAborted(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	yaml := []byte("version: 1\njobs:\n  a:\n    steps: [{run: true}]\n  b:\n    steps: [{run: true}]\n")
+	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("d", 64), Workspace: "/workspace", MaxParallel: 2, Jobs: []store.Job{{Name: "a"}, {Name: "b"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := createRunner(t, s, "cancel-runner", false)
+	a, _ := s.LeaseJob(ctx, r.ID)
+	b, _ := s.LeaseJob(ctx, r.ID)
+	if a == nil || b == nil {
+		t.Fatal("jobs not leased")
+	}
+	if _, err = s.RequestCancel(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	hb := []store.LeaseHeartbeat{{RunID: a.RunID, JobName: a.JobName, LeaseID: a.LeaseID, Generation: a.Generation}, {RunID: b.RunID, JobName: b.JobName, LeaseID: b.LeaseID, Generation: b.Generation}}
+	results, err := s.HeartbeatJobLeases(ctx, r.ID, hb, time.Now())
+	if err != nil || !results[0].CancelRequested || !results[1].CancelRequested {
+		t.Fatalf("results=%+v err=%v", results, err)
+	}
+	owner := store.ArtifactOwnership{RunID: a.RunID, JobName: a.JobName, RunnerID: r.ID, LeaseID: a.LeaseID, Generation: a.Generation}
+	if err = s.CompleteJob(ctx, owner, store.JobCanceled, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.pool.Exec(ctx, `UPDATE job_runs SET lease_expires_at=now()-interval '1 second' WHERE run_id=$1 AND job_name=$2`, b.RunID, b.JobName); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ExpireJobLeases(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetRun(ctx, run.ID)
+	if got.Status != store.RunAborted {
+		t.Fatalf("status=%s", got.Status)
+	}
 }
 
 func TestRemoteLeaseOwnershipTransitionsAndExpiration(t *testing.T) {

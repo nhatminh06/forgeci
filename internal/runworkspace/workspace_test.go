@@ -73,3 +73,61 @@ func TestRemoveRejectsSymlinkedParent(t *testing.T) {
 		t.Fatalf("outside workspace deleted: %v", err)
 	}
 }
+
+func TestJobWorkspacesAreFreshAndLeaseScoped(t *testing.T) {
+	root := t.TempDir()
+	first := Marker{RunID: "run", JobName: "build", LeaseID: "lease-1", Generation: 1, SourceDigest: "source"}
+	second := Marker{RunID: "run", JobName: "build", LeaseID: "lease-2", Generation: 2, SourceDigest: "source"}
+	firstDir, err := Create(root, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(firstDir, "undeclared"), []byte("private"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	secondDir, err := Create(root, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDir == secondDir {
+		t.Fatal("different leases reused one workspace")
+	}
+	if _, err := os.Stat(filepath.Join(secondDir, "undeclared")); !os.IsNotExist(err) {
+		t.Fatalf("fresh workspace inherited undeclared file: %v", err)
+	}
+	if err := Remove(root, secondDir, first); err == nil {
+		t.Fatal("workspace accepted another lease marker")
+	}
+	if err := Remove(root, firstDir, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := Remove(root, secondDir, second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupStaleJobWorkspaceRequiresExactMarkerIdentity(t *testing.T) {
+	root := t.TempDir()
+	valid := Marker{RunID: "run", JobName: "job", LeaseID: "valid", Generation: 1}
+	validDir, err := Create(root, valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maliciousDir := filepath.Join(root, "jobs", "run", "job", "malicious")
+	if err := os.MkdirAll(maliciousDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(Marker{RunID: "other", JobName: "job", LeaseID: "malicious"})
+	if err := os.WriteFile(filepath.Join(maliciousDir, markerName), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupStale(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(validDir); !os.IsNotExist(err) {
+		t.Fatalf("valid stale job workspace remains: %v", err)
+	}
+	if _, err := os.Stat(maliciousDir); err != nil {
+		t.Fatalf("mismatched marker workspace removed: %v", err)
+	}
+}

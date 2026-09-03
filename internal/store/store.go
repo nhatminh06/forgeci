@@ -22,6 +22,7 @@ const (
 	JobRunning  JobStatus = "RUNNING"
 	JobPassed   JobStatus = "PASSED"
 	JobFailed   JobStatus = "FAILED"
+	JobError    JobStatus = "ERROR"
 	JobBlocked  JobStatus = "BLOCKED"
 	JobCanceled JobStatus = "CANCELED"
 	JobAborted  JobStatus = "ABORTED"
@@ -61,12 +62,16 @@ type Run struct {
 }
 
 type Job struct {
-	Name         string     `json:"name"`
-	Status       JobStatus  `json:"status"`
-	Image        *string    `json:"image"`
-	StartedAt    *time.Time `json:"started_at"`
-	FinishedAt   *time.Time `json:"finished_at"`
-	ErrorMessage *string    `json:"error_message,omitempty"`
+	Name            string     `json:"name"`
+	Status          JobStatus  `json:"status"`
+	Image           *string    `json:"image"`
+	StartedAt       *time.Time `json:"started_at"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	ErrorMessage    *string    `json:"error_message,omitempty"`
+	RunnerID        *string    `json:"runner_id,omitempty"`
+	LeaseID         *string    `json:"lease_id,omitempty"`
+	LeaseGeneration int        `json:"lease_generation"`
+	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
 }
 
 type RunnerStatus string
@@ -88,6 +93,54 @@ type Runner struct {
 	RegisteredAt    time.Time    `json:"registered_at"`
 	LastSeenAt      time.Time    `json:"last_seen_at"`
 	CurrentRunID    *string      `json:"current_run_id,omitempty"`
+	ActiveJobs      int          `json:"active_jobs"`
+}
+
+type JobDependency struct {
+	JobName, DependsOn string
+}
+
+type JobLease struct {
+	RunID, JobName, RunnerID, LeaseID string
+	Generation                        int
+	ExpiresAt                         time.Time
+	Job                               JobDefinition
+	Snapshot                          SourceSnapshot
+}
+
+// JobDefinition is the wire-neutral executable portion of a pipeline job.
+type JobDefinition struct {
+	Image     *string               `json:"image,omitempty"`
+	Steps     []string              `json:"steps"`
+	Uploads   []ArtifactDeclaration `json:"uploads,omitempty"`
+	Downloads []ArtifactDownload    `json:"downloads,omitempty"`
+}
+
+type ArtifactDeclaration struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+type ArtifactDownload struct {
+	From string `json:"from"`
+	Name string `json:"name"`
+	Into string `json:"into"`
+}
+
+type LeaseHeartbeat struct {
+	RunID      string `json:"run_id"`
+	JobName    string `json:"job_name"`
+	LeaseID    string `json:"lease_id"`
+	Generation int    `json:"generation"`
+}
+
+type LeaseHeartbeatResult struct {
+	RunID           string     `json:"run_id"`
+	JobName         string     `json:"job_name"`
+	LeaseID         string     `json:"lease_id"`
+	Generation      int        `json:"generation"`
+	Valid           bool       `json:"valid"`
+	CancelRequested bool       `json:"cancel_requested"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
 }
 
 type CreateRun struct {
@@ -95,7 +148,15 @@ type CreateRun struct {
 	PipelineYAML                                []byte
 	MaxParallel                                 int
 	Jobs                                        []Job
+	Dependencies                                []JobDependency
 	Snapshot                                    *SourceSnapshot
+}
+
+type JobSchedulerStore interface {
+	LeaseJob(context.Context, string) (*JobLease, error)
+	HeartbeatJobLeases(context.Context, string, []LeaseHeartbeat, time.Time) ([]LeaseHeartbeatResult, error)
+	CompleteJob(context.Context, ArtifactOwnership, JobStatus, *string) error
+	ExpireJobLeases(context.Context, time.Time) error
 }
 
 type SourceSnapshot struct {

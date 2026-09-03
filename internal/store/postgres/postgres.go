@@ -131,6 +131,11 @@ func (s *Store) CreateRun(ctx context.Context, in store.CreateRun) (*store.Run, 
 			return nil, fmt.Errorf("insert job %q: %w", job.Name, err)
 		}
 	}
+	for _, dependency := range in.Dependencies {
+		if _, err = tx.Exec(ctx, `INSERT INTO job_dependencies(run_id,job_name,depends_on_job) VALUES($1,$2,$3)`, in.ID, dependency.JobName, dependency.DependsOn); err != nil {
+			return nil, fmt.Errorf("insert dependency %q -> %q: %w", dependency.JobName, dependency.DependsOn, err)
+		}
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit run: %w", err)
 	}
@@ -166,18 +171,19 @@ func (s *Store) GetRun(ctx context.Context, id string) (*store.Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT job_name,status,image,started_at,finished_at,error_message FROM job_runs WHERE run_id=$1 ORDER BY job_name`, id)
+	rows, err := s.pool.Query(ctx, `SELECT job_name,status,image,started_at,finished_at,error_message,runner_id::text,lease_id::text,lease_generation,lease_expires_at FROM job_runs WHERE run_id=$1 ORDER BY job_name`, id)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var j store.Job
-		if err := rows.Scan(&j.Name, &j.Status, &j.Image, &j.StartedAt, &j.FinishedAt, &j.ErrorMessage); err != nil {
+		if err := rows.Scan(&j.Name, &j.Status, &j.Image, &j.StartedAt, &j.FinishedAt, &j.ErrorMessage, &j.RunnerID, &j.LeaseID, &j.LeaseGeneration, &j.LeaseExpiresAt); err != nil {
 			return nil, err
 		}
 		j.StartedAt = utcTime(j.StartedAt)
 		j.FinishedAt = utcTime(j.FinishedAt)
+		j.LeaseExpiresAt = utcTime(j.LeaseExpiresAt)
 		r.Jobs = append(r.Jobs, j)
 	}
 	return r, rows.Err()
@@ -255,7 +261,7 @@ func (s *Store) UpdateJob(ctx context.Context, runID, name string, status store.
 			return store.ErrConflict
 		}
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE job_runs SET status=$3,started_at=CASE WHEN $3='RUNNING' THEN COALESCE(started_at,now()) ELSE started_at END,finished_at=CASE WHEN $3 IN ('PASSED','FAILED','BLOCKED','CANCELED','ABORTED') THEN now() ELSE finished_at END,error_message=$4 WHERE run_id=$1 AND job_name=$2`, runID, name, status, message)
+	tag, err := s.pool.Exec(ctx, `UPDATE job_runs SET status=$3,started_at=CASE WHEN $3='RUNNING' THEN COALESCE(started_at,now()) ELSE started_at END,finished_at=CASE WHEN $3 IN ('PASSED','FAILED','ERROR','BLOCKED','CANCELED','ABORTED') THEN now() ELSE finished_at END,error_message=$4 WHERE run_id=$1 AND job_name=$2`, runID, name, status, message)
 	if err == nil && tag.RowsAffected() != 1 {
 		return store.ErrNotFound
 	}
@@ -315,8 +321,13 @@ func (s *Store) CancelQueued(ctx context.Context, id string) error {
 	return tx.Commit(ctx)
 }
 func (s *Store) RequestCancel(ctx context.Context, id string) (store.RunStatus, error) {
+	tx, beginErr := s.pool.Begin(ctx)
+	if beginErr != nil {
+		return "", beginErr
+	}
+	defer tx.Rollback(ctx)
 	var status store.RunStatus
-	err := s.pool.QueryRow(ctx, `UPDATE pipeline_runs SET cancel_requested_at=COALESCE(cancel_requested_at,now()) WHERE id=$1 AND status='RUNNING' RETURNING status`, id).Scan(&status)
+	err := tx.QueryRow(ctx, `UPDATE pipeline_runs SET cancel_requested_at=COALESCE(cancel_requested_at,now()) WHERE id=$1 AND status='RUNNING' RETURNING status`, id).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		r, e := s.GetRun(ctx, id)
 		if e != nil {
@@ -324,7 +335,16 @@ func (s *Store) RequestCancel(ctx context.Context, id string) (store.RunStatus, 
 		}
 		return r.Status, store.ErrConflict
 	}
-	return status, err
+	if err != nil {
+		return status, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE job_runs SET status='CANCELED',finished_at=now(),error_message='run cancellation requested' WHERE run_id=$1 AND status='PENDING'`, id); err != nil {
+		return status, err
+	}
+	if err = finalizeRun(ctx, tx, id, s.artifactRetention); err != nil {
+		return status, err
+	}
+	return status, tx.Commit(ctx)
 }
 func (s *Store) RecoverInterrupted(ctx context.Context) error {
 	tx, err := s.pool.Begin(ctx)
@@ -391,9 +411,8 @@ func (s *Store) RegisterRunner(ctx context.Context, r store.Runner) (*store.Runn
 
 func (s *Store) GetRunner(ctx context.Context, id string) (*store.Runner, error) {
 	r := &store.Runner{}
-	err := s.pool.QueryRow(ctx, `SELECT id::text,name,protocol_version,os,arch,docker_available,max_parallel,status,registered_at,last_seen_at,current_run_id::text
-		FROM runners WHERE id=$1`, id).Scan(
-		&r.ID, &r.Name, &r.ProtocolVersion, &r.OS, &r.Arch, &r.DockerAvailable, &r.MaxParallel, &r.Status, &r.RegisteredAt, &r.LastSeenAt, &r.CurrentRunID)
+	err := s.pool.QueryRow(ctx, `SELECT r.id::text,r.name,r.protocol_version,r.os,r.arch,r.docker_available,r.max_parallel,r.status,r.registered_at,r.last_seen_at,r.current_run_id::text,(SELECT count(*) FROM job_runs j WHERE j.runner_id=r.id AND j.status='RUNNING') FROM runners r WHERE r.id=$1`, id).Scan(
+		&r.ID, &r.Name, &r.ProtocolVersion, &r.OS, &r.Arch, &r.DockerAvailable, &r.MaxParallel, &r.Status, &r.RegisteredAt, &r.LastSeenAt, &r.CurrentRunID, &r.ActiveJobs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -406,8 +425,7 @@ func (s *Store) GetRunner(ctx context.Context, id string) (*store.Runner, error)
 }
 
 func (s *Store) ListRunners(ctx context.Context) ([]store.Runner, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text,name,protocol_version,os,arch,docker_available,max_parallel,status,registered_at,last_seen_at,current_run_id::text
-		FROM runners ORDER BY name, id`)
+	rows, err := s.pool.Query(ctx, `SELECT r.id::text,r.name,r.protocol_version,r.os,r.arch,r.docker_available,r.max_parallel,r.status,r.registered_at,r.last_seen_at,r.current_run_id::text,(SELECT count(*) FROM job_runs j WHERE j.runner_id=r.id AND j.status='RUNNING') FROM runners r ORDER BY r.name,r.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -416,7 +434,7 @@ func (s *Store) ListRunners(ctx context.Context) ([]store.Runner, error) {
 	var runners []store.Runner
 	for rows.Next() {
 		r := store.Runner{}
-		if err := rows.Scan(&r.ID, &r.Name, &r.ProtocolVersion, &r.OS, &r.Arch, &r.DockerAvailable, &r.MaxParallel, &r.Status, &r.RegisteredAt, &r.LastSeenAt, &r.CurrentRunID); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.ProtocolVersion, &r.OS, &r.Arch, &r.DockerAvailable, &r.MaxParallel, &r.Status, &r.RegisteredAt, &r.LastSeenAt, &r.CurrentRunID, &r.ActiveJobs); err != nil {
 			return nil, err
 		}
 		r.RegisteredAt = r.RegisteredAt.UTC()
@@ -617,7 +635,7 @@ func (s *Store) CommitArtifacts(ctx context.Context, owner store.ArtifactOwnersh
 	var pipelineYAML []byte
 	var jobStatus store.JobStatus
 	var valid bool
-	query := `SELECT p.pipeline_yaml,j.status,($2='' OR (p.runner_id::text=$2 AND p.lease_id::text=$3 AND p.lease_generation=$4 AND p.lease_expires_at>now())) FROM pipeline_runs p JOIN job_runs j ON j.run_id=p.id AND j.job_name=$5 WHERE p.id=$1 AND p.status='RUNNING' FOR UPDATE OF p,j`
+	query := `SELECT p.pipeline_yaml,j.status,($2='' OR (j.runner_id::text=$2 AND j.lease_id::text=$3 AND j.lease_generation=$4 AND j.lease_expires_at>now())) FROM pipeline_runs p JOIN job_runs j ON j.run_id=p.id AND j.job_name=$5 WHERE p.id=$1 AND p.status='RUNNING' FOR UPDATE OF p,j`
 	if err = tx.QueryRow(ctx, query, owner.RunID, owner.RunnerID, owner.LeaseID, owner.Generation, owner.JobName).Scan(&pipelineYAML, &jobStatus, &valid); errors.Is(err, pgx.ErrNoRows) {
 		return store.ErrNotFound
 	} else if err != nil {
@@ -714,7 +732,7 @@ func scanArtifact(row pgx.Row) (*store.Artifact, error) {
 	return &a, nil
 }
 func (s *Store) GetArtifactForLease(ctx context.Context, owner store.ArtifactOwnership, producer, name string) (*store.Artifact, error) {
-	a, err := scanArtifact(s.pool.QueryRow(ctx, `SELECT `+artifactColumns+` FROM artifacts a JOIN pipeline_runs p ON p.id=a.run_id JOIN job_runs j ON j.run_id=a.run_id AND j.job_name=a.producer_job WHERE a.run_id=$1 AND a.producer_job=$6 AND a.name=$7 AND a.deleted_at IS NULL AND p.status='RUNNING' AND p.runner_id::text=$2 AND p.lease_id::text=$3 AND p.lease_generation=$4 AND p.lease_expires_at>now() AND j.status='PASSED' AND EXISTS(SELECT 1 FROM job_runs c WHERE c.run_id=p.id AND c.job_name=$5 AND c.status='RUNNING')`, owner.RunID, owner.RunnerID, owner.LeaseID, owner.Generation, owner.JobName, producer, name))
+	a, err := scanArtifact(s.pool.QueryRow(ctx, `SELECT `+artifactColumns+` FROM artifacts a JOIN pipeline_runs p ON p.id=a.run_id JOIN job_runs j ON j.run_id=a.run_id AND j.job_name=a.producer_job JOIN job_runs c ON c.run_id=a.run_id AND c.job_name=$5 WHERE a.run_id=$1 AND a.producer_job=$6 AND a.name=$7 AND a.deleted_at IS NULL AND p.status='RUNNING' AND c.runner_id::text=$2 AND c.lease_id::text=$3 AND c.lease_generation=$4 AND c.lease_expires_at>now() AND c.status='RUNNING' AND j.status='PASSED' AND EXISTS(SELECT 1 FROM job_dependencies d WHERE d.run_id=a.run_id AND d.job_name=c.job_name AND d.depends_on_job=j.job_name)`, owner.RunID, owner.RunnerID, owner.LeaseID, owner.Generation, owner.JobName, producer, name))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}

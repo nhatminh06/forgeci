@@ -2,7 +2,7 @@
 
 ForgeCI is a self-hosted CI/CD platform built from first principles to explore how pipeline engines, schedulers, runners, build systems, artifact stores, software-supply-chain controls, and deployment systems work internally.
 
-Milestone 7 adds explicit durable job artifacts. Producers publish deterministic, content-addressed file or directory archives before becoming passed; consumers fetch, verify, and safely restore declared upstream artifacts before their first step.
+Milestone 8 adds job-level remote scheduling. The control plane durably owns DAG readiness and leases individual jobs across a runner fleet; immutable source snapshots and explicit artifacts make placement independent of runner filesystem state.
 
 ## Current capabilities
 
@@ -23,8 +23,9 @@ Milestone 7 adds explicit durable job artifacts. Producers publish deterministic
 - Immutable artifact CAS, transactional PostgreSQL metadata, retention, and reference-aware GC
 - Authenticated lease-owned artifact transfer and verified downstream materialization
 - Isolated per-run local and Docker workspaces with marker-protected cleanup
-- FIFO dispatch with live job-state persistence; one local run or one remote run per runner
-- Remote runner registration, heartbeat, lease acquisition, and completion reporting
+- Deterministic ready-job dispatch with durable dependency and job-state persistence
+- Independent runner and per-run concurrency limits with Docker capability matching
+- Remote runner registration, multi-job heartbeat, job lease acquisition, and completion reporting
 - Persistent runner inventory with `GET /v1/runners`
 - Local HTTP API and CLI commands for runs, runners, and artifact listing/download
 - Restart recovery for queued, completed, and interrupted runs
@@ -33,12 +34,12 @@ Milestone 7 adds explicit durable job artifacts. Producers publish deterministic
 ## Architecture
 
 ```text
-HTTP API → control plane → PostgreSQL + snapshot CAS + artifact CAS → queued run
+HTTP API → control-plane DAG scheduler → PostgreSQL + snapshot CAS + artifact CAS
     │
-    └── runner protocol → lease → download + verify → isolated workspace → executor
+    └── protocol v2 → ready job lease → fresh workspace → local/Docker executor
 ```
 
-Parsing, graph compilation, runtime state, and command execution remain separate so the control plane never re-interprets raw YAML. The control plane owns queueing and run lifecycle, while a persistent remote runner owns a leased whole-run execution. See [docs/architecture.md](docs/architecture.md) for the component boundaries.
+Parsing, graph compilation, runtime state, and command execution remain separate. In remote mode the control plane owns the durable DAG and readiness; each runner owns only its concurrently active leased jobs. See [docs/architecture.md](docs/architecture.md) and [docs/job-scheduling.md](docs/job-scheduling.md).
 
 Snapshot rules are documented in [docs/source-snapshots.md](docs/source-snapshots.md); artifact lifecycle, integrity, retention, and security are in [docs/artifacts.md](docs/artifacts.md).
 
@@ -124,9 +125,9 @@ Exit code `0` means success, `1` means at least one job failed or was blocked, a
 
 `--jobs` must be greater than zero and defaults to `1`, preserving sequential Milestone 1 behavior.
 
-## What Milestone 7 demonstrates
+## What Milestone 8 demonstrates
 
-Source snapshots and artifacts are independent durable objects: snapshots freeze pipeline input, while artifacts publish explicit job output. An artifact's logical digest identifies its canonical tree and its blob digest protects exact transport bytes. Required metadata commits atomically before the producer can become passed.
+Jobs from one run can execute across three or more runners, including local and Docker executors, without sharing a mutable workspace. Durable edges govern readiness, job leases provide fencing, and explicit artifacts are the only upstream-output transfer mechanism. Runner capacity and run capacity are enforced independently by PostgreSQL claim transactions.
 
 ## Current limitations and security model
 
@@ -136,4 +137,4 @@ The HTTP API remains loopback-only for the control-plane surface, and the runner
 
 ## Roadmap
 
-Build caching, job-level cross-runner scheduling, retries, persistent logs, per-runner credentials, Kubernetes, multi-tenancy/RBAC, and high availability remain deferred.
+Build caching, automatic retries or reassignment, labels/selectors, GPUs, persistent logs, per-runner credentials, Kubernetes/autoscaling, multi-tenancy/RBAC, and high availability remain deferred.

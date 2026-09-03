@@ -213,18 +213,14 @@ func runners(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	fmt.Fprintln(stdout, "NAME\tSTATUS\tOS\tARCH\tDOCKER\tCAPACITY\tCURRENT_RUN")
+	fmt.Fprintln(stdout, "NAME\tSTATUS\tOS\tARCH\tDOCKER\tACTIVE\tCAPACITY")
 	for _, runner := range runners {
 		docker := "no"
 		if runner.DockerAvailable {
 			docker = "yes"
 		}
-		currentRun := "-"
-		if runner.CurrentRunID != nil && *runner.CurrentRunID != "" {
-			currentRun = *runner.CurrentRunID
-		}
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
-			runner.Name, runner.Status, runner.OS, runner.Arch, docker, runner.MaxParallel, currentRun)
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
+			runner.Name, runner.Status, runner.OS, runner.Arch, docker, runner.ActiveJobs, runner.MaxParallel)
 	}
 	return 0
 }
@@ -256,9 +252,13 @@ func inspect(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if item.FinishedAt != nil {
 		fmt.Fprintf(stdout, "Finished: %s\n", item.FinishedAt.Format(time.RFC3339))
 	}
-	fmt.Fprintln(stdout, "\nJobs\nNAME\tSTATUS")
+	fmt.Fprintln(stdout, "\nJobs\nNAME\tSTATUS\tRUNNER")
 	for _, job := range item.Jobs {
-		fmt.Fprintf(stdout, "%s\t%s\n", job.Name, job.Status)
+		runnerID := "-"
+		if job.RunnerID != nil {
+			runnerID = *job.RunnerID
+		}
+		fmt.Fprintf(stdout, "%s\t%s\t%s\n", job.Name, job.Status, runnerID)
 	}
 	return 0
 }

@@ -151,6 +151,9 @@ func (m *Manager) Submit(ctx context.Context, pipelineFile string, maxParallel i
 	for _, name := range graph.Order {
 		job := graph.Nodes[name].Job
 		in.Jobs = append(in.Jobs, store.Job{Name: name, Status: store.JobPending, Image: job.Image})
+		for _, dependency := range job.Needs {
+			in.Dependencies = append(in.Dependencies, store.JobDependency{JobName: name, DependsOn: dependency})
+		}
 	}
 	run, err := m.store.CreateRun(ctx, in)
 	if err != nil {
@@ -201,6 +204,7 @@ func (m *Manager) Cancel(ctx context.Context, id string) (store.RunStatus, error
 			m.activeCancel()
 		}
 		m.mu.Unlock()
+		m.Notify()
 		return status, nil
 	default:
 		return r.Status, store.ErrConflict

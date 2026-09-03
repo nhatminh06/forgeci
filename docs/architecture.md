@@ -1,26 +1,26 @@
-# Milestone 7 architecture
+# Milestone 8 architecture
 
 ```text
 HTTP API
     │
     ▼
-run manager
+run manager + durable DAG scheduler
     │
     ▼
 PostgreSQL store + filesystem snapshot CAS + filesystem artifact CAS
     │
     ▼
-single-run FIFO dispatcher
+ready-job claim transactions
     │
     ▼
-stored pipeline YAML + verified source snapshot → parser → validation → DAG
+persisted dependency edges + job state
     │
     ▼
-bounded scheduler
+combined capacity checks
     │
-    ├── ready job ──► local job executor
-    ├── ready job ──► Docker job executor
-    └── ready job ──► waits for capacity
+    ├── job lease ──► runner A local executor
+    ├── job lease ──► runner B Docker executor
+    └── ready job ──► waits for runner/run capacity
     │
     ▼
 completion events and state updates
@@ -32,7 +32,7 @@ Remote leases include snapshot identity, blob identity, format, size, and entry 
 
 The `pipeline` package compiles validated configuration into graph nodes containing sorted dependency and dependent lists. Kahn's algorithm creates a topological order, using lexicographic job names whenever multiple nodes are ready. If not every node can be ordered, compilation reports the jobs involved in a dependency cycle.
 
-The `runner` event loop is the sole owner of runtime state. It scans `graph.Order` to admit ready jobs deterministically, never admits more than `--jobs`, and processes completion events from workers. Completion timing and live logs may vary, but admission decisions and the final summary order remain deterministic.
+Direct mode retains the in-process `runner` event loop. Remote mode persists dependency edges and lets PostgreSQL transactions select globally ready jobs deterministically. Claims enforce the registered runner's capacity, the run's global parallel limit, dependency readiness, and Docker capability before assigning a fenced job lease.
 
 A `PENDING` job is ready only when every dependency is `PASSED`. A failed or blocked dependency makes the job `BLOCKED`; dependencies that are still pending or running leave it waiting. Independent work remains eligible after another branch fails.
 
@@ -46,10 +46,10 @@ The scheduler knows only job results and never Docker lifecycle details. Its sin
 
 Direct `forge run` still enters the parser/compiler/scheduler path directly and imports no runtime database requirement.
 
-Each runner workspace is keyed by run and lease, uses restrictive permissions, and carries an ownership marker outside the extracted source directory. Cleanup verifies root containment, path shape, and marker identity before recursive deletion. Startup removes only stale marked workspaces and preserves unrelated directories.
+Each remote workspace is keyed by run, job, and lease, uses restrictive permissions, and carries an ownership marker outside the extracted source directory. Cleanup verifies root containment, path shape, and marker identity before recursive deletion. Startup removes only stale marked workspaces and preserves unrelated directories.
 
 Successful producer steps are followed by deterministic artifact capture, blob upload, and one transactional metadata-set commit before `PASSED`. A consumer downloads only explicitly declared upstream artifacts through durable storage, verifies blob and logical identity, and atomically materializes them before steps. Snapshot and artifact stores remain semantically separate.
 
 ## Intentionally absent
 
-Milestone 7 has no build cache, Git/SCM checkout, job-level cross-runner scheduling, retries, persistent logs, Kubernetes, secrets, RBAC, or distributed control-plane coordination. Docker execution remains unsuitable as hostile-code isolation.
+Milestone 8 has no build cache, Git/SCM checkout, automatic retry or reassignment, runner labels/selectors, GPU scheduling, persistent logs, Kubernetes/autoscaling, secrets, RBAC, or high-availability control plane. Docker execution remains unsuitable as hostile-code isolation.

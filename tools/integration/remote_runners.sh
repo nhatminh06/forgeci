@@ -9,21 +9,21 @@ runner_port=$((39000 + ($$ % 500)))
 server_pid=
 runner_a_pid=
 runner_b_pid=
+runner_c_pid=
 
 cleanup() {
-  for pid in "$runner_a_pid" "$runner_b_pid" "$server_pid"; do
+  for pid in "$runner_a_pid" "$runner_b_pid" "$runner_c_pid" "$server_pid"; do
     [ -z "$pid" ] || kill "$pid" >/dev/null 2>&1 || true
   done
-  for pid in "$runner_a_pid" "$runner_b_pid" "$server_pid"; do
+  for pid in "$runner_a_pid" "$runner_b_pid" "$runner_c_pid" "$server_pid"; do
     [ -z "$pid" ] || wait "$pid" >/dev/null 2>&1 || true
   done
   docker rm -f "$pg" >/dev/null 2>&1 || true
-  docker ps -aq --filter label=forgeci.managed=true | xargs -r docker rm -f >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$tmp/server" "$tmp/runner-a" "$tmp/runner-b" "$tmp/state-a" "$tmp/state-b" "$tmp/bin" "$tmp/snapshots" "$tmp/artifacts"
+mkdir -p "$tmp/server" "$tmp/runner-a" "$tmp/runner-b" "$tmp/runner-c" "$tmp/state-a" "$tmp/state-b" "$tmp/state-c" "$tmp/bin" "$tmp/snapshots" "$tmp/artifacts"
 cat >"$tmp/server/remote.yaml" <<'YAML'
 version: 1
 jobs:
@@ -144,6 +144,84 @@ jobs:
     steps:
       - run: exit 7
 YAML
+cat >"$tmp/server/distributed.yaml" <<'YAML'
+version: 1
+jobs:
+  setup:
+    image: alpine:3.20
+    steps:
+      - run: mkdir -p root && printf portable > root/value
+    artifacts:
+      upload:
+        - name: seed
+          path: root/value
+  fan-a:
+    needs: [setup]
+    artifacts:
+      download:
+        - from: setup
+          name: seed
+          into: input
+      upload:
+        - name: result-a
+          path: out/a
+    steps:
+      - run: test ! -e root/value && test "$(cat input/value)" = portable
+      - run: mkdir -p out && printf A > out/a && sleep 3
+  fan-b:
+    needs: [setup]
+    image: alpine:3.20
+    artifacts:
+      download:
+        - from: setup
+          name: seed
+          into: input
+      upload:
+        - name: result-b
+          path: out/b
+    steps:
+      - run: test ! -e root/value && test "$(cat input/value)" = portable
+      - run: mkdir -p out && printf B > out/b && sleep 3
+  fan-c:
+    needs: [setup]
+    artifacts:
+      download:
+        - from: setup
+          name: seed
+          into: input
+      upload:
+        - name: result-c
+          path: out/c
+    steps:
+      - run: test ! -e root/value && test "$(cat input/value)" = portable
+      - run: mkdir -p out && printf C > out/c && sleep 3
+  join:
+    needs: [fan-a, fan-b, fan-c]
+    image: alpine:3.20
+    artifacts:
+      download:
+        - from: fan-a
+          name: result-a
+          into: inputs/a
+        - from: fan-b
+          name: result-b
+          into: inputs/b
+        - from: fan-c
+          name: result-c
+          into: inputs/c
+    steps:
+      - run: test "$(cat inputs/a/a)$(cat inputs/b/b)$(cat inputs/c/c)" = ABC
+YAML
+cat >"$tmp/server/capacity.yaml" <<'YAML'
+version: 1
+jobs:
+  one:
+    steps:
+      - run: sleep 3
+  two:
+    steps:
+      - run: sleep 3
+YAML
 touch "$tmp/server/SERVER_ONLY_MARKER"
 printf 'A\n' > "$tmp/server/version.txt"
 printf '%s\n' integration-token >"$tmp/token"
@@ -171,7 +249,7 @@ while :; do
   i=$((i+1)); [ "$i" -lt 20 ] || { cat "$tmp/server.log"; exit 1; }
   sleep .2
 done
-[ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (3,4,5)")" = 3 ]
+[ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(*) FROM schema_migrations WHERE version IN (3,4,5,6)")" = 4 ]
 [ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT source_snapshot_sha256 IS NULL FROM pipeline_runs WHERE id='00000000-0000-4000-8000-000000000099'")" = t ]
 "$tmp/bin/forge" inspect 00000000-0000-4000-8000-000000000099 --server "http://127.0.0.1:$api_port" >/dev/null
 
@@ -186,10 +264,11 @@ sleep 1
 [ "$(status "$queued")" = QUEUED ]
 [ ! -e "$tmp/server/RUNNER_ONLY_MARKER" ]
 
-FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-a" --state-dir "$tmp/state-a" --name runner-a --max-parallel 2 >"$tmp/runner-a.log" 2>&1 & runner_a_pid=$!
-FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-b" --state-dir "$tmp/state-b" --name runner-b --max-parallel 2 >"$tmp/runner-b.log" 2>&1 & runner_b_pid=$!
+FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-a" --state-dir "$tmp/state-a" --name runner-a --max-parallel 1 >"$tmp/runner-a.log" 2>&1 & runner_a_pid=$!
+FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-b" --state-dir "$tmp/state-b" --name runner-b --max-parallel 1 >"$tmp/runner-b.log" 2>&1 & runner_b_pid=$!
+FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-c" --state-dir "$tmp/state-c" --name runner-c --max-parallel 1 >"$tmp/runner-c.log" 2>&1 & runner_c_pid=$!
 wait_status "$queued" PASSED
-test -z "$(find "$tmp/runner-a/runs" "$tmp/runner-b/runs" -mindepth 2 -type d 2>/dev/null || true)"
+test -z "$(find "$tmp/runner-a/jobs" "$tmp/runner-b/jobs" -name .forgeci-workspace.json 2>/dev/null || true)"
 
 same_a=$(submit slow.yaml); same_b=$(submit slow.yaml)
 digest_a=$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT source_snapshot_sha256 FROM pipeline_runs WHERE id='$same_a'")
@@ -204,9 +283,31 @@ while [ "$(status "$first")" != RUNNING ] || [ "$(status "$second")" != RUNNING 
   i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1
 done
 listing=$("$tmp/bin/forge" runners --server "http://127.0.0.1:$api_port")
-printf '%s\n' "$listing" | grep -q "$first"
-printf '%s\n' "$listing" | grep -q "$second"
+printf '%s\n' "$listing" | grep -q 'runner-a.*ONLINE'
+printf '%s\n' "$listing" | grep -q 'runner-b.*ONLINE'
 wait_status "$first" PASSED; wait_status "$second" PASSED
+
+distributed=$(submit distributed.yaml 3)
+i=0
+while [ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(*) FROM job_runs WHERE run_id='$distributed' AND job_name LIKE 'fan-%' AND status='RUNNING'")" != 3 ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
+[ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(DISTINCT runner_id) FROM job_runs WHERE run_id='$distributed' AND job_name LIKE 'fan-%'")" = 3 ]
+wait_status "$distributed" PASSED
+[ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(*) FROM job_dependencies WHERE run_id='$distributed'")" = 6 ]
+[ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(DISTINCT runner_id) FROM job_runs WHERE run_id='$distributed'")" -ge 3 ]
+
+kill "$runner_a_pid"; wait "$runner_a_pid" || true; runner_a_pid=
+kill "$runner_b_pid"; wait "$runner_b_pid" || true; runner_b_pid=
+kill "$runner_c_pid"; wait "$runner_c_pid" || true; runner_c_pid=
+FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-a" --state-dir "$tmp/state-a" --name runner-a --max-parallel 2 >"$tmp/runner-a-capacity.log" 2>&1 & runner_a_pid=$!
+runner_a_id=$(tr -d '\n' <"$tmp/state-a/runner-id")
+capacity_run=$(submit capacity.yaml 2)
+i=0; while [ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(*) FROM job_runs WHERE run_id='$capacity_run' AND status='RUNNING'")" != 2 ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
+[ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(DISTINCT runner_id) FROM job_runs WHERE run_id='$capacity_run' AND runner_id='$runner_a_id'")" = 1 ]
+wait_status "$capacity_run" PASSED
+multi_a=$(submit slow.yaml); multi_b=$(submit slow.yaml)
+i=0; while [ "$(status "$multi_a")" != RUNNING ] || [ "$(status "$multi_b")" != RUNNING ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
+[ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT count(*) FROM job_runs WHERE run_id IN ('$multi_a','$multi_b') AND status='RUNNING' AND runner_id='$runner_a_id'")" = 2 ]
+wait_status "$multi_a" PASSED; wait_status "$multi_b" PASSED
 
 docker_run=$(submit docker.yaml)
 wait_status "$docker_run" PASSED
@@ -222,7 +323,7 @@ artifact_digest=$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT b
 
 access_run=$(submit artifact-access.yaml)
 i=0; until [ "$(docker exec "$pg" psql -U postgres -d forgeci -At -c "SELECT status FROM job_runs WHERE run_id='$access_run' AND job_name='consume'")" = RUNNING ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
-access_row=$(docker exec "$pg" psql -U postgres -d forgeci -At -F ' ' -c "SELECT runner_id,lease_id,lease_generation FROM pipeline_runs WHERE id='$access_run'")
+access_row=$(docker exec "$pg" psql -U postgres -d forgeci -At -F ' ' -c "SELECT runner_id,lease_id,lease_generation FROM job_runs WHERE run_id='$access_run' AND job_name='consume'")
 access_runner=$(printf '%s' "$access_row" | awk '{print $1}'); access_lease=$(printf '%s' "$access_row" | awk '{print $2}'); access_generation=$(printf '%s' "$access_row" | awk '{print $3}')
 runner_a_id=$(tr -d '\n' <"$tmp/state-a/runner-id"); runner_b_id=$(tr -d '\n' <"$tmp/state-b/runner-id"); wrong_runner=$runner_a_id; [ "$wrong_runner" != "$access_runner" ] || wrong_runner=$runner_b_id
 wrong_artifact_code=$(curl -sS -o "$tmp/wrong-artifact.json" -w '%{http_code}' -H 'Authorization: Bearer integration-token' "http://127.0.0.1:$runner_port/v1/runner/leases/$access_lease/artifacts/build/scoped?runner_id=$wrong_runner&run_id=$access_run&generation=$access_generation&consumer_job=consume")
@@ -256,25 +357,24 @@ wait_status "$canceled" CANCELED
 [ ! -e "$tmp/runner-b/SHOULD_NOT_EXIST" ]
 
 identity=$(tr -d '\n' <"$tmp/state-a/runner-id")
-kill "$runner_b_pid"; wait "$runner_b_pid" || true; runner_b_pid=
 lost=$(submit long.yaml)
 i=0; while [ "$(status "$lost")" != RUNNING ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
-i=0; until find "$tmp/runner-a/runs" -name .forgeci-workspace.json | grep -q .; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
+i=0; until find "$tmp/runner-a/jobs" -name .forgeci-workspace.json | grep -q .; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
 kill -9 "$runner_a_pid"; wait "$runner_a_pid" >/dev/null 2>&1 || true; runner_a_pid=
-find "$tmp/runner-a/runs" -name .forgeci-workspace.json | grep -q .
+find "$tmp/runner-a/jobs" -name .forgeci-workspace.json | grep -q .
 wait_status "$lost" ABORTED
-FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-a" --state-dir "$tmp/state-a" --name runner-a --max-parallel 2 >"$tmp/runner-a-2.log" 2>&1 & runner_a_pid=$!
+FORGECI_RUNNER_TOKEN=integration-token "$tmp/bin/forge-runner" --server "http://127.0.0.1:$runner_port" --workspace-root "$tmp/runner-a" --state-dir "$tmp/state-a" --name runner-a --max-parallel 1 >"$tmp/runner-a-2.log" 2>&1 & runner_a_pid=$!
 [ "$(tr -d '\n' <"$tmp/state-a/runner-id")" = "$identity" ]
-i=0; while find "$tmp/runner-a/runs" -name .forgeci-workspace.json | grep -q .; do i=$((i+1)); [ "$i" -lt 50 ] || exit 1; sleep .1; done
+i=0; while find "$tmp/runner-a/jobs" -name .forgeci-workspace.json | grep -q .; do i=$((i+1)); [ "$i" -lt 50 ] || exit 1; sleep .1; done
 
 partitioned=$(submit partition.yaml)
 i=0; while [ "$(status "$partitioned")" != RUNNING ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 1; sleep .1; done
-lease_row=$(docker exec "$pg" psql -U postgres -d forgeci -At -F ' ' -c "SELECT runner_id,lease_id,lease_generation FROM pipeline_runs WHERE id='$partitioned'")
+lease_row=$(docker exec "$pg" psql -U postgres -d forgeci -At -F ' ' -c "SELECT runner_id,lease_id,lease_generation FROM job_runs WHERE run_id='$partitioned' AND job_name='partition'")
 partition_runner=$(printf '%s' "$lease_row" | awk '{print $1}')
 partition_lease=$(printf '%s' "$lease_row" | awk '{print $2}')
 partition_generation=$(printf '%s' "$lease_row" | awk '{print $3}')
 wrong_runner=$(tr -d '\n' <"$tmp/state-b/runner-id")
-wrong_source_code=$(curl -sS -o "$tmp/wrong-source.json" -w '%{http_code}' -H 'Authorization: Bearer integration-token' "http://127.0.0.1:$runner_port/v1/runner/leases/$partition_lease/source?runner_id=$wrong_runner&run_id=$partitioned&generation=$partition_generation")
+wrong_source_code=$(curl -sS -o "$tmp/wrong-source.json" -w '%{http_code}' -H 'Authorization: Bearer integration-token' "http://127.0.0.1:$runner_port/v1/runner/leases/$partition_lease/source?runner_id=$wrong_runner&run_id=$partitioned&job_name=partition&generation=$partition_generation")
 [ "$wrong_source_code" = 409 ]
 kill -STOP "$server_pid"
 sleep 36
@@ -282,7 +382,7 @@ test -z "$(docker ps -q --filter label=forgeci.managed=true)"
 [ ! -e "$tmp/runner-a/SHOULD_NOT_EXIST" ]
 kill -CONT "$server_pid"
 wait_status "$partitioned" ABORTED
-stale_code=$(curl -sS -o "$tmp/stale.json" -w '%{http_code}' -X POST -H 'Authorization: Bearer integration-token' -H 'Content-Type: application/json' --data "{\"runner_id\":\"$partition_runner\",\"run_id\":\"$partitioned\",\"lease_id\":\"$partition_lease\",\"generation\":$partition_generation,\"status\":\"PASSED\"}" "http://127.0.0.1:$runner_port/v1/runner/leases/$partition_lease/complete")
+stale_code=$(curl -sS -o "$tmp/stale.json" -w '%{http_code}' -X POST -H 'Authorization: Bearer integration-token' -H 'Content-Type: application/json' --data "{\"runner_id\":\"$partition_runner\",\"run_id\":\"$partitioned\",\"job_name\":\"partition\",\"lease_id\":\"$partition_lease\",\"generation\":$partition_generation,\"status\":\"PASSED\"}" "http://127.0.0.1:$runner_port/v1/runner/leases/$partition_lease/complete")
 [ "$stale_code" = 409 ]
 [ "$(status "$partitioned")" = ABORTED ]
 
