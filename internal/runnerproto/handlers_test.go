@@ -47,7 +47,7 @@ func TestArtifactUploadRequiresCurrentRunnerAndLease(t *testing.T) {
 	runID := "00000000-0000-4000-8000-000000000002"
 	leaseID := "00000000-0000-4000-8000-000000000003"
 	expiry := time.Now().Add(time.Minute)
-	run := &store.Run{ID: runID, Status: store.RunRunning, RunnerID: &runnerID, LeaseID: &leaseID, LeaseGeneration: 2, LeaseExpiresAt: &expiry, Jobs: []store.Job{{Name: "build", Status: store.JobRunning}}}
+	run := &store.Run{ID: runID, Status: store.RunRunning, Jobs: []store.Job{{Name: "build", Status: store.JobRunning, RunnerID: &runnerID, LeaseID: &leaseID, LeaseGeneration: 2, LeaseExpiresAt: &expiry}}}
 	cas, err := artifact.Open(t.TempDir(), artifact.DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestArtifactUploadRequiresCurrentRunnerAndLease(t *testing.T) {
 		t.Fatalf("valid upload code=%d body=%s", got.Code, got.Body.String())
 	}
 	past := time.Now().Add(-time.Second)
-	run.LeaseExpiresAt = &past
+	run.Jobs[0].LeaseExpiresAt = &past
 	if got := request(runnerID); got.Code != http.StatusConflict {
 		t.Fatalf("stale lease code=%d", got.Code)
 	}
@@ -91,7 +91,7 @@ func TestSourceRequiresCurrentLeaseOwnership(t *testing.T) {
 	leaseID := "00000000-0000-4000-8000-000000000003"
 	digest := strings.Repeat("a", 64)
 	expiry := time.Now().Add(time.Minute)
-	run := &store.Run{ID: runID, Status: store.RunRunning, RunnerID: &runnerID, LeaseID: &leaseID, LeaseGeneration: 2, LeaseExpiresAt: &expiry, SourceSnapshotSHA256: &digest, SnapshotArchiveSize: 4, SnapshotBlobSHA256: strings.Repeat("b", 64)}
+	run := &store.Run{ID: runID, Status: store.RunRunning, SourceSnapshotSHA256: &digest, SnapshotArchiveSize: 4, SnapshotBlobSHA256: strings.Repeat("b", 64), Jobs: []store.Job{{Name: "build", Status: store.JobRunning, RunnerID: &runnerID, LeaseID: &leaseID, LeaseGeneration: 2, LeaseExpiresAt: &expiry}}}
 	file := t.TempDir() + "/blob"
 	os.WriteFile(file, []byte("data"), 0600)
 	h := NewHandlers(sourceStore{run: run}, "token")
@@ -102,17 +102,17 @@ func TestSourceRequiresCurrentLeaseOwnership(t *testing.T) {
 		h.Source(w, r)
 		return w
 	}
-	valid := request("runner_id=" + runnerID + "&run_id=" + runID + "&generation=2")
+	valid := request("runner_id=" + runnerID + "&run_id=" + runID + "&job_name=build&generation=2")
 	if valid.Code != http.StatusOK || valid.Body.String() != "data" {
 		t.Fatalf("valid source: %d %q", valid.Code, valid.Body.String())
 	}
-	for _, query := range []string{"runner_id=00000000-0000-4000-8000-000000000099&run_id=" + runID + "&generation=2", "runner_id=" + runnerID + "&run_id=" + runID + "&generation=1"} {
+	for _, query := range []string{"runner_id=00000000-0000-4000-8000-000000000099&run_id=" + runID + "&job_name=build&generation=2", "runner_id=" + runnerID + "&run_id=" + runID + "&job_name=build&generation=1"} {
 		if got := request(query); got.Code != http.StatusConflict {
 			t.Fatalf("ownership bypass: %d", got.Code)
 		}
 	}
-	run.LeaseExpiresAt = func() *time.Time { v := time.Now().Add(-time.Second); return &v }()
-	if got := request("runner_id=" + runnerID + "&run_id=" + runID + "&generation=2"); got.Code != http.StatusConflict {
+	run.Jobs[0].LeaseExpiresAt = func() *time.Time { v := time.Now().Add(-time.Second); return &v }()
+	if got := request("runner_id=" + runnerID + "&run_id=" + runID + "&job_name=build&generation=2"); got.Code != http.StatusConflict {
 		t.Fatalf("expired lease accepted: %d", got.Code)
 	}
 }
@@ -120,15 +120,15 @@ func TestSourceRequiresCurrentLeaseOwnership(t *testing.T) {
 type signalingLeaseStore struct {
 	RunnerStore
 	mu    sync.Mutex
-	run   *store.Run
+	lease *store.JobLease
 	calls int
 }
 
-func (s *signalingLeaseStore) LeaseRun(context.Context, string, string) (*store.Run, error) {
+func (s *signalingLeaseStore) LeaseJob(context.Context, string) (*store.JobLease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
-	return s.run, nil
+	return s.lease, nil
 }
 
 func TestLeaseLongPollWakesOnSubmission(t *testing.T) {
@@ -153,9 +153,9 @@ func TestLeaseLongPollWakesOnSubmission(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	leaseID, parallel, expires := "00000000-0000-4000-8000-000000000002", 1, time.Now().Add(time.Minute)
+	leaseID, expires := "00000000-0000-4000-8000-000000000002", time.Now().Add(time.Minute)
 	s.mu.Lock()
-	s.run = &store.Run{ID: "00000000-0000-4000-8000-000000000003", LeaseID: &leaseID, LeaseGeneration: 1, EffectiveParallel: &parallel, LeaseExpiresAt: &expires}
+	s.lease = &store.JobLease{RunID: "00000000-0000-4000-8000-000000000003", JobName: "build", LeaseID: leaseID, Generation: 1, ExpiresAt: expires}
 	s.mu.Unlock()
 	close(signal)
 	select {
@@ -176,5 +176,14 @@ func TestStrictRunnerJSON(t *testing.T) {
 		if response.Code != http.StatusBadRequest {
 			t.Fatalf("body length=%d code=%d", len(body), response.Code)
 		}
+	}
+}
+
+func TestProtocolV1IsRejected(t *testing.T) {
+	body := `{"id":"00000000-0000-4000-8000-000000000001","name":"old","protocol_version":1,"os":"linux","arch":"amd64","docker":false,"max_parallel":1}`
+	w := httptest.NewRecorder()
+	NewHandlers(nil, "token").Register(w, httptest.NewRequest(http.MethodPost, "/v1/runner/register", strings.NewReader(body)))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "unsupported protocol version 1") {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
 	}
 }
