@@ -28,7 +28,7 @@ func TestCacheAuthorizationRejectsInvalidOwnershipAndDeclarations(t *testing.T) 
 	}
 	base := "/v1/runner/leases/" + leaseID + "/cache/go-v1?runner_id=" + runnerID + "&run_id=" + runID + "&job_name=build&generation=2&path=.cache/go"
 	for _, tc := range []struct{ name, auth, path string }{
-		{"missing token", "", base}, {"bad token", "Bearer wrong", base}, {"wrong runner", "Bearer token", strings.Replace(base, runnerID, "00000000-0000-4000-8000-000000000099", 1)}, {"wrong run", "Bearer token", strings.Replace(base, runID, "00000000-0000-4000-8000-000000000099", 1)}, {"wrong job", "Bearer token", strings.Replace(base, "job_name=build", "job_name=other", 1)}, {"wrong generation", "Bearer token", strings.Replace(base, "generation=2", "generation=1", 1)}, {"undeclared key", "Bearer token", strings.Replace(base, "go-v1", "other", 1)},
+		{"missing token", "", base}, {"bad token", "Bearer wrong", base}, {"wrong runner", "Bearer token", strings.Replace(base, runnerID, "00000000-0000-4000-8000-000000000099", 1)}, {"wrong run", "Bearer token", strings.Replace(base, runID, "00000000-0000-4000-8000-000000000099", 1)}, {"wrong job", "Bearer token", strings.Replace(base, "job_name=build", "job_name=other", 1)}, {"wrong generation", "Bearer token", strings.Replace(base, "generation=2", "generation=1", 1)}, {"wrong lease", "Bearer token", strings.Replace(base, leaseID, "00000000-0000-4000-8000-000000000099", 1)}, {"undeclared key", "Bearer token", strings.Replace(base, "go-v1", "other", 1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := request(http.MethodGet, tc.path, tc.auth)
@@ -44,5 +44,10 @@ func TestCacheAuthorizationRejectsInvalidOwnershipAndDeclarations(t *testing.T) 
 	run.Jobs[0].LeaseExpiresAt = &past
 	if w := request(http.MethodGet, base, "Bearer token"); w.Code == http.StatusOK {
 		t.Fatal("expired lease accepted")
+	}
+	run.Jobs[0].LeaseExpiresAt = &exp
+	run.Jobs[0].Status = store.JobPassed
+	if w := request(http.MethodGet, base, "Bearer token"); w.Code == http.StatusOK {
+		t.Fatal("terminal job restore accepted")
 	}
 }
