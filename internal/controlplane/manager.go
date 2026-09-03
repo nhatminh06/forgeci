@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -30,6 +31,7 @@ type Manager struct {
 	workspace     string
 	snapshots     *snapshot.Store
 	artifacts     *artifact.Store
+	cacheStore    *cache.Store
 	workspaceRoot string
 	output        io.Writer
 	wake          chan struct{}
@@ -44,6 +46,7 @@ type Manager struct {
 }
 
 func (m *Manager) SetArtifactStore(value *artifact.Store) { m.artifacts = value }
+func (m *Manager) SetCacheStore(value *cache.Store)       { m.cacheStore = value }
 
 type InputError struct{ Err error }
 
@@ -355,7 +358,29 @@ func (m *Manager) execute(runRecord *store.Run) {
 			})
 		}
 	}
-	result := (runner.Runner{Executor: exec, Output: m.output, ErrorOutput: m.output, MaxParallel: runRecord.MaxParallel, Observer: obs, Artifacts: artifactSession}).Run(ctx, graph)
+	var cacheSession *cache.Session
+	if m.cacheStore != nil {
+		remote := cache.NewLocalRemote(m.cacheStore, runRecord.Workspace)
+		if persistence, ok := m.store.(store.CacheStore); ok {
+			remote.LookupFn = func(callCtx context.Context, key string) (cache.Metadata, error) {
+				item, lookupErr := persistence.LookupCache(callCtx, runRecord.Workspace, key, time.Now().UTC())
+				if lookupErr != nil {
+					return cache.Metadata{}, lookupErr
+				}
+				return cache.Metadata{Key: item.Key, Metadata: artifact.Metadata{Name: item.Key, RootName: item.RootName, RootKind: item.RootKind, ContentSHA256: item.ContentSHA256, BlobSHA256: item.BlobSHA256, Format: item.Format, ArchiveSizeBytes: item.ArchiveSizeBytes, LogicalSizeBytes: item.LogicalSizeBytes, EntryCount: item.EntryCount, CreatedAt: item.CreatedAt}, LastAccessedAt: item.LastAccessedAt, ExpiresAt: item.ExpiresAt}, nil
+			}
+			remote.CommitFn = func(callCtx context.Context, item cache.Metadata) error {
+				return persistence.CommitCache(callCtx, store.CacheMetadata{Workspace: runRecord.Workspace, Key: item.Key, RootName: item.RootName, RootKind: item.RootKind, ContentSHA256: item.ContentSHA256, BlobSHA256: item.BlobSHA256, Format: item.Format, ArchiveSizeBytes: item.ArchiveSizeBytes, LogicalSizeBytes: item.LogicalSizeBytes, EntryCount: item.EntryCount, CreatedAt: item.CreatedAt, LastAccessedAt: time.Now().UTC()})
+			}
+		}
+		cacheSession, err = cache.NewSession(executionWorkspace, filepath.Join(m.cacheStore.Root(), "tmp"), remote)
+		if err != nil {
+			message := err.Error()
+			m.finish(runRecord.ID, store.RunError, &message)
+			return
+		}
+	}
+	result := (runner.Runner{Executor: exec, Output: m.output, ErrorOutput: m.output, MaxParallel: runRecord.MaxParallel, Observer: obs, Artifacts: artifactSession, Cache: cacheSession}).Run(ctx, graph)
 	status := store.RunFailed
 	var message *string
 	if obs.err != nil {

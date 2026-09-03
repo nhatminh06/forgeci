@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -127,11 +128,13 @@ type Handlers struct {
 	workSignal  func() <-chan struct{}
 	openBlob    func(string) (*os.File, error)
 	artifacts   *artifact.Store
+	cacheStore  *cache.Store
 	notify      func()
 }
 
 func (h *Handlers) SetSnapshotOpener(open func(string) (*os.File, error)) { h.openBlob = open }
 func (h *Handlers) SetArtifactStore(value *artifact.Store)                { h.artifacts = value }
+func (h *Handlers) SetCacheStore(value *cache.Store)                      { h.cacheStore = value }
 func (h *Handlers) SetNotifier(value func())                              { h.notify = value }
 
 func NewHandlers(store RunnerStore, token string, signals ...func() <-chan struct{}) *Handlers {
@@ -483,6 +486,12 @@ func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	if strings.HasSuffix(path, "/source") {
 		h.Source(w, r)
+	} else if pathContains(path, "/cache-blobs/") {
+		h.CacheUpload(w, r)
+	} else if strings.HasSuffix(path, "/cache/commit") {
+		h.CacheCommit(w, r)
+	} else if pathContains(path, "/cache/") {
+		h.CacheDownload(w, r)
 	} else if pathContains(path, "/artifact-blobs/") {
 		h.ArtifactUpload(w, r)
 	} else if strings.HasSuffix(path, "/artifacts/commit") {

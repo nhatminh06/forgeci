@@ -10,6 +10,17 @@ type Job struct {
 	Image     *string   `yaml:"image,omitempty"`
 	Steps     []Step    `yaml:"steps"`
 	Artifacts Artifacts `yaml:"artifacts,omitempty"`
+	Cache     Cache     `yaml:"cache,omitempty"`
+}
+
+type Cache struct {
+	Restore []CacheEntry `yaml:"restore,omitempty"`
+	Save    []CacheEntry `yaml:"save,omitempty"`
+}
+
+type CacheEntry struct {
+	Key  string `yaml:"key"`
+	Path string `yaml:"path"`
 }
 
 type Artifacts struct {

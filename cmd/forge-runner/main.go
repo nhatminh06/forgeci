@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/runworkspace"
@@ -558,6 +559,15 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 		rr.completeArtifactFailure(lease, ctx, err)
 		return
 	}
+	cacheSession, _ := cache.NewSession(sourceDir, filepath.Join(workspace, "cache-tmp"), remoteCacheTransport{rr: rr, runID: lease.RunID, leaseID: lease.LeaseID, jobName: lease.JobName, generation: lease.Generation})
+	var cacheRestore, cacheSave []config.CacheEntry
+	for _, c := range lease.Job.CacheRestore {
+		cacheRestore = append(cacheRestore, config.CacheEntry{Key: c.Key, Path: c.Path})
+	}
+	for _, c := range lease.Job.CacheSave {
+		cacheSave = append(cacheSave, config.CacheEntry{Key: c.Key, Path: c.Path})
+	}
+	cacheSession.Restore(ctx, cacheRestore, os.Stdout)
 	job := config.Job{Image: lease.Job.Image, Artifacts: config.Artifacts{Upload: uploads, Download: downloads}}
 	for _, command := range lease.Job.Steps {
 		job.Steps = append(job.Steps, config.Step{Run: command})
@@ -587,6 +597,7 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 		rr.completeArtifactFailure(lease, ctx, err)
 		return
 	}
+	cacheSession.Save(ctx, cacheSave, os.Stdout)
 	_ = rr.sendJobComplete(lease, "PASSED", nil)
 }
 
@@ -642,6 +653,90 @@ type runnerArtifactTransport struct {
 	rr             *RemoteRunner
 	runID, leaseID string
 	generation     int
+}
+
+type remoteCacheTransport struct {
+	rr                      *RemoteRunner
+	runID, leaseID, jobName string
+	generation              int
+}
+
+func (t remoteCacheTransport) query(path string) string {
+	v := url.Values{}
+	v.Set("runner_id", t.rr.id)
+	v.Set("run_id", t.runID)
+	v.Set("job_name", t.jobName)
+	v.Set("generation", strconv.Itoa(t.generation))
+	v.Set("path", path)
+	return v.Encode()
+}
+func (t remoteCacheTransport) request(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
+	req, e := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if e != nil {
+		return nil, e
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	return t.rr.httpClient.Do(req)
+}
+func (t remoteCacheTransport) Lookup(ctx context.Context, key string) (cache.Metadata, error) {
+	ep := fmt.Sprintf("%s/v1/runner/leases/%s/cache/%s?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(key), t.query(""))
+	resp, e := t.request(ctx, http.MethodGet, ep, nil)
+	if e != nil {
+		return cache.Metadata{}, e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return cache.Metadata{}, cache.ErrCacheMiss
+	}
+	if resp.StatusCode != http.StatusOK {
+		return cache.Metadata{}, fmt.Errorf("cache lookup: %s", resp.Status)
+	}
+	m := cache.Metadata{Key: key}
+	m.Metadata.RootName = resp.Header.Get("X-ForgeCI-Cache-Root")
+	m.Metadata.RootKind = resp.Header.Get("X-ForgeCI-Cache-Kind")
+	m.Metadata.ContentSHA256 = resp.Header.Get("X-ForgeCI-Cache-Content-SHA256")
+	m.Metadata.BlobSHA256 = resp.Header.Get("X-ForgeCI-Cache-Blob-SHA256")
+	m.Metadata.Format = resp.Header.Get("X-ForgeCI-Cache-Format")
+	m.Metadata.ArchiveSizeBytes = resp.ContentLength
+	return m, nil
+}
+func (t remoteCacheTransport) Download(ctx context.Context, m cache.Metadata, w io.Writer) error {
+	ep := fmt.Sprintf("%s/v1/runner/leases/%s/cache/%s?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(m.Key), t.query(""))
+	resp, e := t.request(ctx, http.MethodGet, ep, nil)
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("cache download: %s", resp.Status)
+	}
+	_, e = io.Copy(w, resp.Body)
+	return e
+}
+func (t remoteCacheTransport) Upload(ctx context.Context, m cache.Metadata, r io.Reader) error {
+	ep := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/cache-blobs/%s?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(t.jobName), m.BlobSHA256, t.query(m.Key))
+	resp, e := t.request(ctx, http.MethodPut, ep, r)
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("cache upload: %s", resp.Status)
+	}
+	return nil
+}
+func (t remoteCacheTransport) Commit(ctx context.Context, m cache.Metadata) error {
+	body, _ := json.Marshal(map[string]any{"runner_id": t.rr.id, "run_id": t.runID, "lease_id": t.leaseID, "generation": t.generation, "job_name": t.jobName, "key": m.Key, "path": "", "root_name": m.Metadata.RootName, "root_kind": m.Metadata.RootKind, "content_sha256": m.Metadata.ContentSHA256, "blob_sha256": m.Metadata.BlobSHA256, "format": m.Metadata.Format, "archive_size_bytes": m.Metadata.ArchiveSizeBytes, "logical_size_bytes": m.Metadata.LogicalSizeBytes, "entry_count": m.Metadata.EntryCount})
+	ep := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/cache/commit", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(t.jobName))
+	resp, e := t.request(ctx, http.MethodPost, ep, bytes.NewReader(body))
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("cache commit: %s", resp.Status)
+	}
+	return nil
 }
 
 func (t runnerArtifactTransport) query(job string) string {

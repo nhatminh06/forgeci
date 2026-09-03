@@ -94,6 +94,12 @@ func (s *Store) LeaseJob(ctx context.Context, runnerID string) (*store.JobLease,
 	for _, d := range job.Artifacts.Download {
 		def.Downloads = append(def.Downloads, store.ArtifactDownload{From: d.From, Name: d.Name, Into: d.Into})
 	}
+	for _, c := range job.Cache.Restore {
+		def.CacheRestore = append(def.CacheRestore, store.CacheDeclaration{Key: c.Key, Path: c.Path})
+	}
+	for _, c := range job.Cache.Save {
+		def.CacheSave = append(def.CacheSave, store.CacheDeclaration{Key: c.Key, Path: c.Path})
+	}
 	return &store.JobLease{RunID: runID, JobName: jobName, RunnerID: runnerID, LeaseID: leaseID, Generation: generation, ExpiresAt: expires, Job: def, Snapshot: store.SourceSnapshot{SourceDigest: source, BlobDigest: blob, Format: format, ArchiveSizeBytes: archive, LogicalSizeBytes: logical, EntryCount: entries}}, nil
 }
 
