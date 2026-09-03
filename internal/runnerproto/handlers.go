@@ -20,7 +20,7 @@ import (
 )
 
 // Protocol version constant
-const ProtocolVersion = 1
+const ProtocolVersion = 2
 
 // Request/Response types
 
@@ -44,16 +44,13 @@ type RegisterResponse struct {
 }
 
 type HeartbeatRequest struct {
-	RunnerID      string  `json:"runner_id"`
-	ActiveLeaseID *string `json:"active_lease_id"`
-	Generation    int     `json:"generation,omitempty"`
+	RunnerID string                 `json:"runner_id"`
+	Leases   []store.LeaseHeartbeat `json:"leases"`
 }
 
 type HeartbeatResponse struct {
-	LeaseValid      bool       `json:"lease_valid"`
-	CancelRequested bool       `json:"cancel_requested"`
-	ServerShutdown  bool       `json:"server_shutdown"`
-	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
+	Leases         []store.LeaseHeartbeatResult `json:"leases"`
+	ServerShutdown bool                         `json:"server_shutdown"`
 }
 
 type LeaseRequest struct {
@@ -61,18 +58,18 @@ type LeaseRequest struct {
 }
 
 type LeaseResponse struct {
-	RunID                string    `json:"run_id"`
-	LeaseID              string    `json:"lease_id"`
-	Generation           int       `json:"generation"`
-	PipelineYAML         []byte    `json:"pipeline_yaml"`
-	EffectiveParallel    int       `json:"effective_parallel"`
-	ExpiresAt            time.Time `json:"expires_at"`
-	SourceSnapshotSHA256 string    `json:"source_snapshot_sha256"`
-	BlobSHA256           string    `json:"blob_sha256"`
-	ArchiveSizeBytes     int64     `json:"archive_size_bytes"`
-	LogicalSizeBytes     int64     `json:"logical_size_bytes"`
-	EntryCount           int       `json:"entry_count"`
-	ArchiveFormat        string    `json:"archive_format"`
+	RunID                string              `json:"run_id"`
+	JobName              string              `json:"job_name"`
+	LeaseID              string              `json:"lease_id"`
+	Generation           int                 `json:"generation"`
+	Job                  store.JobDefinition `json:"job"`
+	ExpiresAt            time.Time           `json:"expires_at"`
+	SourceSnapshotSHA256 string              `json:"source_snapshot_sha256"`
+	BlobSHA256           string              `json:"blob_sha256"`
+	ArchiveSizeBytes     int64               `json:"archive_size_bytes"`
+	LogicalSizeBytes     int64               `json:"logical_size_bytes"`
+	EntryCount           int                 `json:"entry_count"`
+	ArchiveFormat        string              `json:"archive_format"`
 }
 
 type JobEventRequest struct {
@@ -93,6 +90,7 @@ type CompleteRunRequest struct {
 	RunID      string  `json:"run_id"`
 	LeaseID    string  `json:"lease_id"`
 	Generation int     `json:"generation"`
+	JobName    string  `json:"job_name"`
 	Status     string  `json:"status"`
 	Error      *string `json:"error,omitempty"`
 }
@@ -116,6 +114,9 @@ type RunnerStore interface {
 	ReportJobEvent(context.Context, string, string, string, int, string, store.JobStatus) error
 	CompleteRun(context.Context, string, string, string, int, store.RunStatus, *string) error
 	GetRun(context.Context, string) (*store.Run, error)
+	LeaseJob(context.Context, string) (*store.JobLease, error)
+	HeartbeatJobLeases(context.Context, string, []store.LeaseHeartbeat, time.Time) ([]store.LeaseHeartbeatResult, error)
+	CompleteJob(context.Context, store.ArtifactOwnership, store.JobStatus, *string) error
 }
 
 type Handlers struct {
@@ -126,10 +127,12 @@ type Handlers struct {
 	workSignal  func() <-chan struct{}
 	openBlob    func(string) (*os.File, error)
 	artifacts   *artifact.Store
+	notify      func()
 }
 
 func (h *Handlers) SetSnapshotOpener(open func(string) (*os.File, error)) { h.openBlob = open }
 func (h *Handlers) SetArtifactStore(value *artifact.Store)                { h.artifacts = value }
+func (h *Handlers) SetNotifier(value func())                              { h.notify = value }
 
 func NewHandlers(store RunnerStore, token string, signals ...func() <-chan struct{}) *Handlers {
 	h := &Handlers{
@@ -277,64 +280,31 @@ func (h *Handlers) Heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !validUUID(req.RunnerID) || (req.ActiveLeaseID != nil && !validUUID(*req.ActiveLeaseID)) || req.Generation < 0 {
+	if !validUUID(req.RunnerID) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "missing runner_id"})
 		return
 	}
-
-	// Update liveness
-	err := h.store.UpdateRunnerLiveness(r.Context(), req.RunnerID, time.Now().UTC())
+	seen := map[string]struct{}{}
+	for _, lease := range req.Leases {
+		key := lease.RunID + "\x00" + lease.JobName + "\x00" + lease.LeaseID
+		if !validUUID(lease.RunID) || lease.JobName == "" || !validUUID(lease.LeaseID) || lease.Generation < 1 {
+			writeError(w, http.StatusBadRequest, "invalid job lease")
+			return
+		}
+		if _, ok := seen[key]; ok {
+			writeError(w, http.StatusBadRequest, "duplicate job lease")
+			return
+		}
+		seen[key] = struct{}{}
+	}
+	results, err := h.store.HeartbeatJobLeases(r.Context(), req.RunnerID, req.Leases, time.Now().UTC())
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "liveness update failed"})
+		writeError(w, http.StatusInternalServerError, "heartbeat failed")
 		return
 	}
-
-	// Check if lease is still valid and renew if requested
-	var leaseValid bool
-	var renewedUntil *time.Time
-	if req.ActiveLeaseID != nil && *req.ActiveLeaseID != "" {
-		// Get the run to check lease status
-		runner, err := h.store.GetRunner(r.Context(), req.RunnerID)
-		if err != nil {
-			leaseValid = false
-		} else if runner.CurrentRunID != nil {
-			run, err := h.store.GetRun(r.Context(), *runner.CurrentRunID)
-			if err == nil && run.LeaseID != nil && *run.LeaseID == *req.ActiveLeaseID && run.Status == store.RunRunning {
-				leaseValid = true
-				// Renew lease
-				ttl := 30 * time.Second
-				newExpiry := time.Now().UTC().Add(ttl)
-				if req.Generation == run.LeaseGeneration && h.store.RenewLease(r.Context(), *runner.CurrentRunID, req.RunnerID, *req.ActiveLeaseID, req.Generation, newExpiry) == nil {
-					renewedUntil = &newExpiry
-				} else {
-					leaseValid = false
-				}
-			}
-		}
-	}
-
-	// Check for cancel request
-	var cancelRequested bool
-	if req.ActiveLeaseID != nil && *req.ActiveLeaseID != "" {
-		runner, _ := h.store.GetRunner(r.Context(), req.RunnerID)
-		if runner != nil && runner.CurrentRunID != nil {
-			run, _ := h.store.GetRun(r.Context(), *runner.CurrentRunID)
-			if run != nil && run.CancelRequestedAt != nil {
-				cancelRequested = true
-			}
-		}
-	}
-
-	resp := HeartbeatResponse{
-		LeaseValid:      leaseValid,
-		CancelRequested: cancelRequested,
-		ServerShutdown:  h.shutting.Load(),
-		LeaseExpiresAt:  renewedUntil,
-	}
+	resp := HeartbeatResponse{Leases: results, ServerShutdown: h.shutting.Load()}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -365,7 +335,7 @@ func (h *Handlers) Lease(w http.ResponseWriter, r *http.Request) {
 		if h.workSignal != nil {
 			signal = h.workSignal()
 		}
-		run, err := h.store.LeaseRun(r.Context(), req.RunnerID, "")
+		lease, err := h.store.LeaseJob(r.Context(), req.RunnerID)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -373,18 +343,10 @@ func (h *Handlers) Lease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if run != nil {
+		if lease != nil {
 			resp := LeaseResponse{
-				RunID:             run.ID,
-				LeaseID:           *run.LeaseID,
-				Generation:        run.LeaseGeneration,
-				PipelineYAML:      run.PipelineYAML,
-				EffectiveParallel: *run.EffectiveParallel,
-				ExpiresAt:         *run.LeaseExpiresAt,
-				BlobSHA256:        run.SnapshotBlobSHA256, ArchiveSizeBytes: run.SnapshotArchiveSize, LogicalSizeBytes: run.SnapshotLogicalSize, EntryCount: run.SnapshotEntryCount, ArchiveFormat: run.SnapshotFormat,
-			}
-			if run.SourceSnapshotSHA256 != nil {
-				resp.SourceSnapshotSHA256 = *run.SourceSnapshotSHA256
+				RunID: lease.RunID, JobName: lease.JobName, LeaseID: lease.LeaseID, Generation: lease.Generation, Job: lease.Job, ExpiresAt: lease.ExpiresAt,
+				SourceSnapshotSHA256: lease.Snapshot.SourceDigest, BlobSHA256: lease.Snapshot.BlobDigest, ArchiveSizeBytes: lease.Snapshot.ArchiveSizeBytes, LogicalSizeBytes: lease.Snapshot.LogicalSizeBytes, EntryCount: lease.Snapshot.EntryCount, ArchiveFormat: lease.Snapshot.Format,
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -480,41 +442,28 @@ func (h *Handlers) CompleteRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !validUUID(req.RunnerID) || !validUUID(req.RunID) || !validUUID(req.LeaseID) || req.Generation < 1 {
+	if !validUUID(req.RunnerID) || !validUUID(req.RunID) || !validUUID(req.LeaseID) || req.Generation < 1 || req.JobName == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "missing required fields"})
 		return
 	}
 
-	run, err := h.store.GetRun(r.Context(), req.RunID)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "run not found"})
-		return
-	}
-
-	// Verify lease
-	if run.LeaseID == nil || *run.LeaseID != req.LeaseID || run.LeaseGeneration != req.Generation {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid lease"})
-		return
-	}
-
-	runStatus := store.RunStatus(req.Status)
-	if !validCompletionStatus(runStatus) {
+	jobStatus := store.JobStatus(req.Status)
+	if jobStatus != store.JobPassed && jobStatus != store.JobFailed && jobStatus != store.JobError && jobStatus != store.JobCanceled {
 		writeError(w, http.StatusBadRequest, "invalid run status")
 		return
 	}
 
-	err = h.store.CompleteRun(r.Context(), req.RunID, req.RunnerID, req.LeaseID, req.Generation, runStatus, req.Error)
+	err := h.store.CompleteJob(r.Context(), store.ArtifactOwnership{RunID: req.RunID, RunnerID: req.RunnerID, LeaseID: req.LeaseID, Generation: req.Generation, JobName: req.JobName}, jobStatus, req.Error)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "completion failed"})
 		return
+	}
+	if h.notify != nil {
+		h.notify()
 	}
 
 	resp := CompleteRunResponse{Accepted: true}
@@ -534,8 +483,6 @@ func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
 		h.ArtifactCommit(w, r)
 	} else if pathContains(path, "/artifacts/") {
 		h.ArtifactDownload(w, r)
-	} else if pathContains(path, "/events") {
-		h.JobEvent(w, r)
 	} else if pathContains(path, "/complete") {
 		h.CompleteRun(w, r)
 	} else {
@@ -693,12 +640,12 @@ func (h *Handlers) artifactOwner(w http.ResponseWriter, r *http.Request, leaseID
 }
 
 func validArtifactLease(run *store.Run, owner store.ArtifactOwnership, jobStatus store.JobStatus) bool {
-	if run.Status != store.RunRunning || run.RunnerID == nil || *run.RunnerID != owner.RunnerID || run.LeaseID == nil || *run.LeaseID != owner.LeaseID || run.LeaseGeneration != owner.Generation || run.LeaseExpiresAt == nil || !time.Now().UTC().Before(*run.LeaseExpiresAt) {
+	if run.Status != store.RunRunning {
 		return false
 	}
 	for _, job := range run.Jobs {
 		if job.Name == owner.JobName {
-			return job.Status == jobStatus
+			return job.Status == jobStatus && job.RunnerID != nil && *job.RunnerID == owner.RunnerID && job.LeaseID != nil && *job.LeaseID == owner.LeaseID && job.LeaseGeneration == owner.Generation && job.LeaseExpiresAt != nil && time.Now().UTC().Before(*job.LeaseExpiresAt)
 		}
 	}
 	return false
@@ -714,9 +661,9 @@ func (h *Handlers) Source(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid source request")
 		return
 	}
-	runnerID, runID := r.URL.Query().Get("runner_id"), r.URL.Query().Get("run_id")
+	runnerID, runID, jobName := r.URL.Query().Get("runner_id"), r.URL.Query().Get("run_id"), r.URL.Query().Get("job_name")
 	generation, err := strconv.Atoi(r.URL.Query().Get("generation"))
-	if !validUUID(runnerID) || !validUUID(runID) || err != nil || generation < 1 {
+	if !validUUID(runnerID) || !validUUID(runID) || jobName == "" || err != nil || generation < 1 {
 		writeError(w, http.StatusBadRequest, "invalid source ownership")
 		return
 	}
@@ -725,7 +672,8 @@ func (h *Handlers) Source(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "run not found")
 		return
 	}
-	if run.Status != store.RunRunning || run.RunnerID == nil || *run.RunnerID != runnerID || run.LeaseID == nil || *run.LeaseID != parts[3] || run.LeaseGeneration != generation || run.LeaseExpiresAt == nil || !time.Now().UTC().Before(*run.LeaseExpiresAt) || run.SourceSnapshotSHA256 == nil {
+	owner := store.ArtifactOwnership{RunID: runID, RunnerID: runnerID, LeaseID: parts[3], Generation: generation, JobName: jobName}
+	if !validArtifactLease(run, owner, store.JobRunning) || run.SourceSnapshotSHA256 == nil {
 		writeError(w, http.StatusConflict, "invalid or expired lease")
 		return
 	}

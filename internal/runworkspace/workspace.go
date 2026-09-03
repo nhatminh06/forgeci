@@ -11,8 +11,8 @@ import (
 const markerName = ".forgeci-workspace.json"
 
 type Marker struct {
-	RunID, LeaseID, SourceDigest string
-	Generation                   int
+	RunID, JobName, LeaseID, SourceDigest string
+	Generation                            int
 }
 
 func Create(root string, marker Marker) (string, error) {
@@ -26,7 +26,7 @@ func Create(root string, marker Marker) (string, error) {
 	if err := os.MkdirAll(abs, 0700); err != nil {
 		return "", err
 	}
-	dir := filepath.Join(abs, "runs", marker.RunID, marker.LeaseID)
+	dir := workspacePath(abs, marker)
 	if err := os.MkdirAll(filepath.Dir(dir), 0700); err != nil {
 		return "", err
 	}
@@ -41,12 +41,19 @@ func Create(root string, marker Marker) (string, error) {
 	return dir, nil
 }
 
+func workspacePath(root string, marker Marker) string {
+	if marker.JobName != "" {
+		return filepath.Join(root, "jobs", marker.RunID, marker.JobName, marker.LeaseID)
+	}
+	return filepath.Join(root, "runs", marker.RunID, marker.LeaseID)
+}
+
 func validComponent(value string) bool {
 	return value != "" && value != "." && value != ".." && !strings.ContainsAny(value, "/\\\x00\r\n")
 }
 
 func Remove(root, dir string, expected Marker) error {
-	if !validComponent(expected.RunID) || !validComponent(expected.LeaseID) {
+	if !validComponent(expected.RunID) || !validComponent(expected.LeaseID) || expected.JobName != "" && !validComponent(expected.JobName) {
 		return fmt.Errorf("invalid workspace identity")
 	}
 	absRoot, err := filepath.Abs(root)
@@ -61,10 +68,18 @@ func Remove(root, dir string, expected Marker) error {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("workspace is outside configured root")
 	}
-	if filepath.Clean(rel) != filepath.Join("runs", expected.RunID, expected.LeaseID) {
+	expectedRel := filepath.Join("runs", expected.RunID, expected.LeaseID)
+	if expected.JobName != "" {
+		expectedRel = filepath.Join("jobs", expected.RunID, expected.JobName, expected.LeaseID)
+	}
+	if filepath.Clean(rel) != expectedRel {
 		return fmt.Errorf("workspace path does not match identity")
 	}
-	for _, candidate := range []string{filepath.Join(absRoot, "runs"), filepath.Join(absRoot, "runs", expected.RunID), absDir} {
+	candidates := []string{filepath.Join(absRoot, "runs"), filepath.Join(absRoot, "runs", expected.RunID), absDir}
+	if expected.JobName != "" {
+		candidates = []string{filepath.Join(absRoot, "jobs"), filepath.Join(absRoot, "jobs", expected.RunID), filepath.Join(absRoot, "jobs", expected.RunID, expected.JobName), absDir}
+	}
+	for _, candidate := range candidates {
 		info, err := os.Lstat(candidate)
 		if err != nil {
 			return err
@@ -89,6 +104,59 @@ func Remove(root, dir string, expected Marker) error {
 }
 
 func CleanupStale(root string) error {
+	if err := cleanupTree(root, "jobs", true); err != nil {
+		return err
+	}
+	return cleanupTree(root, "runs", false)
+}
+
+func cleanupTree(root, kind string, jobs bool) error {
+	if jobs {
+		runs := filepath.Join(root, kind)
+		runDirs, err := os.ReadDir(runs)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for _, run := range runDirs {
+			if !run.IsDir() {
+				continue
+			}
+			jobDirs, err := os.ReadDir(filepath.Join(runs, run.Name()))
+			if err != nil {
+				return err
+			}
+			for _, job := range jobDirs {
+				if !job.IsDir() {
+					continue
+				}
+				leases, err := os.ReadDir(filepath.Join(runs, run.Name(), job.Name()))
+				if err != nil {
+					return err
+				}
+				for _, lease := range leases {
+					if !lease.IsDir() {
+						continue
+					}
+					dir := filepath.Join(runs, run.Name(), job.Name(), lease.Name())
+					b, err := os.ReadFile(filepath.Join(dir, markerName))
+					if err != nil {
+						continue
+					}
+					var marker Marker
+					if json.Unmarshal(b, &marker) != nil || marker.RunID != run.Name() || marker.JobName != job.Name() || marker.LeaseID != lease.Name() {
+						continue
+					}
+					if err := Remove(root, dir, marker); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
 	runs := filepath.Join(root, "runs")
 	runDirs, err := os.ReadDir(runs)
 	if os.IsNotExist(err) {
