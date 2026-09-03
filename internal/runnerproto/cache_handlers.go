@@ -16,15 +16,21 @@ import (
 )
 
 type cacheCommitRequest struct {
-	RunnerID                           string `json:"runner_id"`
-	RunID                              string `json:"run_id"`
-	JobName                            string `json:"job_name"`
-	LeaseID                            string `json:"lease_id"`
-	Generation                         int    `json:"generation"`
-	Key, Path, RootName, RootKind      string
-	ContentSHA256, BlobSHA256, Format  string
-	ArchiveSizeBytes, LogicalSizeBytes int64
-	EntryCount                         int
+	RunnerID         string `json:"runner_id"`
+	RunID            string `json:"run_id"`
+	JobName          string `json:"job_name"`
+	LeaseID          string `json:"lease_id"`
+	Generation       int    `json:"generation"`
+	Key              string `json:"key"`
+	Path             string `json:"path"`
+	RootName         string `json:"root_name"`
+	RootKind         string `json:"root_kind"`
+	ContentSHA256    string `json:"content_sha256"`
+	BlobSHA256       string `json:"blob_sha256"`
+	Format           string `json:"format"`
+	ArchiveSizeBytes int64  `json:"archive_size_bytes"`
+	LogicalSizeBytes int64  `json:"logical_size_bytes"`
+	EntryCount       int    `json:"entry_count"`
 }
 
 func (h *Handlers) cacheStoreBackend() (store.CacheStore, bool) {
@@ -171,7 +177,7 @@ func cacheDigest(v string) bool {
 
 func (h *Handlers) CacheCommit(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 7 || parts[0] != "v1" || parts[1] != "runner" || parts[2] != "leases" || parts[4] != "jobs" || parts[6] != "cache" || r.Method != http.MethodPost {
+	if len(parts) != 8 || parts[0] != "v1" || parts[1] != "runner" || parts[2] != "leases" || parts[4] != "jobs" || parts[6] != "cache" || parts[7] != "commit" || r.Method != http.MethodPost {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}

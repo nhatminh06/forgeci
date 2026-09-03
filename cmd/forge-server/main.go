@@ -236,6 +236,7 @@ func run() error {
 		handlers := runnerproto.NewHandlers(persistence, runnerToken, manager.WorkAvailable)
 		handlers.SetSnapshotOpener(snapshotStore.OpenBlob)
 		handlers.SetArtifactStore(artifactStore)
+		handlers.SetCacheStore(cacheStore)
 		handlers.SetNotifier(manager.Notify)
 
 		// Start lease expiration sweeper

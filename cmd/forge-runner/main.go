@@ -676,6 +676,7 @@ func (t remoteCacheTransport) request(ctx context.Context, method, endpoint stri
 		return nil, e
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.Header.Set("Content-Type", "application/octet-stream")
 	return t.rr.httpClient.Do(req)
 }
 func (t remoteCacheTransport) Lookup(ctx context.Context, key string) (cache.Metadata, error) {
@@ -698,6 +699,8 @@ func (t remoteCacheTransport) Lookup(ctx context.Context, key string) (cache.Met
 	m.Metadata.BlobSHA256 = resp.Header.Get("X-ForgeCI-Cache-Blob-SHA256")
 	m.Metadata.Format = resp.Header.Get("X-ForgeCI-Cache-Format")
 	m.Metadata.ArchiveSizeBytes = resp.ContentLength
+	m.Metadata.LogicalSizeBytes, _ = strconv.ParseInt(resp.Header.Get("X-ForgeCI-Cache-Logical-Size"), 10, 64)
+	m.Metadata.EntryCount, _ = strconv.Atoi(resp.Header.Get("X-ForgeCI-Cache-Entry-Count"))
 	return m, nil
 }
 func (t remoteCacheTransport) Download(ctx context.Context, m cache.Metadata, w io.Writer) error {
@@ -714,27 +717,48 @@ func (t remoteCacheTransport) Download(ctx context.Context, m cache.Metadata, w 
 	return e
 }
 func (t remoteCacheTransport) Upload(ctx context.Context, m cache.Metadata, r io.Reader) error {
-	ep := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/cache-blobs/%s?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(t.jobName), m.BlobSHA256, t.query(m.Key))
-	resp, e := t.request(ctx, http.MethodPut, ep, r)
+	q := url.Values{}
+	q.Set("key", m.Key)
+	q.Set("runner_id", t.rr.id)
+	q.Set("run_id", t.runID)
+	q.Set("job_name", t.jobName)
+	q.Set("generation", strconv.Itoa(t.generation))
+	ep := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/cache-blobs/%s?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(t.jobName), m.BlobSHA256, q.Encode())
+	req, e := http.NewRequestWithContext(ctx, http.MethodPut, ep, r)
+	if e != nil {
+		return e
+	}
+	req.ContentLength = m.ArchiveSizeBytes
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, e := t.rr.httpClient.Do(req)
 	if e != nil {
 		return e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("cache upload: %s", resp.Status)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("cache upload: %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
 func (t remoteCacheTransport) Commit(ctx context.Context, m cache.Metadata) error {
 	body, _ := json.Marshal(map[string]any{"runner_id": t.rr.id, "run_id": t.runID, "lease_id": t.leaseID, "generation": t.generation, "job_name": t.jobName, "key": m.Key, "path": "", "root_name": m.Metadata.RootName, "root_kind": m.Metadata.RootKind, "content_sha256": m.Metadata.ContentSHA256, "blob_sha256": m.Metadata.BlobSHA256, "format": m.Metadata.Format, "archive_size_bytes": m.Metadata.ArchiveSizeBytes, "logical_size_bytes": m.Metadata.LogicalSizeBytes, "entry_count": m.Metadata.EntryCount})
-	ep := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/cache/commit", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(t.jobName))
-	resp, e := t.request(ctx, http.MethodPost, ep, bytes.NewReader(body))
+	ep := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/cache/commit?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(t.jobName), t.query(""))
+	req, e := http.NewRequestWithContext(ctx, http.MethodPost, ep, bytes.NewReader(body))
+	if e != nil {
+		return e
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.Header.Set("Content-Type", "application/json")
+	resp, e := t.rr.httpClient.Do(req)
 	if e != nil {
 		return e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("cache commit: %s", resp.Status)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("cache commit: %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
@@ -756,6 +780,7 @@ func (t runnerArtifactTransport) Upload(ctx context.Context, job string, meta ar
 		return err
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = meta.ArchiveSizeBytes
 	resp, err := t.rr.httpClient.Do(req)
 	if err != nil {
@@ -784,6 +809,7 @@ func (t runnerArtifactTransport) Commit(ctx context.Context, job string, metas [
 		return err
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.rr.httpClient.Do(req)
 	if err != nil {
@@ -803,6 +829,7 @@ func (t runnerArtifactTransport) Download(ctx context.Context, producer, name, c
 		return artifact.Metadata{}, err
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := t.rr.httpClient.Do(req)
 	if err != nil {
 		return artifact.Metadata{}, fmt.Errorf("download artifact: %w", err)

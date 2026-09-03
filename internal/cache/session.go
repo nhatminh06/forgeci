@@ -118,7 +118,7 @@ func (s *Session) Restore(ctx context.Context, items []config.CacheEntry, output
 			fmt.Fprintf(output, "[cache] restore rejected for %s: %v\n", item.Key, err)
 			continue
 		}
-		final := filepath.Join(destination, meta.RootName)
+		final := destination
 		if _, err := os.Lstat(final); err == nil {
 			fmt.Fprintf(output, "[cache] BYPASS %s: destination exists\n", item.Key)
 			continue
@@ -148,7 +148,7 @@ func (s *Session) Restore(ctx context.Context, items []config.CacheEntry, output
 			} else {
 				err = Extract(archiveName, stage, meta, artifactLimits(meta))
 				if err == nil {
-					if err = os.MkdirAll(destination, 0700); err == nil {
+					if err = os.MkdirAll(filepath.Dir(destination), 0700); err == nil {
 						err = os.Rename(filepath.Join(stage, meta.RootName), final)
 					}
 				}
