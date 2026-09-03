@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -124,9 +125,11 @@ type Handlers struct {
 	longPollTTL time.Duration
 	workSignal  func() <-chan struct{}
 	openBlob    func(string) (*os.File, error)
+	artifacts   *artifact.Store
 }
 
 func (h *Handlers) SetSnapshotOpener(open func(string) (*os.File, error)) { h.openBlob = open }
+func (h *Handlers) SetArtifactStore(value *artifact.Store)                { h.artifacts = value }
 
 func NewHandlers(store RunnerStore, token string, signals ...func() <-chan struct{}) *Handlers {
 	h := &Handlers{
@@ -525,6 +528,12 @@ func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	if strings.HasSuffix(path, "/source") {
 		h.Source(w, r)
+	} else if pathContains(path, "/artifact-blobs/") {
+		h.ArtifactUpload(w, r)
+	} else if strings.HasSuffix(path, "/artifacts/commit") {
+		h.ArtifactCommit(w, r)
+	} else if pathContains(path, "/artifacts/") {
+		h.ArtifactDownload(w, r)
 	} else if pathContains(path, "/events") {
 		h.JobEvent(w, r)
 	} else if pathContains(path, "/complete") {
@@ -532,6 +541,167 @@ func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+type artifactCommitRequest struct {
+	RunnerID   string               `json:"runner_id"`
+	RunID      string               `json:"run_id"`
+	LeaseID    string               `json:"lease_id"`
+	Generation int                  `json:"generation"`
+	JobName    string               `json:"job_name"`
+	Artifacts  []artifactCommitItem `json:"artifacts"`
+}
+type artifactCommitItem struct {
+	Name             string `json:"name"`
+	RootName         string `json:"root_name"`
+	RootKind         string `json:"root_kind"`
+	ContentSHA256    string `json:"content_sha256"`
+	BlobSHA256       string `json:"blob_sha256"`
+	Format           string `json:"format"`
+	ArchiveSizeBytes int64  `json:"archive_size_bytes"`
+	LogicalSizeBytes int64  `json:"logical_size_bytes"`
+	EntryCount       int    `json:"entry_count"`
+}
+
+func (h *Handlers) ArtifactUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut || h.artifacts == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 8 || parts[4] != "jobs" || parts[6] != "artifact-blobs" || !validUUID(parts[3]) || parts[5] == "" || !artifact.ValidDigest(parts[7]) {
+		writeError(w, http.StatusBadRequest, "invalid artifact upload path")
+		return
+	}
+	owner, ok := h.artifactOwner(w, r, parts[3], parts[5])
+	if !ok {
+		return
+	}
+	size, err := strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
+	if err != nil || size < 0 {
+		writeError(w, http.StatusBadRequest, "artifact content length required")
+		return
+	}
+	run, err := h.store.GetRun(r.Context(), owner.RunID)
+	if err != nil || !validArtifactLease(run, owner, store.JobRunning) {
+		writeError(w, http.StatusConflict, "invalid or expired lease")
+		return
+	}
+	if _, err := h.artifacts.Put(r.Context().Done(), parts[7], size, r.Body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) ArtifactCommit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || h.artifacts == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 8 || parts[4] != "jobs" || parts[6] != "artifacts" || parts[7] != "commit" || !validUUID(parts[3]) {
+		writeError(w, http.StatusBadRequest, "invalid artifact commit path")
+		return
+	}
+	var req artifactCommitRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	if req.LeaseID != parts[3] || req.JobName != parts[5] || !validUUID(req.RunnerID) || !validUUID(req.RunID) || req.Generation < 1 {
+		writeError(w, http.StatusBadRequest, "invalid artifact ownership")
+		return
+	}
+	backend, ok := h.store.(store.ArtifactStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "artifact metadata unavailable")
+		return
+	}
+	owner := store.ArtifactOwnership{RunID: req.RunID, RunnerID: req.RunnerID, LeaseID: req.LeaseID, Generation: req.Generation, JobName: req.JobName}
+	run, err := h.store.GetRun(r.Context(), req.RunID)
+	if err != nil || !validArtifactLease(run, owner, store.JobRunning) {
+		writeError(w, http.StatusConflict, "invalid or expired lease")
+		return
+	}
+	items := make([]store.Artifact, len(req.Artifacts))
+	for i, wire := range req.Artifacts {
+		item := &items[i]
+		*item = store.Artifact{RunID: req.RunID, ProducerJob: req.JobName, Name: wire.Name, RootName: wire.RootName, RootKind: wire.RootKind, ContentSHA256: wire.ContentSHA256, BlobSHA256: wire.BlobSHA256, Format: wire.Format, ArchiveSizeBytes: wire.ArchiveSizeBytes, LogicalSizeBytes: wire.LogicalSizeBytes, EntryCount: wire.EntryCount, CreatedAt: time.Now().UTC()}
+		if !artifact.ValidDigest(item.ContentSHA256) || !artifact.ValidDigest(item.BlobSHA256) || item.Format != artifact.Format || !h.artifacts.HasBlob(item.BlobSHA256, item.ArchiveSizeBytes) {
+			writeError(w, http.StatusBadRequest, "invalid or missing artifact blob")
+			return
+		}
+	}
+	if err := backend.CommitArtifacts(r.Context(), owner, items); err != nil {
+		writeError(w, http.StatusConflict, "artifact commit rejected")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]bool{"accepted": true})
+}
+
+func (h *Handlers) ArtifactDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || h.artifacts == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 7 || parts[4] != "artifacts" || !validUUID(parts[3]) || parts[5] == "" || parts[6] == "" {
+		writeError(w, http.StatusBadRequest, "invalid artifact download path")
+		return
+	}
+	owner, ok := h.artifactOwner(w, r, parts[3], r.URL.Query().Get("consumer_job"))
+	if !ok {
+		return
+	}
+	backend, ok := h.store.(store.ArtifactStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "artifact metadata unavailable")
+		return
+	}
+	item, err := backend.GetArtifactForLease(r.Context(), owner, parts[5], parts[6])
+	if err != nil {
+		writeError(w, http.StatusConflict, "artifact unavailable")
+		return
+	}
+	f, err := h.artifacts.OpenBlob(item.BlobSHA256)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "artifact blob unavailable")
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/vnd.forgeci.artifact+gzip")
+	w.Header().Set("Content-Length", strconv.FormatInt(item.ArchiveSizeBytes, 10))
+	w.Header().Set("X-ForgeCI-Blob-SHA256", item.BlobSHA256)
+	w.Header().Set("X-ForgeCI-Content-SHA256", item.ContentSHA256)
+	w.Header().Set("X-ForgeCI-Root-Name", item.RootName)
+	w.Header().Set("X-ForgeCI-Root-Kind", item.RootKind)
+	w.Header().Set("X-ForgeCI-Entry-Count", strconv.Itoa(item.EntryCount))
+	w.Header().Set("X-ForgeCI-Logical-Size", strconv.FormatInt(item.LogicalSizeBytes, 10))
+	_, _ = io.CopyN(w, f, item.ArchiveSizeBytes)
+}
+
+func (h *Handlers) artifactOwner(w http.ResponseWriter, r *http.Request, leaseID, job string) (store.ArtifactOwnership, bool) {
+	generation, err := strconv.Atoi(r.URL.Query().Get("generation"))
+	owner := store.ArtifactOwnership{RunID: r.URL.Query().Get("run_id"), RunnerID: r.URL.Query().Get("runner_id"), LeaseID: leaseID, Generation: generation, JobName: job}
+	if err != nil || !validUUID(owner.RunID) || !validUUID(owner.RunnerID) || generation < 1 || job == "" {
+		writeError(w, http.StatusBadRequest, "invalid artifact ownership")
+		return owner, false
+	}
+	return owner, true
+}
+
+func validArtifactLease(run *store.Run, owner store.ArtifactOwnership, jobStatus store.JobStatus) bool {
+	if run.Status != store.RunRunning || run.RunnerID == nil || *run.RunnerID != owner.RunnerID || run.LeaseID == nil || *run.LeaseID != owner.LeaseID || run.LeaseGeneration != owner.Generation || run.LeaseExpiresAt == nil || !time.Now().UTC().Before(*run.LeaseExpiresAt) {
+		return false
+	}
+	for _, job := range run.Jobs {
+		if job.Name == owner.JobName {
+			return job.Status == jobStatus
+		}
+	}
+	return false
 }
 
 func (h *Handlers) Source(w http.ResponseWriter, r *http.Request) {

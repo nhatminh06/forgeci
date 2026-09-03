@@ -1,4 +1,4 @@
-# Milestone 6 architecture
+# Milestone 7 architecture
 
 ```text
 HTTP API
@@ -7,7 +7,7 @@ HTTP API
 run manager
     │
     ▼
-PostgreSQL store + filesystem snapshot CAS
+PostgreSQL store + filesystem snapshot CAS + filesystem artifact CAS
     │
     ▼
 single-run FIFO dispatcher
@@ -48,6 +48,8 @@ Direct `forge run` still enters the parser/compiler/scheduler path directly and 
 
 Each runner workspace is keyed by run and lease, uses restrictive permissions, and carries an ownership marker outside the extracted source directory. Cleanup verifies root containment, path shape, and marker identity before recursive deletion. Startup removes only stale marked workspaces and preserves unrelated directories.
 
+Successful producer steps are followed by deterministic artifact capture, blob upload, and one transactional metadata-set commit before `PASSED`. A consumer downloads only explicitly declared upstream artifacts through durable storage, verifies blob and logical identity, and atomically materializes them before steps. Snapshot and artifact stores remain semantically separate.
+
 ## Intentionally absent
 
-Milestone 6 has no artifact or cache services, Git/SCM checkout, cross-runner jobs, retries, persistent logs, Kubernetes, secrets, RBAC, or distributed control-plane coordination. Docker execution remains unsuitable as hostile-code isolation.
+Milestone 7 has no build cache, Git/SCM checkout, job-level cross-runner scheduling, retries, persistent logs, Kubernetes, secrets, RBAC, or distributed control-plane coordination. Docker execution remains unsuitable as hostile-code isolation.

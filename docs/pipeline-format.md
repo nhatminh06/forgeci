@@ -47,6 +47,8 @@ jobs:
 
 ## Execution behavior
 
+Jobs may declare named outputs with `artifacts.upload` (`name`, `path`) and inputs with `artifacts.download` (`from`, `name`, `into`). A producer must be a direct `needs` dependency and declare the requested name. Upload follows successful steps and precedes `PASSED`; verified restore precedes consumer steps. See [artifacts.md](artifacts.md).
+
 `forge run` defaults to one active job. `forge run --jobs N` permits at most `N` ready jobs to overlap. Ready jobs are admitted in deterministic graph order; their completion and live output order may vary. Steps within each job always run sequentially in declaration order through `/bin/sh -c`.
 
 Jobs without `image` execute locally from the invocation directory. Jobs with `image` execute in one container per job; all steps share its state and run in order through `/bin/sh -c` from `/workspace`. The invocation directory is bind-mounted read-write at `/workspace`. Standard output and standard error stream live and separately.
@@ -57,4 +59,4 @@ The process exits `0` for a successful pipeline, `1` for a pipeline with failed 
 
 ## Security model
 
-The pipeline and repository must be trusted. Docker jobs cannot configure privileged mode, host networking/PID/IPC, devices, added capabilities, or a Docker socket mount, but the repository is writable from the container and Docker daemon access is privileged. The image defines the container user and default networking remains enabled. ForgeCI does not add seccomp/AppArmor policy management, secret isolation, resource quotas, or hostile multi-tenant isolation. This is not safe isolation for arbitrary untrusted code.
+The pipeline and repository must be trusted. Docker jobs cannot configure privileged mode, host networking/PID/IPC, devices, added capabilities, or a Docker socket mount, but the repository is writable from the container and Docker daemon access is privileged. Containers use the runner host UID/GID so outputs remain publishable and cleanable; default networking remains enabled. ForgeCI does not add seccomp/AppArmor policy management, secret isolation, resource quotas, or hostile multi-tenant isolation. This is not safe isolation for arbitrary untrusted code.

@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -34,6 +35,11 @@ type JobStateObserver interface {
 	OnJobState(string, State, State)
 }
 
+type ArtifactLifecycle interface {
+	Restore(context.Context, string, []config.ArtifactDownload) error
+	Publish(context.Context, string, []config.ArtifactUpload) error
+}
+
 type Result struct {
 	States        map[string]State
 	Interrupted   bool
@@ -58,6 +64,7 @@ type Runner struct {
 	ErrorOutput io.Writer
 	MaxParallel int
 	Observer    JobStateObserver
+	Artifacts   ArtifactLifecycle
 }
 
 type completion struct {
@@ -190,9 +197,23 @@ func hasFailedDependency(graph *pipeline.Graph, states map[string]State, name st
 }
 
 func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output synchronizedOutput) (State, bool) {
+	if r.Artifacts != nil {
+		if err := r.Artifacts.Restore(ctx, node.Name, node.Job.Artifacts.Download); err != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintf(output.stdout, "x %s canceled\n\n", node.Name)
+				return Canceled, false
+			}
+			fmt.Fprintf(output.stdout, "x %s (restore artifacts: %v)\n\n", node.Name, err)
+			return Failed, !artifact.IsPipelineError(err)
+		}
+	}
 	if jobExecutor, ok := r.Executor.(JobExecutor); ok {
 		execution := jobExecutor.RunJob(ctx, node.Name, node.Job, output.stdout, output.stderr)
-		return finishJob(ctx, node.Name, execution, output.stdout)
+		state, internal := finishJobExecution(ctx, node.Name, execution, output.stdout)
+		if state != Passed {
+			return state, internal
+		}
+		return r.publish(ctx, node, output.stdout)
 	}
 	for _, step := range node.Job.Steps {
 		fmt.Fprintf(output.stdout, "$ %s\n", step.Run)
@@ -211,8 +232,29 @@ func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output sync
 		fmt.Fprintf(output.stdout, "x %s (%v)\n\n", node.Name, execution.Err)
 		return Failed, true
 	}
-	fmt.Fprintf(output.stdout, "✓ %s\n\n", node.Name)
+	return r.publish(ctx, node, output.stdout)
+}
+
+func (r Runner) publish(ctx context.Context, node *pipeline.Node, output io.Writer) (State, bool) {
+	if r.Artifacts != nil {
+		if err := r.Artifacts.Publish(ctx, node.Name, node.Job.Artifacts.Upload); err != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintf(output, "x %s canceled\n\n", node.Name)
+				return Canceled, false
+			}
+			fmt.Fprintf(output, "x %s (publish artifacts: %v)\n\n", node.Name, err)
+			return Failed, !artifact.IsPipelineError(err)
+		}
+	}
+	fmt.Fprintf(output, "✓ %s\n\n", node.Name)
 	return Passed, false
+}
+
+func finishJobExecution(ctx context.Context, name string, execution executor.Result, output io.Writer) (State, bool) {
+	if execution.Err == nil {
+		return Passed, false
+	}
+	return finishJob(ctx, name, execution, output)
 }
 
 func finishJob(ctx context.Context, name string, execution executor.Result, output io.Writer) (State, bool) {

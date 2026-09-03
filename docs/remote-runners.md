@@ -13,7 +13,7 @@ FORGECI_RUNNER_TOKEN=... ./build/forge-runner \
 
 `--workspace` remains a deprecated alias for `--workspace-root`. The workspace root is canonicalized, created with restrictive permissions, and must not contain or be contained by the runner state directory.
 
-Runner-side bounds default to 512 MiB compressed, 1 GiB extracted, and 100,000 entries. They can be reduced with `--snapshot-max-archive-bytes`, `--snapshot-max-logical-bytes`, and `--snapshot-max-entries`.
+Runner-side snapshot and artifact bounds default to 512 MiB compressed, 1 GiB extracted, and 100,000 entries. Artifact bounds use the corresponding `--artifact-max-*` flags.
 
 ## Download and verification
 
@@ -39,4 +39,4 @@ Local jobs run in `source/`; Docker jobs mount it read-write at `/workspace`. Pa
 
 Heartbeats renew only the exact current lease. Expired, replaced, wrong-runner, and stale ownership tuples cannot download source, report events, or complete a run. Runner loss remains conservative: the run becomes `ABORTED` and is not automatically reassigned.
 
-The shared bearer token is still not per-runner cryptographic identity. Pipelines and sources are trusted; workspaces are writable; Docker daemon access is privileged; and ForgeCI provides no hostile multi-tenant sandbox, secret isolation, artifact transfer, cache, job-level leases, retries, or cross-runner job scheduling.
+The shared bearer token is still not per-runner cryptographic identity. Artifact routes additionally require exact live-lease and same-run ownership. Pipelines and sources are trusted; workspaces are writable; Docker daemon access is privileged; and ForgeCI provides no hostile multi-tenant sandbox, secret isolation, build cache, job-level leases, retries, or cross-runner job scheduling.

@@ -40,6 +40,44 @@ func TestMainExitCodes(t *testing.T) {
 	}
 }
 
+func TestDirectArtifactsDurableRoundTrip(t *testing.T) {
+	workspace := t.TempDir()
+	pipeline := filepath.Join(workspace, "artifacts.yaml")
+	data := `version: 1
+jobs:
+  build:
+    steps:
+      - run: mkdir -p dist && printf value > dist/app
+    artifacts:
+      upload:
+        - name: app
+          path: dist/app
+  scrub:
+    needs: [build]
+    steps:
+      - run: rm -f dist/app
+  consume:
+    needs: [build, scrub]
+    artifacts:
+      download:
+        - from: build
+          name: app
+          into: restored
+    steps:
+      - run: test "$(cat restored/app)" = value
+`
+	if err := os.WriteFile(pipeline, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Main(context.Background(), []string{"run", "--file", pipeline, "--jobs", "2"}, workspace, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(workspace, "restored", "app")); err != nil || string(got) != "value" {
+		t.Fatalf("restored=%q err=%v", got, err)
+	}
+}
+
 func TestControlPlaneCommands(t *testing.T) {
 	original := newControlClient
 	t.Cleanup(func() { newControlClient = original })

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -44,6 +46,9 @@ type Config struct {
 	MaxSnapshotArchive int64
 	MaxSnapshotLogical int64
 	MaxSnapshotEntries int
+	MaxArtifactArchive int64
+	MaxArtifactLogical int64
+	MaxArtifactEntries int
 }
 
 type RemoteRunner struct {
@@ -80,6 +85,9 @@ func main() {
 	flag.Int64Var(&cfg.MaxSnapshotArchive, "snapshot-max-archive-bytes", 512<<20, "maximum downloaded snapshot bytes")
 	flag.Int64Var(&cfg.MaxSnapshotLogical, "snapshot-max-logical-bytes", 1<<30, "maximum extracted source bytes")
 	flag.IntVar(&cfg.MaxSnapshotEntries, "snapshot-max-entries", 100000, "maximum extracted source entries")
+	flag.Int64Var(&cfg.MaxArtifactArchive, "artifact-max-archive-bytes", 512<<20, "maximum transferred artifact bytes")
+	flag.Int64Var(&cfg.MaxArtifactLogical, "artifact-max-logical-bytes", 1<<30, "maximum extracted artifact bytes")
+	flag.IntVar(&cfg.MaxArtifactEntries, "artifact-max-entries", 100000, "maximum extracted artifact entries")
 	flag.Parse()
 
 	if cfg.ServerToken == "" {
@@ -97,6 +105,10 @@ func main() {
 	}
 	if cfg.MaxSnapshotArchive < 0 || cfg.MaxSnapshotLogical < 0 || cfg.MaxSnapshotEntries < 0 {
 		fmt.Fprintln(os.Stderr, "Error: snapshot limits must not be negative")
+		os.Exit(1)
+	}
+	if cfg.MaxArtifactArchive < 1 || cfg.MaxArtifactLogical < 1 || cfg.MaxArtifactEntries < 1 {
+		fmt.Fprintln(os.Stderr, "Error: artifact limits must be greater than zero")
 		os.Exit(1)
 	}
 
@@ -594,12 +606,18 @@ func (rr *RemoteRunner) processCurrentRun() {
 		return
 	}
 	jobObserver := remoteJobObserver{runner: rr, runID: runID, leaseID: leaseID, generation: generation}
+	artifactSession, err := artifact.NewRemoteSession(sourceDir, filepath.Join(workspace, "artifact-tmp"), runnerArtifactTransport{rr: rr, runID: runID, leaseID: leaseID, generation: generation}, rr.artifactLimits())
+	if err != nil {
+		rr.completeError(runID, leaseID, generation, err)
+		return
+	}
 	r := runnerpkg.Runner{
 		Executor:    executor.Job{Local: local, Docker: docker},
 		Output:      os.Stdout,
 		ErrorOutput: os.Stderr,
 		MaxParallel: parallel,
 		Observer:    jobObserver,
+		Artifacts:   artifactSession,
 	}
 	result := r.Run(executionCtx, graph)
 
@@ -615,6 +633,113 @@ func (rr *RemoteRunner) processCurrentRun() {
 	_ = rr.sendComplete(runID, leaseID, generation, status, nil)
 
 	rr.clearLease()
+}
+
+func (rr *RemoteRunner) artifactLimits() artifact.Limits {
+	limits := artifact.DefaultLimits()
+	limits.MaxArchiveBytes = rr.config.MaxArtifactArchive
+	limits.MaxLogicalBytes = rr.config.MaxArtifactLogical
+	limits.MaxFileBytes = rr.config.MaxArtifactLogical
+	limits.MaxEntries = rr.config.MaxArtifactEntries
+	return limits
+}
+
+type runnerArtifactTransport struct {
+	rr             *RemoteRunner
+	runID, leaseID string
+	generation     int
+}
+
+func (t runnerArtifactTransport) query(job string) string {
+	values := url.Values{}
+	values.Set("runner_id", t.rr.id)
+	values.Set("run_id", t.runID)
+	values.Set("generation", strconv.Itoa(t.generation))
+	if job != "" {
+		values.Set("consumer_job", job)
+	}
+	return values.Encode()
+}
+func (t runnerArtifactTransport) Upload(ctx context.Context, job string, meta artifact.Metadata, body io.Reader) error {
+	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/artifact-blobs/%s?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(job), meta.BlobSHA256, t.query(""))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.ContentLength = meta.ArchiveSizeBytes
+	resp, err := t.rr.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload artifact: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("upload artifact: %d: %s", resp.StatusCode, data)
+	}
+	return nil
+}
+func (t runnerArtifactTransport) Commit(ctx context.Context, job string, metas []artifact.Metadata) error {
+	items := make([]map[string]any, len(metas))
+	for i, m := range metas {
+		items[i] = map[string]any{"name": m.Name, "root_name": m.RootName, "root_kind": m.RootKind, "content_sha256": m.ContentSHA256, "blob_sha256": m.BlobSHA256, "format": m.Format, "archive_size_bytes": m.ArchiveSizeBytes, "logical_size_bytes": m.LogicalSizeBytes, "entry_count": m.EntryCount}
+	}
+	payload := map[string]any{"runner_id": t.rr.id, "run_id": t.runID, "lease_id": t.leaseID, "generation": t.generation, "job_name": job, "artifacts": items}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/artifacts/commit", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(job))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := t.rr.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("commit artifacts: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("commit artifacts: %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+func (t runnerArtifactTransport) Download(ctx context.Context, producer, name, consumer string, destination io.Writer) (artifact.Metadata, error) {
+	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/artifacts/%s/%s?%s", t.rr.config.ServerAddr, t.leaseID, url.PathEscape(producer), url.PathEscape(name), t.query(consumer))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return artifact.Metadata{}, err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", t.rr.config.ServerToken))
+	resp, err := t.rr.httpClient.Do(req)
+	if err != nil {
+		return artifact.Metadata{}, fmt.Errorf("download artifact: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return artifact.Metadata{}, fmt.Errorf("download artifact: %d: %s", resp.StatusCode, body)
+	}
+	archiveSize, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+	if err != nil {
+		return artifact.Metadata{}, fmt.Errorf("invalid artifact size")
+	}
+	logical, err := strconv.ParseInt(resp.Header.Get("X-ForgeCI-Logical-Size"), 10, 64)
+	if err != nil {
+		return artifact.Metadata{}, fmt.Errorf("invalid artifact logical size")
+	}
+	entries, err := strconv.Atoi(resp.Header.Get("X-ForgeCI-Entry-Count"))
+	if err != nil {
+		return artifact.Metadata{}, fmt.Errorf("invalid artifact entry count")
+	}
+	meta := artifact.Metadata{Name: name, RootName: resp.Header.Get("X-ForgeCI-Root-Name"), RootKind: resp.Header.Get("X-ForgeCI-Root-Kind"), ContentSHA256: resp.Header.Get("X-ForgeCI-Content-SHA256"), BlobSHA256: resp.Header.Get("X-ForgeCI-Blob-SHA256"), Format: artifact.Format, ArchiveSizeBytes: archiveSize, LogicalSizeBytes: logical, EntryCount: entries}
+	if err := artifact.CopyVerified(destination, resp.Body, archiveSize, meta.BlobSHA256, t.rr.artifactLimits().MaxArchiveBytes); err != nil {
+		return artifact.Metadata{}, err
+	}
+	return meta, nil
 }
 
 func (rr *RemoteRunner) cancelActive() {

@@ -105,6 +105,30 @@ type SourceSnapshot struct {
 	CreatedAt                          time.Time
 }
 
+type Artifact struct {
+	ID               string     `json:"-"`
+	RunID            string     `json:"-"`
+	ProducerJob      string     `json:"job"`
+	Name             string     `json:"name"`
+	RootName         string     `json:"root_name"`
+	RootKind         string     `json:"root_kind"`
+	ContentSHA256    string     `json:"content_sha256"`
+	BlobSHA256       string     `json:"blob_sha256"`
+	Format           string     `json:"format"`
+	ArchiveSizeBytes int64      `json:"archive_size_bytes"`
+	LogicalSizeBytes int64      `json:"logical_size_bytes"`
+	EntryCount       int        `json:"entry_count"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ExpiresAt        *time.Time `json:"expires_at"`
+	DeletedAt        *time.Time `json:"-"`
+	Available        bool       `json:"available"`
+}
+
+type ArtifactOwnership struct {
+	RunID, RunnerID, LeaseID, JobName string
+	Generation                        int
+}
+
 type Store interface {
 	Ping(context.Context) error
 	CreateRun(context.Context, CreateRun) (*Run, error)
@@ -128,6 +152,16 @@ type Store interface {
 	CompleteRun(context.Context, string, string, string, int, RunStatus, *string) error
 	ExpireLeases(context.Context, time.Time) error
 	Close()
+}
+
+type ArtifactStore interface {
+	CommitArtifacts(context.Context, ArtifactOwnership, []Artifact) error
+	GetArtifactForLease(context.Context, ArtifactOwnership, string, string) (*Artifact, error)
+	ListArtifacts(context.Context, string) ([]Artifact, error)
+	GetArtifact(context.Context, string, string, string) (*Artifact, error)
+	SetArtifactExpiry(context.Context, string, time.Time) error
+	ExpireArtifacts(context.Context, time.Time) ([]string, error)
+	LiveArtifactBlobs(context.Context) (map[string]struct{}, error)
 }
 
 func Terminal(status RunStatus) bool {

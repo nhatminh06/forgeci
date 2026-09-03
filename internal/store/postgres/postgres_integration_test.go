@@ -3,11 +3,13 @@ package postgres
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -34,11 +36,113 @@ func testSnapshot() *store.SourceSnapshot {
 
 func createRemoteRun(t *testing.T, s *Store, image *string) *store.Run {
 	t.Helper()
-	r, err := s.CreateRun(context.Background(), store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1"), PipelineSHA256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", Workspace: "/workspace", MaxParallel: 4, Jobs: []store.Job{{Name: "job", Image: image}}, Snapshot: testSnapshot()})
+	r, err := s.CreateRun(context.Background(), store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1\njobs:\n  job:\n    steps:\n      - run: true\n"), PipelineSHA256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", Workspace: "/workspace", MaxParallel: 4, Jobs: []store.Job{{Name: "job", Image: image}}, Snapshot: testSnapshot()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return r
+}
+
+func TestArtifactSetCommitPrecedesPassedAndExpires(t *testing.T) {
+	s := integrationStore(t)
+	s.SetArtifactRetention(time.Hour)
+	ctx := context.Background()
+	yaml := []byte("version: 1\njobs:\n  build:\n    steps:\n      - run: true\n    artifacts:\n      upload:\n        - name: app\n          path: dist/app\n")
+	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("c", 64), Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "build"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimNextQueuedRun(ctx)
+	if err != nil || claimed.ID != run.ID {
+		t.Fatal(err)
+	}
+	if err := s.UpdateJob(ctx, run.ID, "build", store.JobRunning, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateJob(ctx, run.ID, "build", store.JobPassed, nil); err == nil {
+		t.Fatal("job passed without committed artifacts")
+	}
+	item := store.Artifact{RunID: run.ID, ProducerJob: "build", Name: "app", RootName: "app", RootKind: "file", ContentSHA256: strings.Repeat("a", 64), BlobSHA256: strings.Repeat("b", 64), Format: artifact.Format, ArchiveSizeBytes: 10, LogicalSizeBytes: 5, EntryCount: 1, CreatedAt: time.Now().UTC()}
+	owner := store.ArtifactOwnership{RunID: run.ID, JobName: "build"}
+	if err := s.CommitArtifacts(ctx, owner, []store.Artifact{item}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitArtifacts(ctx, owner, []store.Artifact{item}); err != nil {
+		t.Fatalf("exact replay: %v", err)
+	}
+	conflict := item
+	conflict.BlobSHA256 = strings.Repeat("d", 64)
+	if err := s.CommitArtifacts(ctx, owner, []store.Artifact{conflict}); err == nil {
+		t.Fatal("conflicting replay accepted")
+	}
+	if err := s.UpdateJob(ctx, run.ID, "build", store.JobPassed, nil); err != nil {
+		t.Fatal(err)
+	}
+	active, err := s.ListArtifacts(ctx, run.ID)
+	if err != nil || active[0].ExpiresAt != nil {
+		t.Fatalf("active-run expiry=%+v err=%v", active, err)
+	}
+	if digests, err := s.ExpireArtifacts(ctx, time.Now().Add(365*24*time.Hour)); err != nil || len(digests) != 0 {
+		t.Fatalf("active run expired digests=%v err=%v", digests, err)
+	}
+	if err := s.FinishRun(ctx, run.ID, store.RunPassed, nil); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.ListArtifacts(ctx, run.ID)
+	if err != nil || len(items) != 1 || items[0].ExpiresAt == nil || !items[0].Available {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	digests, err := s.ExpireArtifacts(ctx, items[0].ExpiresAt.Add(time.Nanosecond))
+	if err != nil || len(digests) != 1 || digests[0] != item.BlobSHA256 {
+		t.Fatalf("digests=%v err=%v", digests, err)
+	}
+	expired, err := s.GetArtifact(ctx, run.ID, "build", "app")
+	if err != nil || expired.Available {
+		t.Fatalf("expired=%+v err=%v", expired, err)
+	}
+}
+
+func TestArtifactDownloadLookupIsRunAndLeaseScoped(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	yaml := []byte("version: 1\njobs:\n  build:\n    steps:\n      - run: true\n    artifacts:\n      upload:\n        - name: app\n          path: out/app\n  consume:\n    needs: [build]\n    artifacts:\n      download:\n        - from: build\n          name: app\n          into: input\n    steps:\n      - run: true\n")
+	run, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "forge.yaml", PipelineYAML: yaml, PipelineSHA256: strings.Repeat("c", 64), Workspace: "/workspace", MaxParallel: 1, Jobs: []store.Job{{Name: "build"}, {Name: "consume"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := createRunner(t, s, "artifact-owner", false)
+	lease, err := s.LeaseRun(ctx, worker.ID, "")
+	if err != nil || lease.ID != run.ID {
+		t.Fatal(err)
+	}
+	owner := store.ArtifactOwnership{RunID: run.ID, RunnerID: worker.ID, LeaseID: *lease.LeaseID, Generation: lease.LeaseGeneration, JobName: "build"}
+	if err := s.ReportJobEvent(ctx, run.ID, worker.ID, *lease.LeaseID, lease.LeaseGeneration, "build", store.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	item := store.Artifact{RunID: run.ID, ProducerJob: "build", Name: "app", RootName: "app", RootKind: "file", ContentSHA256: strings.Repeat("a", 64), BlobSHA256: strings.Repeat("b", 64), Format: artifact.Format, ArchiveSizeBytes: 10, LogicalSizeBytes: 5, EntryCount: 1, CreatedAt: time.Now().UTC()}
+	if err := s.CommitArtifacts(ctx, owner, []store.Artifact{item}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReportJobEvent(ctx, run.ID, worker.ID, *lease.LeaseID, lease.LeaseGeneration, "build", store.JobPassed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReportJobEvent(ctx, run.ID, worker.ID, *lease.LeaseID, lease.LeaseGeneration, "consume", store.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	owner.JobName = "consume"
+	if _, err := s.GetArtifactForLease(ctx, owner, "build", "app"); err != nil {
+		t.Fatalf("valid download: %v", err)
+	}
+	wrongRun := owner
+	wrongRun.RunID = uuid.NewString()
+	if _, err := s.GetArtifactForLease(ctx, wrongRun, "build", "app"); err == nil {
+		t.Fatal("cross-run artifact lookup accepted")
+	}
+	wrongRunner := owner
+	wrongRunner.RunnerID = uuid.NewString()
+	if _, err := s.GetArtifactForLease(ctx, wrongRunner, "build", "app"); err == nil {
+		t.Fatal("wrong-runner artifact lookup accepted")
+	}
 }
 
 func createRunner(t *testing.T, s *Store, name string, docker bool) *store.Runner {

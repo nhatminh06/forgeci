@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -66,6 +67,7 @@ func (d *Docker) RunJob(ctx context.Context, name string, job config.Job, stdout
 	created, err := d.client.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image:      image,
+			User:       fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 			Cmd:        []string{"/bin/sh", "-c", "while :; do sleep 3600; done"},
 			WorkingDir: workspace,
 			Labels: map[string]string{

@@ -5,19 +5,27 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"path"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	artifactpkg "github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool              *pgxpool.Pool
+	artifactRetention time.Duration
+}
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	config, err := pgxpool.ParseConfig(databaseURL)
@@ -29,7 +37,7 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	s := &Store{pool: pool}
+	s := &Store{pool: pool, artifactRetention: 168 * time.Hour}
 	if err := s.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
@@ -41,8 +49,9 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) Close()                         { s.pool.Close() }
-func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+func (s *Store) Close()                                   { s.pool.Close() }
+func (s *Store) Ping(ctx context.Context) error           { return s.pool.Ping(ctx) }
+func (s *Store) SetArtifactRetention(value time.Duration) { s.artifactRetention = value }
 
 func (s *Store) migrate(ctx context.Context) error {
 	tx, err := s.pool.Begin(ctx)
@@ -219,18 +228,73 @@ func (s *Store) ClaimNextQueuedRun(ctx context.Context) (*store.Run, error) {
 }
 
 func (s *Store) FinishRun(ctx context.Context, id string, status store.RunStatus, message *string) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE pipeline_runs SET status=$2,finished_at=now(),error_message=$3 WHERE id=$1 AND status='RUNNING'`, id, status, message)
-	if err == nil && tag.RowsAffected() != 1 {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE pipeline_runs SET status=$2,finished_at=now(),error_message=$3 WHERE id=$1 AND status='RUNNING'`, id, status, message)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
 		return store.ErrConflict
 	}
-	return err
+	if _, err = tx.Exec(ctx, `UPDATE artifacts SET expires_at=(SELECT finished_at+$2::interval FROM pipeline_runs WHERE id=$1) WHERE run_id=$1 AND expires_at IS NULL`, id, s.artifactRetention.String()); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 func (s *Store) UpdateJob(ctx context.Context, runID, name string, status store.JobStatus, message *string) error {
+	if status == store.JobPassed {
+		ok, err := s.artifactSetCommitted(ctx, runID, name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return store.ErrConflict
+		}
+	}
 	tag, err := s.pool.Exec(ctx, `UPDATE job_runs SET status=$3,started_at=CASE WHEN $3='RUNNING' THEN COALESCE(started_at,now()) ELSE started_at END,finished_at=CASE WHEN $3 IN ('PASSED','FAILED','BLOCKED','CANCELED','ABORTED') THEN now() ELSE finished_at END,error_message=$4 WHERE run_id=$1 AND job_name=$2`, runID, name, status, message)
 	if err == nil && tag.RowsAffected() != 1 {
 		return store.ErrNotFound
 	}
 	return err
+}
+func (s *Store) artifactSetCommitted(ctx context.Context, runID, name string) (bool, error) {
+	var data []byte
+	if err := s.pool.QueryRow(ctx, `SELECT pipeline_yaml FROM pipeline_runs WHERE id=$1`, runID).Scan(&data); errors.Is(err, pgx.ErrNoRows) {
+		return false, store.ErrNotFound
+	} else if err != nil {
+		return false, err
+	}
+	cfg, err := config.ParseBytes(data, "stored pipeline snapshot")
+	if err != nil {
+		return false, err
+	}
+	job, ok := cfg.Jobs[name]
+	if !ok {
+		return false, store.ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx, `SELECT name FROM artifacts WHERE run_id=$1 AND producer_job=$2 AND deleted_at IS NULL ORDER BY name`, runID, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var actual []string
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return false, err
+		}
+		actual = append(actual, value)
+	}
+	expected := make([]string, len(job.Artifacts.Upload))
+	for i, item := range job.Artifacts.Upload {
+		expected[i] = item.Name
+	}
+	sort.Strings(expected)
+	return slices.Equal(expected, actual), rows.Err()
 }
 func (s *Store) CancelQueued(ctx context.Context, id string) error {
 	tx, err := s.pool.Begin(ctx)
@@ -284,6 +348,9 @@ func (s *Store) RecoverInterrupted(ctx context.Context) error {
 	sort.Strings(ids)
 	for _, id := range ids {
 		if _, err = tx.Exec(ctx, `UPDATE job_runs SET status='ABORTED',finished_at=now(),error_message='control plane restarted before run completed' WHERE run_id=$1 AND status IN ('PENDING','RUNNING')`, id); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE artifacts SET expires_at=(SELECT finished_at+$2::interval FROM pipeline_runs WHERE id=$1) WHERE run_id=$1 AND expires_at IS NULL`, id, s.artifactRetention.String()); err != nil {
 			return err
 		}
 	}
@@ -475,6 +542,15 @@ func (s *Store) RenewLease(ctx context.Context, runID, runnerID, leaseID string,
 }
 
 func (s *Store) ReportJobEvent(ctx context.Context, runID, runnerID, leaseID string, generation int, jobName string, status store.JobStatus) error {
+	if status == store.JobPassed {
+		ok, err := s.artifactSetCommitted(ctx, runID, jobName)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return store.ErrConflict
+		}
+	}
 	tag, err := s.pool.Exec(ctx, `UPDATE job_runs j SET status=$6,
 		started_at=CASE WHEN $6='RUNNING' THEN COALESCE(j.started_at,now()) ELSE j.started_at END,
 		finished_at=CASE WHEN $6 IN ('PASSED','FAILED','BLOCKED','CANCELED') THEN COALESCE(j.finished_at,now()) ELSE j.finished_at END
@@ -519,6 +595,9 @@ func (s *Store) CompleteRun(ctx context.Context, runID, runnerID, leaseID string
 	if tag.RowsAffected() != 1 {
 		return store.ErrConflict
 	}
+	if _, err = tx.Exec(ctx, `UPDATE artifacts SET expires_at=(SELECT finished_at+$2::interval FROM pipeline_runs WHERE id=$1) WHERE run_id=$1 AND expires_at IS NULL`, runID, s.artifactRetention.String()); err != nil {
+		return err
+	}
 
 	// Clear runner's current run
 	_, err = tx.Exec(ctx, `UPDATE runners SET current_run_id=NULL WHERE id=$1`, runnerID)
@@ -527,6 +606,211 @@ func (s *Store) CompleteRun(ctx context.Context, runID, runnerID, leaseID string
 	}
 
 	return tx.Commit(ctx)
+}
+
+func (s *Store) CommitArtifacts(ctx context.Context, owner store.ArtifactOwnership, items []store.Artifact) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var pipelineYAML []byte
+	var jobStatus store.JobStatus
+	var valid bool
+	query := `SELECT p.pipeline_yaml,j.status,($2='' OR (p.runner_id::text=$2 AND p.lease_id::text=$3 AND p.lease_generation=$4 AND p.lease_expires_at>now())) FROM pipeline_runs p JOIN job_runs j ON j.run_id=p.id AND j.job_name=$5 WHERE p.id=$1 AND p.status='RUNNING' FOR UPDATE OF p,j`
+	if err = tx.QueryRow(ctx, query, owner.RunID, owner.RunnerID, owner.LeaseID, owner.Generation, owner.JobName).Scan(&pipelineYAML, &jobStatus, &valid); errors.Is(err, pgx.ErrNoRows) {
+		return store.ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if !valid || jobStatus != store.JobRunning {
+		return store.ErrConflict
+	}
+	cfg, err := config.ParseBytes(pipelineYAML, "stored pipeline snapshot")
+	if err != nil {
+		return err
+	}
+	job, ok := cfg.Jobs[owner.JobName]
+	if !ok {
+		return store.ErrNotFound
+	}
+	expected := make(map[string]string, len(job.Artifacts.Upload))
+	for _, u := range job.Artifacts.Upload {
+		expected[u.Name] = path.Base(u.Path)
+	}
+	if len(items) != len(expected) {
+		return store.ErrConflict
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		root, ok := expected[item.Name]
+		if !ok {
+			return store.ErrConflict
+		}
+		if _, ok := seen[item.Name]; ok {
+			return store.ErrConflict
+		}
+		seen[item.Name] = struct{}{}
+		if item.ProducerJob != owner.JobName || item.RunID != "" && item.RunID != owner.RunID || !artifactpkg.ValidDigest(item.ContentSHA256) || !artifactpkg.ValidDigest(item.BlobSHA256) || item.Format != artifactpkg.Format || item.RootName != root || (item.RootKind != "file" && item.RootKind != "directory") || item.ArchiveSizeBytes < 0 || item.LogicalSizeBytes < 0 || item.EntryCount < 1 {
+			return store.ErrConflict
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT producer_job,name,root_name,root_kind,artifact_content_sha256,blob_sha256,format,archive_size_bytes,logical_size_bytes,entry_count FROM artifacts WHERE run_id=$1 AND producer_job=$2 ORDER BY name`, owner.RunID, owner.JobName)
+	if err != nil {
+		return err
+	}
+	var existing []store.Artifact
+	for rows.Next() {
+		var a store.Artifact
+		if err := rows.Scan(&a.ProducerJob, &a.Name, &a.RootName, &a.RootKind, &a.ContentSHA256, &a.BlobSHA256, &a.Format, &a.ArchiveSizeBytes, &a.LogicalSizeBytes, &a.EntryCount); err != nil {
+			rows.Close()
+			return err
+		}
+		existing = append(existing, a)
+	}
+	rows.Close()
+	if len(existing) > 0 {
+		if !sameArtifactSet(existing, items) {
+			return store.ErrConflict
+		}
+		return tx.Commit(ctx)
+	}
+	for _, item := range items {
+		_, err = tx.Exec(ctx, `INSERT INTO artifacts(id,run_id,producer_job,name,root_name,root_kind,artifact_content_sha256,blob_sha256,format,archive_size_bytes,logical_size_bytes,entry_count,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, uuid.NewString(), owner.RunID, owner.JobName, item.Name, item.RootName, item.RootKind, item.ContentSHA256, item.BlobSHA256, item.Format, item.ArchiveSizeBytes, item.LogicalSizeBytes, item.EntryCount, item.CreatedAt)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+func sameArtifactSet(a, b []store.Artifact) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	byName := make(map[string]store.Artifact, len(b))
+	for _, x := range b {
+		byName[x.Name] = x
+	}
+	for _, x := range a {
+		y, ok := byName[x.Name]
+		if !ok || x.RootName != y.RootName || x.RootKind != y.RootKind || x.ContentSHA256 != y.ContentSHA256 || x.BlobSHA256 != y.BlobSHA256 || x.Format != y.Format || x.ArchiveSizeBytes != y.ArchiveSizeBytes || x.LogicalSizeBytes != y.LogicalSizeBytes || x.EntryCount != y.EntryCount {
+			return false
+		}
+	}
+	return true
+}
+
+const artifactColumns = `a.id::text,a.run_id::text,a.producer_job,a.name,a.root_name,a.root_kind,a.artifact_content_sha256,a.blob_sha256,a.format,a.archive_size_bytes,a.logical_size_bytes,a.entry_count,a.created_at,a.expires_at,a.deleted_at,(a.deleted_at IS NULL)`
+
+func scanArtifact(row pgx.Row) (*store.Artifact, error) {
+	var a store.Artifact
+	err := row.Scan(&a.ID, &a.RunID, &a.ProducerJob, &a.Name, &a.RootName, &a.RootKind, &a.ContentSHA256, &a.BlobSHA256, &a.Format, &a.ArchiveSizeBytes, &a.LogicalSizeBytes, &a.EntryCount, &a.CreatedAt, &a.ExpiresAt, &a.DeletedAt, &a.Available)
+	if err != nil {
+		return nil, err
+	}
+	a.CreatedAt = a.CreatedAt.UTC()
+	a.ExpiresAt = utcTime(a.ExpiresAt)
+	a.DeletedAt = utcTime(a.DeletedAt)
+	return &a, nil
+}
+func (s *Store) GetArtifactForLease(ctx context.Context, owner store.ArtifactOwnership, producer, name string) (*store.Artifact, error) {
+	a, err := scanArtifact(s.pool.QueryRow(ctx, `SELECT `+artifactColumns+` FROM artifacts a JOIN pipeline_runs p ON p.id=a.run_id JOIN job_runs j ON j.run_id=a.run_id AND j.job_name=a.producer_job WHERE a.run_id=$1 AND a.producer_job=$6 AND a.name=$7 AND a.deleted_at IS NULL AND p.status='RUNNING' AND p.runner_id::text=$2 AND p.lease_id::text=$3 AND p.lease_generation=$4 AND p.lease_expires_at>now() AND j.status='PASSED' AND EXISTS(SELECT 1 FROM job_runs c WHERE c.run_id=p.id AND c.job_name=$5 AND c.status='RUNNING')`, owner.RunID, owner.RunnerID, owner.LeaseID, owner.Generation, owner.JobName, producer, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	return a, err
+}
+func (s *Store) ListArtifacts(ctx context.Context, runID string) ([]store.Artifact, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+artifactColumns+` FROM artifacts a WHERE a.run_id=$1 ORDER BY a.producer_job,a.name`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []store.Artifact{}
+	for rows.Next() {
+		a, err := scanArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var exists bool
+	if len(result) == 0 {
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pipeline_runs WHERE id=$1)`, runID).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, store.ErrNotFound
+		}
+	}
+	return result, nil
+}
+func (s *Store) GetArtifact(ctx context.Context, runID, job, name string) (*store.Artifact, error) {
+	a, err := scanArtifact(s.pool.QueryRow(ctx, `SELECT `+artifactColumns+` FROM artifacts a WHERE a.run_id=$1 AND a.producer_job=$2 AND a.name=$3`, runID, job, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	return a, err
+}
+func (s *Store) SetArtifactExpiry(ctx context.Context, runID string, when time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE artifacts SET expires_at=$2 WHERE run_id=$1 AND expires_at IS NULL`, runID, when.UTC())
+	return err
+}
+func (s *Store) ExpireArtifacts(ctx context.Context, now time.Time) ([]string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `UPDATE artifacts SET deleted_at=$1 WHERE deleted_at IS NULL AND expires_at IS NOT NULL AND expires_at<=$1 RETURNING blob_sha256`, now.UTC())
+	if err != nil {
+		return nil, err
+	}
+	candidates := map[string]struct{}{}
+	for rows.Next() {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		candidates[strings.TrimSpace(digest)] = struct{}{}
+	}
+	rows.Close()
+	var removable []string
+	for digest := range candidates {
+		var live bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM artifacts WHERE blob_sha256=$1 AND deleted_at IS NULL)`, digest).Scan(&live); err != nil {
+			return nil, err
+		}
+		if !live {
+			removable = append(removable, digest)
+		}
+	}
+	sort.Strings(removable)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return removable, nil
+}
+
+func (s *Store) LiveArtifactBlobs(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT blob_sha256 FROM artifacts WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]struct{}{}
+	for rows.Next() {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			return nil, err
+		}
+		result[strings.TrimSpace(digest)] = struct{}{}
+	}
+	return result, rows.Err()
 }
 
 func (s *Store) ExpireLeases(ctx context.Context, now time.Time) error {
@@ -568,6 +852,9 @@ func (s *Store) ExpireLeases(ctx context.Context, now time.Time) error {
 			SET status='ABORTED', finished_at=now(), error_message='runner lease expired'
 			WHERE run_id=$1 AND status IN ('PENDING', 'RUNNING')`, runID)
 		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE artifacts SET expires_at=(SELECT finished_at+$2::interval FROM pipeline_runs WHERE id=$1) WHERE run_id=$1 AND expires_at IS NULL`, runID, s.artifactRetention.String()); err != nil {
 			return err
 		}
 	}

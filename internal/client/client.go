@@ -3,8 +3,11 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -84,4 +87,40 @@ func (c *Client) Inspect(ctx context.Context, id string) (*store.Run, error) {
 }
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodPost, "/v1/runs/"+id+"/cancel", nil, nil)
+}
+func (c *Client) Artifacts(ctx context.Context, id string) ([]store.Artifact, error) {
+	var out []store.Artifact
+	err := c.do(ctx, http.MethodGet, "/v1/runs/"+id+"/artifacts", nil, &out)
+	return out, err
+}
+func (c *Client) DownloadArtifact(ctx context.Context, id, job, name string, destination io.Writer) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/runs/"+id+"/artifacts/"+job+"/"+name, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("control-plane request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		if e.Error == "" {
+			e.Error = resp.Status
+		}
+		return "", fmt.Errorf("server: %s", e.Error)
+	}
+	digest := resp.Header.Get("X-ForgeCI-Blob-SHA256")
+	h := sha256.New()
+	_, err = io.Copy(io.MultiWriter(destination, h), resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if hex.EncodeToString(h.Sum(nil)) != digest {
+		return "", fmt.Errorf("artifact blob digest mismatch")
+	}
+	return digest, nil
 }

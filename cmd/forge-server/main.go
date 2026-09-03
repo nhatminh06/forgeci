@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nhatminh06/forgeci/internal/api"
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
 	"github.com/nhatminh06/forgeci/internal/runnerproto"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
@@ -37,6 +38,13 @@ func run() error {
 	listen := flags.String("listen", "127.0.0.1:8080", "loopback listen address")
 	workspace := flags.String("workspace", cwd, "repository workspace")
 	snapshotDir := flags.String("snapshot-dir", "", "source snapshot store directory (required, outside workspace)")
+	artifactDir := flags.String("artifact-dir", "", "durable artifact store directory (required, outside workspace)")
+	artifactRetention := flags.Duration("artifact-retention", 168*time.Hour, "artifact retention after a run becomes terminal")
+	artifactGCInterval := flags.Duration("artifact-gc-interval", time.Minute, "artifact garbage collection interval")
+	artifactOrphanGrace := flags.Duration("artifact-orphan-grace", time.Hour, "minimum age before removing orphan artifact blobs")
+	maxArtifactEntries := flags.Int("artifact-max-entries", 100000, "maximum artifact entries")
+	maxArtifactLogical := flags.Int64("artifact-max-logical-bytes", 1<<30, "maximum logical artifact bytes")
+	maxArtifactArchive := flags.Int64("artifact-max-archive-bytes", 512<<20, "maximum compressed artifact bytes")
 	maxSnapshotEntries := flags.Int("snapshot-max-entries", 100000, "maximum source snapshot entries")
 	maxSnapshotLogical := flags.Int64("snapshot-max-logical-bytes", 1<<30, "maximum logical source bytes")
 	maxSnapshotArchive := flags.Int64("snapshot-max-archive-bytes", 512<<20, "maximum compressed snapshot bytes")
@@ -61,6 +69,12 @@ func run() error {
 	}
 	if *snapshotDir == "" {
 		return fmt.Errorf("snapshot directory is required")
+	}
+	if *artifactDir == "" {
+		return fmt.Errorf("artifact directory is required")
+	}
+	if *artifactRetention <= 0 || *artifactGCInterval <= 0 || *artifactOrphanGrace <= 0 {
+		return fmt.Errorf("artifact retention and GC durations must be greater than zero")
 	}
 
 	// Validate execution mode
@@ -106,6 +120,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	artifactLimits := artifact.DefaultLimits()
+	artifactLimits.MaxEntries = *maxArtifactEntries
+	artifactLimits.MaxLogicalBytes = *maxArtifactLogical
+	artifactLimits.MaxFileBytes = *maxArtifactLogical
+	artifactLimits.MaxArchiveBytes = *maxArtifactArchive
+	artifactStore, err := artifact.Open(*artifactDir, artifactLimits)
+	if err != nil {
+		return err
+	}
+	workspaceRoot, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return err
+	}
+	if pathsOverlap(workspaceRoot, artifactStore.Root()) || pathsOverlap(snapshotStore.Root(), artifactStore.Root()) {
+		return fmt.Errorf("artifact directory must be separate from workspace and snapshot directory")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	persistence, err := postgres.Open(ctx, *databaseURL)
@@ -113,10 +143,12 @@ func run() error {
 		return err
 	}
 	defer persistence.Close()
+	persistence.SetArtifactRetention(*artifactRetention)
 	manager, err := controlplane.New(ctx, persistence, absolute, os.Stdout, snapshotStore)
 	if err != nil {
 		return err
 	}
+	manager.SetArtifactStore(artifactStore)
 
 	// Only start manager in local execution mode
 	if *executionMode == "local" {
@@ -126,15 +158,42 @@ func run() error {
 	}
 	defer manager.Close()
 
-	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager, Store: persistence}).Handler(), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager, Store: persistence, OpenArtifact: artifactStore.OpenBlob}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.ListenAndServe() }()
+	go func() {
+		ticker := time.NewTicker(*artifactGCInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case now := <-ticker.C:
+				digests, err := persistence.ExpireArtifacts(ctx, now.UTC())
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "artifact GC metadata error: %v\n", err)
+					continue
+				}
+				for _, digest := range digests {
+					if err := artifactStore.RemoveBlob(digest); err != nil {
+						fmt.Fprintf(os.Stderr, "artifact GC blob error: %v\n", err)
+					}
+				}
+				live, err := persistence.LiveArtifactBlobs(ctx)
+				if err == nil {
+					_ = artifactStore.CleanupOrphans(now.UTC(), *artifactOrphanGrace, live)
+				}
+				_ = artifactStore.CleanupTemps(now.UTC(), *artifactOrphanGrace)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Setup runner protocol server in remote mode
 	var runnerServer *http.Server
 	if *executionMode == "remote" {
 		handlers := runnerproto.NewHandlers(persistence, runnerToken, manager.WorkAvailable)
 		handlers.SetSnapshotOpener(snapshotStore.OpenBlob)
+		handlers.SetArtifactStore(artifactStore)
 
 		// Start lease expiration sweeper
 		go func() {
@@ -199,6 +258,15 @@ func run() error {
 		}
 	}
 	return nil
+}
+
+func pathsOverlap(a, b string) bool {
+	rel, err := filepath.Rel(a, b)
+	if err == nil && (rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		return true
+	}
+	rel, err = filepath.Rel(b, a)
+	return err == nil && (rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func validateLoopback(address string) error {

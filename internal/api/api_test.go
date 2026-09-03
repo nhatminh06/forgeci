@@ -22,14 +22,34 @@ type fakeManager struct {
 }
 
 type fakeStore struct {
-	runners []store.Runner
-	pingErr error
+	runners   []store.Runner
+	pingErr   error
+	artifacts []store.Artifact
+	artifact  *store.Artifact
 }
 
 func (s *fakeStore) Ping(ctx context.Context) error { return s.pingErr }
 func (s *fakeStore) ListRunners(context.Context) ([]store.Runner, error) {
 	return s.runners, nil
 }
+func (s *fakeStore) CommitArtifacts(context.Context, store.ArtifactOwnership, []store.Artifact) error {
+	return nil
+}
+func (s *fakeStore) GetArtifactForLease(context.Context, store.ArtifactOwnership, string, string) (*store.Artifact, error) {
+	return s.artifact, nil
+}
+func (s *fakeStore) ListArtifacts(context.Context, string) ([]store.Artifact, error) {
+	return s.artifacts, nil
+}
+func (s *fakeStore) GetArtifact(context.Context, string, string, string) (*store.Artifact, error) {
+	if s.artifact == nil {
+		return nil, store.ErrNotFound
+	}
+	return s.artifact, nil
+}
+func (s *fakeStore) SetArtifactExpiry(context.Context, string, time.Time) error     { return nil }
+func (s *fakeStore) ExpireArtifacts(context.Context, time.Time) ([]string, error)   { return nil, nil }
+func (s *fakeStore) LiveArtifactBlobs(context.Context) (map[string]struct{}, error) { return nil, nil }
 
 func (m *fakeManager) Ping(context.Context) error { return m.pingErr }
 func (m *fakeManager) Submit(_ context.Context, file string, jobs int) (*store.Run, error) {
@@ -39,6 +59,20 @@ func (m *fakeManager) Submit(_ context.Context, file string, jobs int) (*store.R
 		return nil, m.submitErr
 	}
 	return &store.Run{ID: "00000000-0000-4000-8000-000000000001", Status: store.RunQueued}, nil
+}
+
+func TestArtifactListAndExpiredDownload(t *testing.T) {
+	item := store.Artifact{ProducerJob: "build", Name: "app", Available: false}
+	persistence := &fakeStore{artifacts: []store.Artifact{item}, artifact: &item}
+	handler := (Server{Manager: &fakeManager{}, Store: persistence}).Handler()
+	listed := request(t, handler, http.MethodGet, "/v1/runs/00000000-0000-4000-8000-000000000001/artifacts", "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"name":"app"`) {
+		t.Fatalf("list code=%d body=%s", listed.Code, listed.Body.String())
+	}
+	expired := request(t, handler, http.MethodGet, "/v1/runs/00000000-0000-4000-8000-000000000001/artifacts/build/app", "")
+	if expired.Code != http.StatusGone || expired.Body.String() != "{\"error\":\"artifact expired\"}\n" {
+		t.Fatalf("expired code=%d body=%s", expired.Code, expired.Body.String())
+	}
 }
 func (*fakeManager) List(context.Context, int) ([]store.Run, error) {
 	return []store.Run{{ID: "id", Status: store.RunPassed, CreatedAt: time.Unix(1, 0)}}, nil

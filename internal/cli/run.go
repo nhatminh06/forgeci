@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	controlclient "github.com/nhatminh06/forgeci/internal/client"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
@@ -23,6 +26,8 @@ Usage:
   forge submit [--server <url>] [--file <path>] [--jobs <N>]
   forge runs [--server <url>] [--limit <N>]
   forge runners [--server <url>]
+  forge artifacts <run-id> [--server <url>]
+  forge artifact download <run-id> <job> <name> --output <path> [--server <url>]
   forge inspect <run-id> [--server <url>]
   forge cancel <run-id> [--server <url>]
   forge --help
@@ -57,10 +62,91 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		return inspect(ctx, args[1:], stdout, stderr)
 	case "cancel":
 		return cancelRun(ctx, args[1:], stdout, stderr)
+	case "artifacts":
+		return artifacts(ctx, args[1:], stdout, stderr)
+	case "artifact":
+		return artifactCommand(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], helpText)
 		return 2
 	}
+}
+
+func artifacts(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	server, positionals, err := parseLooseFlags(args, map[string]string{"--server": defaultServer})
+	if err != nil || len(positionals) != 1 {
+		fmt.Fprintln(stderr, "usage: forge artifacts <run-id> [--server <url>]")
+		return 2
+	}
+	items, err := newControlClient(server["--server"]).Artifacts(ctx, positionals[0])
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	fmt.Fprintln(stdout, "JOB\tNAME\tSIZE\tSTATUS\tEXPIRES")
+	for _, item := range items {
+		status := "available"
+		if !item.Available {
+			status = "expired"
+		}
+		expires := "-"
+		if item.ExpiresAt != nil {
+			expires = item.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		fmt.Fprintf(stdout, "%s\t%s\t%d\t%s\t%s\n", item.ProducerJob, item.Name, item.ArchiveSizeBytes, status, expires)
+	}
+	return 0
+}
+func artifactCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] != "download" {
+		fmt.Fprintln(stderr, "usage: forge artifact download <run-id> <job> <name> --output <path> [--server <url>]")
+		return 2
+	}
+	values, positionals, err := parseLooseFlags(args[1:], map[string]string{"--server": defaultServer, "--output": ""})
+	if err != nil || len(positionals) != 3 || values["--output"] == "" {
+		fmt.Fprintln(stderr, "usage: forge artifact download <run-id> <job> <name> --output <path> [--server <url>]")
+		return 2
+	}
+	f, err := os.OpenFile(values["--output"], os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	digest, downloadErr := newControlClient(values["--server"]).DownloadArtifact(ctx, positionals[0], positionals[1], positionals[2], f)
+	closeErr := f.Close()
+	if downloadErr != nil || closeErr != nil {
+		_ = os.Remove(values["--output"])
+		if downloadErr != nil {
+			fmt.Fprintln(stderr, downloadErr)
+		} else {
+			fmt.Fprintln(stderr, closeErr)
+		}
+		return 2
+	}
+	fmt.Fprintf(stdout, "Downloaded %s/%s (%s) to %s\n", positionals[1], positionals[2], digest, values["--output"])
+	return 0
+}
+func parseLooseFlags(args []string, defaults map[string]string) (map[string]string, []string, error) {
+	values := make(map[string]string, len(defaults))
+	for k, v := range defaults {
+		values[k] = v
+	}
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		if _, ok := values[args[i]]; ok {
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("missing value for %s", args[i])
+			}
+			values[args[i]] = args[i+1]
+			i++
+			continue
+		}
+		if strings.HasPrefix(args[i], "-") {
+			return nil, nil, fmt.Errorf("unknown flag %s", args[i])
+		}
+		positional = append(positional, args[i])
+	}
+	return values, positional, nil
 }
 
 const defaultServer = "http://127.0.0.1:8080"
@@ -254,7 +340,23 @@ func run(ctx context.Context, args []string, directory string, stdout, stderr io
 		}
 	}
 	jobExecutor := executor.Job{Local: local, Docker: docker}
-	result := (runner.Runner{Executor: jobExecutor, Output: stdout, ErrorOutput: stderr, MaxParallel: *jobs}).Run(ctx, graph)
+	artifactRoot, err := os.MkdirTemp("", "forgeci-direct-artifacts-*")
+	if err != nil {
+		fmt.Fprintf(stderr, "create temporary artifact store: %v\n", err)
+		return 2
+	}
+	defer os.RemoveAll(artifactRoot)
+	artifactStore, err := artifact.Open(filepath.Join(artifactRoot, "store"), artifact.DefaultLimits())
+	if err != nil {
+		fmt.Fprintf(stderr, "open temporary artifact store: %v\n", err)
+		return 2
+	}
+	artifactSession, err := artifact.NewSession(directory, filepath.Join(artifactRoot, "work"), artifactStore, artifact.DefaultLimits())
+	if err != nil {
+		fmt.Fprintf(stderr, "create artifact session: %v\n", err)
+		return 2
+	}
+	result := (runner.Runner{Executor: jobExecutor, Output: stdout, ErrorOutput: stderr, MaxParallel: *jobs, Artifacts: artifactSession}).Run(ctx, graph)
 	runner.PrintSummary(stdout, graph, result)
 	if result.Interrupted {
 		fmt.Fprintln(stderr, "pipeline interrupted")
