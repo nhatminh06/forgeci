@@ -1,9 +1,14 @@
 package cache
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nhatminh06/forgeci/internal/artifact"
 )
@@ -41,6 +46,56 @@ func TestDeterministicFileRoundTrip(t *testing.T) {
 	info, err := os.Stat(filepath.Join(destination, "cache", "tool.bin"))
 	if err != nil || info.Mode().Perm() != 0750 {
 		t.Fatalf("restored mode=%v err=%v", info.Mode(), err)
+	}
+}
+
+func TestStoreOrphanAndTempGrace(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("orphan")
+	sum := sha256.Sum256(payload)
+	digest := hex.EncodeToString(sum[:])
+	if _, err = s.Put(context.Background().Done(), digest, int64(len(payload)), bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	live := map[string]struct{}{}
+	if err = s.CleanupOrphans(now, time.Hour, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.OpenBlob(digest); err != nil {
+		t.Fatal("fresh orphan removed", err)
+	}
+	if err = os.Chtimes(filepath.Join(root, "blobs", "sha256", digest[:2], digest[2:]), now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CleanupOrphans(now, time.Hour, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.OpenBlob(digest); !os.IsNotExist(err) {
+		t.Fatalf("old orphan remains: %v", err)
+	}
+	tmp := filepath.Join(root, "tmp", "stale")
+	if err = os.WriteFile(tmp, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CleanupTemps(now, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(tmp); err != nil {
+		t.Fatal("fresh temp removed", err)
+	}
+	if err = os.Chtimes(tmp, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CleanupTemps(now, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("old temp remains: %v", err)
 	}
 }
 

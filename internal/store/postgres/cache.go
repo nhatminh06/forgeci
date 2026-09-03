@@ -52,9 +52,17 @@ func (s *Store) CommitCache(ctx context.Context, m store.CacheMetadata) error {
 		v := time.Now().UTC().Add(s.cacheRetention)
 		expires = &v
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO cache_entries(workspace,cache_key,root_name,root_kind,content_sha256,blob_sha256,format,archive_size_bytes,logical_size_bytes,entry_count,created_at,last_accessed_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE($11,now()),COALESCE($11,now()),$12)`, m.Workspace, m.Key, m.RootName, m.RootKind, m.ContentSHA256, m.BlobSHA256, m.Format, m.ArchiveSizeBytes, m.LogicalSizeBytes, m.EntryCount, m.CreatedAt, expires)
+	_, err = tx.Exec(ctx, `INSERT INTO cache_entries(workspace,cache_key,root_name,root_kind,content_sha256,blob_sha256,format,archive_size_bytes,logical_size_bytes,entry_count,created_at,last_accessed_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE($11,now()),COALESCE($11,now()),$12) ON CONFLICT (workspace,cache_key) WHERE deleted_at IS NULL DO NOTHING`, m.Workspace, m.Key, m.RootName, m.RootKind, m.ContentSHA256, m.BlobSHA256, m.Format, m.ArchiveSizeBytes, m.LogicalSizeBytes, m.EntryCount, m.CreatedAt, expires)
 	if err != nil {
 		return err
+	}
+	var existingAfterInsert store.CacheMetadata
+	err = tx.QueryRow(ctx, `SELECT workspace,cache_key,root_name,root_kind,content_sha256,blob_sha256,format,archive_size_bytes,logical_size_bytes,entry_count,created_at,last_accessed_at,expires_at,deleted_at FROM cache_entries WHERE workspace=$1 AND cache_key=$2 AND deleted_at IS NULL`, m.Workspace, m.Key).Scan(&existingAfterInsert.Workspace, &existingAfterInsert.Key, &existingAfterInsert.RootName, &existingAfterInsert.RootKind, &existingAfterInsert.ContentSHA256, &existingAfterInsert.BlobSHA256, &existingAfterInsert.Format, &existingAfterInsert.ArchiveSizeBytes, &existingAfterInsert.LogicalSizeBytes, &existingAfterInsert.EntryCount, &existingAfterInsert.CreatedAt, &existingAfterInsert.LastAccessedAt, &existingAfterInsert.ExpiresAt, &existingAfterInsert.DeletedAt)
+	if err != nil {
+		return err
+	}
+	if !sameCacheMetadata(existingAfterInsert, m) {
+		return store.ErrConflict
 	}
 	return tx.Commit(ctx)
 }
@@ -125,6 +133,7 @@ func (s *Store) ExpireCache(ctx context.Context, now time.Time, maxBytes int64) 
 				return nil, err
 			}
 			seen := map[string]struct{}{}
+			var evict []string
 			for rows.Next() && total > maxBytes {
 				var id, digest string
 				var size int64
@@ -136,13 +145,19 @@ func (s *Store) ExpireCache(ctx context.Context, now time.Time, maxBytes int64) 
 					continue
 				}
 				seen[digest] = struct{}{}
-				if _, err = tx.Exec(ctx, `UPDATE cache_entries SET deleted_at=$2 WHERE blob_sha256=$1 AND deleted_at IS NULL`, digest, now.UTC()); err != nil {
-					rows.Close()
-					return nil, err
-				}
+				evict = append(evict, digest)
 				total -= size
 			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return nil, err
+			}
 			rows.Close()
+			for _, digest := range evict {
+				if _, err = tx.Exec(ctx, `UPDATE cache_entries SET deleted_at=$2 WHERE blob_sha256=$1 AND deleted_at IS NULL`, digest, now.UTC()); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 	if err = tx.Commit(ctx); err != nil {
