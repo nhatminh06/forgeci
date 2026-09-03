@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -28,6 +29,7 @@ type Manager struct {
 	store         store.Store
 	workspace     string
 	snapshots     *snapshot.Store
+	artifacts     *artifact.Store
 	workspaceRoot string
 	output        io.Writer
 	wake          chan struct{}
@@ -40,6 +42,8 @@ type Manager struct {
 	activeID      string
 	activeCancel  context.CancelFunc
 }
+
+func (m *Manager) SetArtifactStore(value *artifact.Store) { m.artifacts = value }
 
 type InputError struct{ Err error }
 
@@ -322,7 +326,32 @@ func (m *Manager) execute(runRecord *store.Run) {
 	}
 	obs := &observer{runID: runRecord.ID, store: m.store, cancel: cancel}
 	exec := executor.Job{Local: local, Docker: docker}
-	result := (runner.Runner{Executor: exec, Output: m.output, ErrorOutput: m.output, MaxParallel: runRecord.MaxParallel, Observer: obs}).Run(ctx, graph)
+	var artifactSession *artifact.Session
+	if m.artifacts != nil {
+		artifactTemp := filepath.Join(m.artifacts.Root(), "tmp")
+		artifactSession, err = artifact.NewSession(executionWorkspace, artifactTemp, m.artifacts, m.artifacts.Limits())
+		if err != nil {
+			message := err.Error()
+			m.finish(runRecord.ID, store.RunError, &message)
+			return
+		}
+		if persistence, ok := m.store.(store.ArtifactStore); ok {
+			artifactSession.SetDurableCallbacks(func(callCtx context.Context, job string, metas []artifact.Metadata) error {
+				items := make([]store.Artifact, len(metas))
+				for i, meta := range metas {
+					items[i] = store.Artifact{RunID: runRecord.ID, ProducerJob: job, Name: meta.Name, RootName: meta.RootName, RootKind: meta.RootKind, ContentSHA256: meta.ContentSHA256, BlobSHA256: meta.BlobSHA256, Format: meta.Format, ArchiveSizeBytes: meta.ArchiveSizeBytes, LogicalSizeBytes: meta.LogicalSizeBytes, EntryCount: meta.EntryCount, CreatedAt: meta.CreatedAt}
+				}
+				return persistence.CommitArtifacts(callCtx, store.ArtifactOwnership{RunID: runRecord.ID, JobName: job}, items)
+			}, func(callCtx context.Context, producer, name string) (artifact.Metadata, error) {
+				item, err := persistence.GetArtifact(callCtx, runRecord.ID, producer, name)
+				if err != nil {
+					return artifact.Metadata{}, err
+				}
+				return artifact.Metadata{Name: item.Name, RootName: item.RootName, RootKind: item.RootKind, ContentSHA256: item.ContentSHA256, BlobSHA256: item.BlobSHA256, Format: item.Format, ArchiveSizeBytes: item.ArchiveSizeBytes, LogicalSizeBytes: item.LogicalSizeBytes, EntryCount: item.EntryCount, CreatedAt: item.CreatedAt}, nil
+			})
+		}
+	}
+	result := (runner.Runner{Executor: exec, Output: m.output, ErrorOutput: m.output, MaxParallel: runRecord.MaxParallel, Observer: obs, Artifacts: artifactSession}).Run(ctx, graph)
 	status := store.RunFailed
 	var message *string
 	if obs.err != nil {

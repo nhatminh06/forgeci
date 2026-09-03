@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -27,6 +28,55 @@ func graphFor(t *testing.T, jobs map[string]config.Job) *pipeline.Graph {
 		t.Fatal(err)
 	}
 	return graph
+}
+
+type blockingArtifacts struct {
+	entered chan struct{}
+	release chan struct{}
+	err     error
+}
+
+func (b blockingArtifacts) Restore(context.Context, string, []config.ArtifactDownload) error {
+	return nil
+}
+func (b blockingArtifacts) Publish(context.Context, string, []config.ArtifactUpload) error {
+	close(b.entered)
+	<-b.release
+	return b.err
+}
+func TestJobDoesNotPassBeforeArtifactPublication(t *testing.T) {
+	observer := &recordingObserver{}
+	lifecycle := blockingArtifacts{entered: make(chan struct{}), release: make(chan struct{})}
+	graph := graphFor(t, map[string]config.Job{"build": {Steps: []config.Step{{Run: "true"}}, Artifacts: config.Artifacts{Upload: []config.ArtifactUpload{{Name: "app", Path: "dist/app"}}}}})
+	done := make(chan Result, 1)
+	go func() {
+		done <- (Runner{Executor: executor.Local{Directory: t.TempDir()}, Observer: observer, Artifacts: lifecycle}).Run(context.Background(), graph)
+	}()
+	select {
+	case <-lifecycle.entered:
+	case <-time.After(time.Second):
+		t.Fatal("publication not reached")
+	}
+	observer.mu.Lock()
+	events := append([]string(nil), observer.events...)
+	observer.mu.Unlock()
+	if slices.Contains(events, "build:RUNNING>PASSED") {
+		t.Fatal("job passed before artifact publication")
+	}
+	close(lifecycle.release)
+	result := <-done
+	if !result.Succeeded() {
+		t.Fatalf("result=%+v", result)
+	}
+}
+func TestArtifactContentFailureIsJobFailure(t *testing.T) {
+	lifecycle := blockingArtifacts{entered: make(chan struct{}), release: make(chan struct{}), err: artifact.AsPipelineError(errors.New("missing artifact"))}
+	close(lifecycle.release)
+	graph := graphFor(t, map[string]config.Job{"build": {Steps: []config.Step{{Run: "true"}}}})
+	result := (Runner{Executor: executor.Local{Directory: t.TempDir()}, Artifacts: lifecycle}).Run(context.Background(), graph)
+	if result.States["build"] != Failed || result.InternalError {
+		t.Fatalf("result=%+v", result)
+	}
 }
 
 func TestRunSuccessAndMultipleSteps(t *testing.T) {

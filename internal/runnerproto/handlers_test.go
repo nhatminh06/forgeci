@@ -2,6 +2,8 @@ package runnerproto
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/artifact"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -36,6 +39,42 @@ func TestAuthenticationBoundary(t *testing.T) {
 	h.AuthMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true })).ServeHTTP(response, req)
 	if !called {
 		t.Fatal("valid token rejected")
+	}
+}
+
+func TestArtifactUploadRequiresCurrentRunnerAndLease(t *testing.T) {
+	runnerID := "00000000-0000-4000-8000-000000000001"
+	runID := "00000000-0000-4000-8000-000000000002"
+	leaseID := "00000000-0000-4000-8000-000000000003"
+	expiry := time.Now().Add(time.Minute)
+	run := &store.Run{ID: runID, Status: store.RunRunning, RunnerID: &runnerID, LeaseID: &leaseID, LeaseGeneration: 2, LeaseExpiresAt: &expiry, Jobs: []store.Job{{Name: "build", Status: store.JobRunning}}}
+	cas, err := artifact.Open(t.TempDir(), artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandlers(sourceStore{run: run}, "token")
+	h.SetArtifactStore(cas)
+	data := []byte("blob")
+	sum := sha256.Sum256(data)
+	digest := hex.EncodeToString(sum[:])
+	request := func(owner string) *httptest.ResponseRecorder {
+		path := "/v1/runner/leases/" + leaseID + "/jobs/build/artifact-blobs/" + digest + "?runner_id=" + owner + "&run_id=" + runID + "&generation=2"
+		req := httptest.NewRequest(http.MethodPut, path, strings.NewReader(string(data)))
+		req.Header.Set("Content-Length", "4")
+		w := httptest.NewRecorder()
+		h.ArtifactUpload(w, req)
+		return w
+	}
+	if got := request("00000000-0000-4000-8000-000000000099"); got.Code != http.StatusConflict {
+		t.Fatalf("wrong runner code=%d", got.Code)
+	}
+	if got := request(runnerID); got.Code != http.StatusNoContent {
+		t.Fatalf("valid upload code=%d body=%s", got.Code, got.Body.String())
+	}
+	past := time.Now().Add(-time.Second)
+	run.LeaseExpiresAt = &past
+	if got := request(runnerID); got.Code != http.StatusConflict {
+		t.Fatalf("stale lease code=%d", got.Code)
 	}
 }
 

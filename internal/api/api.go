@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -31,8 +32,9 @@ type Store interface {
 }
 
 type Server struct {
-	Manager Manager
-	Store   Store
+	Manager      Manager
+	Store        Store
+	OpenArtifact func(string) (*os.File, error)
 }
 
 func (s Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
@@ -123,9 +125,9 @@ func (s Server) runners(w http.ResponseWriter, r *http.Request) {
 }
 func (s Server) run(w http.ResponseWriter, r *http.Request) {
 	suffix := strings.TrimPrefix(r.URL.Path, "/v1/runs/")
-	cancel := strings.HasSuffix(suffix, "/cancel")
-	id := strings.TrimSuffix(suffix, "/cancel")
-	if id == "" || strings.Contains(id, "/") {
+	parts := strings.Split(suffix, "/")
+	id := parts[0]
+	if id == "" {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -133,7 +135,7 @@ func (s Server) run(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "run not found")
 		return
 	}
-	if cancel && r.Method == http.MethodPost {
+	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
 		status, err := s.Manager.Cancel(r.Context(), id)
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "run not found")
@@ -150,7 +152,7 @@ func (s Server) run(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "status": status})
 		return
 	}
-	if !cancel && r.Method == http.MethodGet {
+	if len(parts) == 1 && r.Method == http.MethodGet {
 		run, err := s.Manager.Get(r.Context(), id)
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "run not found")
@@ -163,7 +165,68 @@ func (s Server) run(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, run)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "artifacts" && r.Method == http.MethodGet {
+		s.listArtifacts(w, r, id)
+		return
+	}
+	if len(parts) == 4 && parts[1] == "artifacts" && r.Method == http.MethodGet {
+		s.downloadArtifact(w, r, id, parts[2], parts[3])
+		return
+	}
 	writeError(w, http.StatusNotFound, "not found")
+}
+
+func (s Server) listArtifacts(w http.ResponseWriter, r *http.Request, runID string) {
+	backend, ok := s.Store.(store.ArtifactStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "artifact metadata unavailable")
+		return
+	}
+	items, err := backend.ListArtifacts(r.Context(), runID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+func (s Server) downloadArtifact(w http.ResponseWriter, r *http.Request, runID, job, name string) {
+	backend, ok := s.Store.(store.ArtifactStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "artifact storage unavailable")
+		return
+	}
+	item, err := backend.GetArtifact(r.Context(), runID, job, name)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "artifact not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	if !item.Available {
+		writeError(w, http.StatusGone, "artifact expired")
+		return
+	}
+	if s.OpenArtifact == nil {
+		writeError(w, http.StatusServiceUnavailable, "artifact storage unavailable")
+		return
+	}
+	f, err := s.OpenArtifact(item.BlobSHA256)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "artifact blob unavailable")
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/vnd.forgeci.artifact+gzip")
+	w.Header().Set("Content-Length", strconv.FormatInt(item.ArchiveSizeBytes, 10))
+	w.Header().Set("X-ForgeCI-Blob-SHA256", item.BlobSHA256)
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.CopyN(w, f, item.ArchiveSizeBytes)
 }
 func decodeStrict(w http.ResponseWriter, r *http.Request, target any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBody)

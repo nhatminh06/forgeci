@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -166,7 +168,7 @@ func TestDockerUsesOneContainerForAllStepsAndCleansUp(t *testing.T) {
 		t.Fatalf("removes=%d stdout=%q stderr=%q", fake.removes, stdout.String(), stderr.String())
 	}
 	opts := fake.createOpts[0]
-	if opts.Config.WorkingDir != workspace || opts.Config.Labels[managedLabelKey] != "true" || opts.Config.Labels["forgeci.job"] != "test" || len(opts.HostConfig.Binds) != 1 || !strings.HasSuffix(opts.HostConfig.Binds[0], ":/workspace:rw") || opts.HostConfig.Privileged {
+	if opts.Config.User != fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()) || opts.Config.WorkingDir != workspace || opts.Config.Labels[managedLabelKey] != "true" || opts.Config.Labels["forgeci.job"] != "test" || len(opts.HostConfig.Binds) != 1 || !strings.HasSuffix(opts.HostConfig.Binds[0], ":/workspace:rw") || opts.HostConfig.Privileged {
 		t.Fatalf("unsafe or incomplete container options: %+v", opts)
 	}
 }
