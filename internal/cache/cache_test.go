@@ -5,13 +5,126 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/config"
+
 	"github.com/nhatminh06/forgeci/internal/artifact"
 )
+
+type testRemote struct {
+	meta                 Metadata
+	archive              []byte
+	uploadErr, commitErr error
+}
+
+func (r *testRemote) Lookup(_ context.Context, key string) (Metadata, error) {
+	if r.meta.Key == "" || r.meta.Key != key {
+		return Metadata{}, ErrCacheMiss
+	}
+	return r.meta, nil
+}
+func (r *testRemote) Download(_ context.Context, _ Metadata, w io.Writer) error {
+	_, err := w.Write(r.archive)
+	return err
+}
+func (r *testRemote) Upload(context.Context, Metadata, io.Reader) error { return r.uploadErr }
+func (r *testRemote) Commit(context.Context, Metadata) error            { return r.commitErr }
+
+func sessionFixture(t *testing.T) (*Session, *testRemote, string) {
+	t.Helper()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "value"), []byte("cached-value"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(root, "cache.tgz")
+	meta, err := Capture(source, "demo", archive, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &testRemote{meta: meta, archive: data}
+	workspace := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewSession(workspace, filepath.Join(root, "tmp"), remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session, remote, workspace
+}
+
+func TestSessionMissIsNonFatal(t *testing.T) {
+	root := t.TempDir()
+	remote := &testRemote{}
+	s, err := NewSession(root, filepath.Join(root, "tmp"), remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Restore(context.Background(), []config.CacheEntry{{Key: "missing", Path: ".cache/demo"}}, io.Discard)
+	if _, err := os.Stat(filepath.Join(root, ".cache/demo")); !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionLookupUsesExactKey(t *testing.T) {
+	s, remote, workspace := sessionFixture(t)
+	remote.meta.Key = "foo"
+	s.Restore(context.Background(), []config.CacheEntry{{Key: "foobar", Path: ".cache/demo"}}, io.Discard)
+	if _, err := os.Stat(filepath.Join(workspace, ".cache/demo")); !os.IsNotExist(err) {
+		t.Fatalf("prefix cache restored: %v", err)
+	}
+}
+func TestSessionLogicalContentCorruptionRejected(t *testing.T) {
+	s, remote, workspace := sessionFixture(t)
+	remote.meta.ContentSHA256 = fmt.Sprintf("%064x", 1)
+	s.Restore(context.Background(), []config.CacheEntry{{Key: "demo", Path: ".cache/demo"}}, io.Discard)
+	if _, err := os.Stat(filepath.Join(workspace, ".cache/demo")); !os.IsNotExist(err) {
+		t.Fatalf("destination materialized: %v", err)
+	}
+}
+func TestSessionSourceDestinationCollisionBypasses(t *testing.T) {
+	s, remote, workspace := sessionFixture(t)
+	_ = remote
+	destination := filepath.Join(workspace, ".cache/demo")
+	if err := os.MkdirAll(destination, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "value"), []byte("source-authoritative"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.Restore(context.Background(), []config.CacheEntry{{Key: "demo", Path: ".cache/demo"}}, io.Discard)
+	got, err := os.ReadFile(filepath.Join(destination, "value"))
+	if err != nil || string(got) != "source-authoritative" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
+func TestSessionSaveFailureIsNonFatal(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	remote := &testRemote{uploadErr: fmt.Errorf("upload failed")}
+	s, err := NewSession(workspace, filepath.Join(root, "tmp"), remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Save(context.Background(), []config.CacheEntry{{Key: "demo", Path: "missing"}}, io.Discard)
+}
 
 func TestDeterministicFileRoundTrip(t *testing.T) {
 	root := t.TempDir()
