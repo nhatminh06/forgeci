@@ -16,6 +16,47 @@ func writePipeline(t *testing.T, body string) string {
 	return path
 }
 
+func TestArtifactDeclarations(t *testing.T) {
+	valid := `version: 1
+jobs:
+  build:
+    steps:
+      - run: mkdir -p dist
+    artifacts:
+      upload:
+        - name: application
+          path: dist/app
+  test:
+    needs: [build]
+    steps:
+      - run: test -f inputs/app
+    artifacts:
+      download:
+        - from: build
+          name: application
+          into: inputs
+`
+	if _, err := ParseBytes([]byte(valid), "valid"); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"unknown field":         strings.Replace(valid, "path: dist/app", "paths: [dist/app]", 1),
+		"bad name":              strings.Replace(valid, "name: application", "name: ../bad", 1),
+		"absolute upload":       strings.Replace(valid, "path: dist/app", "path: /tmp/app", 1),
+		"upload traversal":      strings.Replace(valid, "path: dist/app", "path: ../app", 1),
+		"download traversal":    strings.Replace(valid, "into: inputs", "into: ../inputs", 1),
+		"not direct dependency": strings.Replace(valid, "needs: [build]", "needs: []", 1),
+		"undeclared artifact":   strings.Replace(valid, "name: application\n          into: inputs", "name: other\n          into: inputs", 1),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseBytes([]byte(data), name); err == nil {
+				t.Fatal("invalid artifact pipeline accepted")
+			}
+		})
+	}
+}
+
 func TestLoadValidPipelines(t *testing.T) {
 	tests := map[string]string{
 		"single job": `version: 1
