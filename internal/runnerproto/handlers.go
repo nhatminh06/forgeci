@@ -344,6 +344,12 @@ func (h *Handlers) Lease(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if lease != nil {
+			// A claim may have temporarily locked its run and caused concurrent
+			// claimers to skip it. Wake them after commit so the next ready job is
+			// considered immediately instead of waiting for the long-poll timeout.
+			if h.notify != nil {
+				h.notify()
+			}
 			resp := LeaseResponse{
 				RunID: lease.RunID, JobName: lease.JobName, LeaseID: lease.LeaseID, Generation: lease.Generation, Job: lease.Job, ExpiresAt: lease.ExpiresAt,
 				SourceSnapshotSHA256: lease.Snapshot.SourceDigest, BlobSHA256: lease.Snapshot.BlobDigest, ArchiveSizeBytes: lease.Snapshot.ArchiveSizeBytes, LogicalSizeBytes: lease.Snapshot.LogicalSizeBytes, EntryCount: lease.Snapshot.EntryCount, ArchiveFormat: lease.Snapshot.Format,
