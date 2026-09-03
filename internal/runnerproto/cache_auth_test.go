@@ -1,13 +1,80 @@
 package runnerproto
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/store"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCacheWriteAuthorizationRejectsWrongLeaseTerminalAndUndeclared(t *testing.T) {
+	runnerID := "00000000-0000-0000-0000-000000000001"
+	runID := "00000000-0000-0000-0000-000000000002"
+	leaseID := "00000000-0000-0000-0000-000000000003"
+	wrongLease := "00000000-0000-0000-0000-000000000004"
+	exp := time.Now().Add(time.Hour)
+	run := &store.Run{ID: runID, Status: store.RunRunning, PipelineYAML: []byte("version: 1\njobs:\n  build:\n    cache:\n      save:\n        - key: allowed-v1\n          path: .cache/demo\n    steps:\n      - run: true\n"), Jobs: []store.Job{{Name: "build", Status: store.JobRunning, RunnerID: &runnerID, LeaseID: &leaseID, LeaseGeneration: 2, LeaseExpiresAt: &exp}}}
+	cas, err := cache.Open(t.TempDir(), artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandlers(sourceStore{run: run}, "token")
+	h.SetCacheStore(cas)
+	data := []byte("cache-bytes")
+	request := func(path, query string, body io.Reader, method string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path+"?"+query, body)
+		req.Header.Set("Authorization", "Bearer token")
+		if method == http.MethodPut {
+			req.ContentLength = int64(len(data))
+		}
+		w := httptest.NewRecorder()
+		h.AuthMiddleware(http.HandlerFunc(h.HandleLeaseRoute)).ServeHTTP(w, req)
+		return w
+	}
+	sum := sha256.Sum256(data)
+	digest := hex.EncodeToString(sum[:])
+	base := "/v1/runner/leases/" + leaseID + "/jobs/build/cache-blobs/" + digest
+	q := "runner_id=" + runnerID + "&run_id=" + runID + "&job_name=build&generation=2&key=allowed-v1"
+	if w := request(base, q, strings.NewReader(string(data)), http.MethodPut); w.Code != http.StatusNoContent {
+		t.Fatalf("valid upload=%d", w.Code)
+	}
+	if w := request("/v1/runner/leases/"+wrongLease+"/jobs/build/cache-blobs/"+digest, q, strings.NewReader(string(data)), http.MethodPut); w.Code != http.StatusConflict {
+		t.Fatalf("wrong lease upload=%d", w.Code)
+	}
+	run.Jobs[0].Status = store.JobPassed
+	if w := request(base, q, strings.NewReader(string(data)), http.MethodPut); w.Code != http.StatusConflict {
+		t.Fatalf("terminal upload=%d", w.Code)
+	}
+	run.Jobs[0].Status = store.JobRunning
+	if w := request(base, strings.Replace(q, "allowed-v1", "forbidden-v1", 1), strings.NewReader(string(data)), http.MethodPut); w.Code != http.StatusConflict {
+		t.Fatalf("undeclared upload=%d", w.Code)
+	}
+	commit := func(path, query, key string) *httptest.ResponseRecorder {
+		payload, _ := json.Marshal(map[string]any{"runner_id": runnerID, "run_id": runID, "lease_id": leaseID, "generation": 2, "job_name": "build", "key": key, "path": "", "root_name": "demo", "root_kind": "directory", "content_sha256": strings.Repeat("b", 64), "blob_sha256": digest, "format": cache.Format, "archive_size_bytes": int64(len(data)), "logical_size_bytes": 1, "entry_count": 1})
+		return request(path, query, strings.NewReader(string(payload)), http.MethodPost)
+	}
+	commitPath := "/v1/runner/leases/" + leaseID + "/jobs/build/cache/commit"
+	commitQuery := "runner_id=" + runnerID + "&run_id=" + runID + "&job_name=build&generation=2"
+	if w := commit("/v1/runner/leases/"+wrongLease+"/jobs/build/cache/commit", commitQuery, "allowed-v1"); w.Code != http.StatusBadRequest {
+		t.Fatalf("wrong lease commit=%d", w.Code)
+	}
+	run.Jobs[0].Status = store.JobPassed
+	if w := commit(commitPath, commitQuery, "allowed-v1"); w.Code != http.StatusConflict {
+		t.Fatalf("terminal commit=%d", w.Code)
+	}
+	run.Jobs[0].Status = store.JobRunning
+	if w := commit(commitPath, commitQuery, "forbidden-v1"); w.Code != http.StatusConflict {
+		t.Fatalf("undeclared commit=%d", w.Code)
+	}
+}
 
 func TestCacheAuthorizationRejectsInvalidOwnershipAndDeclarations(t *testing.T) {
 	runnerID := "00000000-0000-4000-8000-000000000001"
