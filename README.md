@@ -2,7 +2,7 @@
 
 ForgeCI is a self-hosted CI/CD platform built from first principles to explore how pipeline engines, schedulers, runners, build systems, artifact stores, software-supply-chain controls, and deployment systems work internally.
 
-Milestone 6 adds deterministic source snapshots and isolated run workspaces. Every server-backed submission captures the exact source tree into an immutable content-addressed archive; local servers and empty remote runners materialize and verify that snapshot before execution. Direct `forge run` intentionally remains a live-workspace command.
+Milestone 7 adds explicit durable job artifacts. Producers publish deterministic, content-addressed file or directory archives before becoming passed; consumers fetch, verify, and safely restore declared upstream artifacts before their first step.
 
 ## Current capabilities
 
@@ -19,25 +19,28 @@ Milestone 6 adds deterministic source snapshots and isolated run workspaces. Eve
 - Deterministic source manifests with logical and archive SHA-256 identities
 - Immutable filesystem snapshot storage with deduplication and PostgreSQL metadata
 - Authenticated, lease-owned snapshot streaming and runner-side integrity verification
+- Named file and directory artifacts with independent logical and blob SHA-256 identities
+- Immutable artifact CAS, transactional PostgreSQL metadata, retention, and reference-aware GC
+- Authenticated lease-owned artifact transfer and verified downstream materialization
 - Isolated per-run local and Docker workspaces with marker-protected cleanup
 - FIFO dispatch with live job-state persistence; one local run or one remote run per runner
 - Remote runner registration, heartbeat, lease acquisition, and completion reporting
 - Persistent runner inventory with `GET /v1/runners`
-- Local HTTP API and CLI commands for submit, list, inspect, cancel, and runner listing
+- Local HTTP API and CLI commands for runs, runners, and artifact listing/download
 - Restart recovery for queued, completed, and interrupted runs
 - Stable summaries and process exit codes
 
 ## Architecture
 
 ```text
-HTTP API → control plane → PostgreSQL + snapshot CAS → queued run
+HTTP API → control plane → PostgreSQL + snapshot CAS + artifact CAS → queued run
     │
     └── runner protocol → lease → download + verify → isolated workspace → executor
 ```
 
 Parsing, graph compilation, runtime state, and command execution remain separate so the control plane never re-interprets raw YAML. The control plane owns queueing and run lifecycle, while a persistent remote runner owns a leased whole-run execution. See [docs/architecture.md](docs/architecture.md) for the component boundaries.
 
-Snapshot format, safety, and reproducibility rules are documented in [docs/source-snapshots.md](docs/source-snapshots.md).
+Snapshot rules are documented in [docs/source-snapshots.md](docs/source-snapshots.md); artifact lifecycle, integrity, retention, and security are in [docs/artifacts.md](docs/artifacts.md).
 
 ## Pipeline example
 
@@ -87,6 +90,7 @@ go build -o build/forge-runner ./cmd/forge-runner
   --runner-listen 127.0.0.1:9090 \
   --workspace "$(pwd)" \
   --snapshot-dir /var/lib/forgeci/snapshots \
+  --artifact-dir /var/lib/forgeci/artifacts \
   --execution-mode remote \
   --database-url 'postgres://postgres:forgeci@127.0.0.1:5432/forgeci?sslmode=disable' \
   --runner-token-file /path/to/runner-token
@@ -112,15 +116,17 @@ forge submit --file <path> --jobs <N>
 forge runs --limit <N>
 forge inspect <run-id>
 forge cancel <run-id>
+forge artifacts <run-id>
+forge artifact download <run-id> <job> <name> --output <path>
 ```
 
 Exit code `0` means success, `1` means at least one job failed or was blocked, and `2` means a CLI, configuration, compilation, or interruption error.
 
 `--jobs` must be greater than zero and defaults to `1`, preserving sequential Milestone 1 behavior.
 
-## What Milestone 6 demonstrates
+## What Milestone 7 demonstrates
 
-Pipeline identity and source identity are independent. The stored YAML digest identifies the execution definition, while the canonical source digest identifies files, directories, symlinks, modes, and file content. A second blob digest protects the exact compressed transport. Runners verify both before executing.
+Source snapshots and artifacts are independent durable objects: snapshots freeze pipeline input, while artifacts publish explicit job output. An artifact's logical digest identifies its canonical tree and its blob digest protects exact transport bytes. Required metadata commits atomically before the producer can become passed.
 
 ## Current limitations and security model
 
@@ -130,4 +136,4 @@ The HTTP API remains loopback-only for the control-plane surface, and the runner
 
 ## Roadmap
 
-Durable artifacts, caching, cross-runner job scheduling, retries, persistent logs, per-runner credentials, Kubernetes, multi-tenancy/RBAC, and high availability remain deferred.
+Build caching, job-level cross-runner scheduling, retries, persistent logs, per-runner credentials, Kubernetes, multi-tenancy/RBAC, and high availability remain deferred.

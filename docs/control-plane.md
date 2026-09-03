@@ -14,6 +14,7 @@ go build -o build/forge-server ./cmd/forge-server
   --listen 127.0.0.1:8080 \
   --workspace "$(pwd)" \
   --snapshot-dir /var/lib/forgeci/snapshots \
+  --artifact-dir /var/lib/forgeci/artifacts \
   --database-url 'postgres://postgres:forgeci@127.0.0.1:5432/forgeci?sslmode=disable'
 ```
 
@@ -30,8 +31,8 @@ The snapshot directory is required and must be outside the source workspace. Def
 
 Inspection prints both pipeline and source digests. Local execution materializes the immutable snapshot below the server snapshot store, executes local and Docker jobs there, and removes the workspace at every terminal outcome. Editing or deleting source after submission cannot affect that run.
 
-Direct `forge run` is deliberately different: it uses the live invocation workspace, requires neither PostgreSQL nor snapshot storage, and remains convenient for immediate local development.
+Direct `forge run` uses the live invocation workspace and needs neither PostgreSQL nor server storage. Artifact-enabled direct runs use an ephemeral local CAS deleted at process exit; server-backed artifacts persist in the configured artifact CAS and PostgreSQL.
 
 ## Recovery and limitations
 
-Snapshot blobs and metadata survive server restart. Startup removes stale temporary snapshot files after a conservative grace period. Permanent blobs referenced by run history are retained. Capture observes exact bytes read but is not a filesystem-atomic point-in-time operation; obvious mutation during capture fails. `.git` is excluded, while untracked files and other source content are included. There are no custom ignores, Git commit identities, SCM checkout, xattrs, ACL preservation, artifacts, or cache.
+Snapshot and artifact blobs and metadata survive server restart. Startup and GC remove stale temporary data after conservative grace periods. Capture observes exact bytes read but is not a filesystem-atomic point-in-time operation; obvious mutation during capture fails. `.git` is excluded, while untracked files and other source content are included. There are no custom ignores, Git commit identities, SCM checkout, xattrs, ACL preservation, or build cache. See [artifacts.md](artifacts.md).
