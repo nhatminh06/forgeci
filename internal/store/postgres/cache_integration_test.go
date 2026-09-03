@@ -65,3 +65,31 @@ func TestCacheLookupDelete(t *testing.T) {
 		t.Fatalf("expected deleted cache miss, got %v", err)
 	}
 }
+
+func TestCacheLookupUsesExactKey(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	workspace := "/exact-" + strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "-")
+	foo := cacheMeta("foo", strings.Repeat("a", 64), strings.Repeat("b", 64))
+	foo.Workspace = workspace
+	foobar := cacheMeta("foobar", strings.Repeat("c", 64), strings.Repeat("d", 64))
+	foobar.Workspace = workspace
+	if err := s.CommitCache(ctx, foo); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitCache(ctx, foobar); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LookupCache(ctx, workspace, "foobar-extra", time.Now().UTC()); err != store.ErrNotFound {
+		t.Fatalf("prefix lookup matched: %v", err)
+	}
+	for _, want := range []store.CacheMetadata{foo, foobar} {
+		got, err := s.LookupCache(ctx, workspace, want.Key, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Key != want.Key || got.ContentSHA256 != want.ContentSHA256 || got.BlobSHA256 != want.BlobSHA256 {
+			t.Fatalf("wrong metadata: %+v", got)
+		}
+	}
+}
