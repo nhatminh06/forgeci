@@ -68,15 +68,11 @@ func sessionFixture(t *testing.T) (*Session, *testRemote, string) {
 }
 
 func TestSessionMissIsNonFatal(t *testing.T) {
-	root := t.TempDir()
-	remote := &testRemote{}
-	s, err := NewSession(root, filepath.Join(root, "tmp"), remote)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.Restore(context.Background(), []config.CacheEntry{{Key: "missing", Path: ".cache/demo"}}, io.Discard)
-	if _, err := os.Stat(filepath.Join(root, ".cache/demo")); !os.IsNotExist(err) {
-		t.Fatal(err)
+	s, remote, workspace := sessionFixture(t)
+	remote.meta.Key = "present"
+	s.Restore(context.Background(), []config.CacheEntry{{Key: "missing", Path: ".cache/missing"}, {Key: "present", Path: ".cache/demo"}}, io.Discard)
+	if _, err := os.Stat(filepath.Join(workspace, ".cache/demo/value")); err != nil {
+		t.Fatalf("MISS prevented later restore: %v", err)
 	}
 }
 
