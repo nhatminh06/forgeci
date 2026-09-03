@@ -135,6 +135,8 @@ func TestLeaseLongPollWakesOnSubmission(t *testing.T) {
 	s := &signalingLeaseStore{}
 	signal := make(chan struct{})
 	h := NewHandlers(s, "token", func() <-chan struct{} { return signal })
+	notified := 0
+	h.SetNotifier(func() { notified++ })
 	h.longPollTTL = time.Second
 	request := httptest.NewRequest(http.MethodPost, "/v1/runner/lease", strings.NewReader(`{"runner_id":"00000000-0000-4000-8000-000000000001"}`))
 	response := httptest.NewRecorder()
@@ -165,6 +167,9 @@ func TestLeaseLongPollWakesOnSubmission(t *testing.T) {
 	}
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if notified != 1 {
+		t.Fatalf("successful claim notifications=%d want=1", notified)
 	}
 }
 
