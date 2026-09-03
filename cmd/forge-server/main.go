@@ -17,6 +17,7 @@ import (
 
 	"github.com/nhatminh06/forgeci/internal/api"
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
 	"github.com/nhatminh06/forgeci/internal/runnerproto"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
@@ -39,6 +40,11 @@ func run() error {
 	workspace := flags.String("workspace", cwd, "repository workspace")
 	snapshotDir := flags.String("snapshot-dir", "", "source snapshot store directory (required, outside workspace)")
 	artifactDir := flags.String("artifact-dir", "", "durable artifact store directory (required, outside workspace)")
+	cacheDir := flags.String("cache-dir", "", "reusable build cache store directory (required, outside workspace)")
+	cacheRetention := flags.Duration("cache-retention", 168*time.Hour, "idle cache retention")
+	cacheMaxBytes := flags.Int64("cache-max-bytes", 10<<30, "maximum unique live cache blob bytes")
+	cacheGCInterval := flags.Duration("cache-gc-interval", time.Minute, "cache garbage collection interval")
+	cacheOrphanGrace := flags.Duration("cache-orphan-grace", time.Hour, "minimum age before removing orphan cache blobs")
 	artifactRetention := flags.Duration("artifact-retention", 168*time.Hour, "artifact retention after a run becomes terminal")
 	artifactGCInterval := flags.Duration("artifact-gc-interval", time.Minute, "artifact garbage collection interval")
 	artifactOrphanGrace := flags.Duration("artifact-orphan-grace", time.Hour, "minimum age before removing orphan artifact blobs")
@@ -73,8 +79,14 @@ func run() error {
 	if *artifactDir == "" {
 		return fmt.Errorf("artifact directory is required")
 	}
+	if *cacheDir == "" {
+		*cacheDir = filepath.Join(filepath.Dir(*artifactDir), "cache")
+	}
 	if *artifactRetention <= 0 || *artifactGCInterval <= 0 || *artifactOrphanGrace <= 0 {
 		return fmt.Errorf("artifact retention and GC durations must be greater than zero")
+	}
+	if *cacheRetention <= 0 || *cacheGCInterval <= 0 || *cacheOrphanGrace <= 0 || *cacheMaxBytes < 0 {
+		return fmt.Errorf("cache retention, GC durations, and size must be valid")
 	}
 
 	// Validate execution mode
@@ -129,11 +141,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	cacheStore, err := cache.Open(*cacheDir, artifactLimits)
+	if err != nil {
+		return err
+	}
 	workspaceRoot, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
 		return err
 	}
-	if pathsOverlap(workspaceRoot, artifactStore.Root()) || pathsOverlap(snapshotStore.Root(), artifactStore.Root()) {
+	if pathsOverlap(workspaceRoot, artifactStore.Root()) || pathsOverlap(snapshotStore.Root(), artifactStore.Root()) || pathsOverlap(workspaceRoot, cacheStore.Root()) || pathsOverlap(snapshotStore.Root(), cacheStore.Root()) || pathsOverlap(artifactStore.Root(), cacheStore.Root()) {
 		return fmt.Errorf("artifact directory must be separate from workspace and snapshot directory")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -144,11 +160,14 @@ func run() error {
 	}
 	defer persistence.Close()
 	persistence.SetArtifactRetention(*artifactRetention)
+	persistence.SetCacheRetention(*cacheRetention)
+	persistence.SetCacheMaxBytes(*cacheMaxBytes)
 	manager, err := controlplane.New(ctx, persistence, absolute, os.Stdout, snapshotStore)
 	if err != nil {
 		return err
 	}
 	manager.SetArtifactStore(artifactStore)
+	manager.SetCacheStore(cacheStore)
 
 	// Only start manager in local execution mode
 	if *executionMode == "local" {
@@ -160,7 +179,7 @@ func run() error {
 	}
 	defer manager.Close()
 
-	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager, Store: persistence, OpenArtifact: artifactStore.OpenBlob}).Handler(), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager, Store: persistence, OpenArtifact: artifactStore.OpenBlob, Workspace: workspaceRoot}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.ListenAndServe() }()
 	go func() {
@@ -189,6 +208,27 @@ func run() error {
 			}
 		}
 	}()
+	go func() {
+		ticker := time.NewTicker(*cacheGCInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case now := <-ticker.C:
+				digests, err := persistence.ExpireCache(ctx, now.UTC(), *cacheMaxBytes)
+				if err == nil {
+					for _, digest := range digests {
+						_ = cacheStore.RemoveBlob(digest)
+					}
+					if live, liveErr := persistence.LiveCacheBlobs(ctx); liveErr == nil {
+						_ = cacheStore.CleanupOrphans(now.UTC(), *cacheOrphanGrace, live)
+					}
+					_ = cacheStore.CleanupTemps(now.UTC(), *cacheOrphanGrace)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Setup runner protocol server in remote mode
 	var runnerServer *http.Server
@@ -196,6 +236,7 @@ func run() error {
 		handlers := runnerproto.NewHandlers(persistence, runnerToken, manager.WorkAvailable)
 		handlers.SetSnapshotOpener(snapshotStore.OpenBlob)
 		handlers.SetArtifactStore(artifactStore)
+		handlers.SetCacheStore(cacheStore)
 		handlers.SetNotifier(manager.Notify)
 
 		// Start lease expiration sweeper

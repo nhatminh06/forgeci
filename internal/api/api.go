@@ -35,6 +35,7 @@ type Server struct {
 	Manager      Manager
 	Store        Store
 	OpenArtifact func(string) (*os.File, error)
+	Workspace    string
 }
 
 func (s Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
@@ -50,11 +51,63 @@ func (s Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.list(w, r)
 	case r.URL.Path == "/v1/runners" && r.Method == http.MethodGet:
 		s.runners(w, r)
+	case r.URL.Path == "/v1/cache" && r.Method == http.MethodGet:
+		s.cacheList(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/cache/") && r.Method == http.MethodDelete:
+		s.cacheDelete(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/runs/"):
 		s.run(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s Server) cacheList(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.Store.(store.CacheStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "cache unavailable")
+		return
+	}
+	if len(r.URL.Query()) > 1 || (r.URL.Query().Get("limit") == "" && r.URL.RawQuery != "") {
+		writeError(w, http.StatusBadRequest, "invalid query parameters")
+		return
+	}
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, e := strconv.Atoi(v)
+		if e != nil || n < 1 || n > 100 {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		limit = n
+	}
+	items, err := b.ListCache(r.Context(), s.Workspace, limit)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cache": items})
+}
+func (s Server) cacheDelete(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.Store.(store.CacheStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "cache unavailable")
+		return
+	}
+	key := strings.TrimPrefix(r.URL.Path, "/v1/cache/")
+	if key == "" || strings.ContainsAny(key, "/?#") {
+		writeError(w, http.StatusBadRequest, "invalid cache key")
+		return
+	}
+	if err := b.DeleteCache(r.Context(), s.Workspace, key); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "cache key not found")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 func (s Server) health(w http.ResponseWriter, r *http.Request) {
 	if err := s.Manager.Ping(r.Context()); err != nil {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/cache"
 	controlclient "github.com/nhatminh06/forgeci/internal/client"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
@@ -26,6 +27,8 @@ Usage:
   forge submit [--server <url>] [--file <path>] [--jobs <N>]
   forge runs [--server <url>] [--limit <N>]
   forge runners [--server <url>]
+  forge cache list [--server <url>]
+  forge cache delete <key> [--server <url>]
   forge artifacts <run-id> [--server <url>]
   forge artifact download <run-id> <job> <name> --output <path> [--server <url>]
   forge inspect <run-id> [--server <url>]
@@ -58,6 +61,8 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		return runs(ctx, args[1:], stdout, stderr)
 	case "runners":
 		return runners(ctx, args[1:], stdout, stderr)
+	case "cache":
+		return cacheCommand(ctx, args[1:], stdout, stderr)
 	case "inspect":
 		return inspect(ctx, args[1:], stdout, stderr)
 	case "cancel":
@@ -70,6 +75,46 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], helpText)
 		return 2
 	}
+}
+
+func cacheCommand(ctx context.Context, args []string, out, errw io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(errw, "usage: forge cache list|delete")
+		return 2
+	}
+	vals, pos, e := parseLooseFlags(args[1:], map[string]string{"--server": defaultServer})
+	if e != nil {
+		fmt.Fprintln(errw, e)
+		return 2
+	}
+	c := newControlClient(vals["--server"])
+	switch args[0] {
+	case "list":
+		if len(pos) != 0 {
+			return 2
+		}
+		items, e := c.CacheList(ctx, 100)
+		if e != nil {
+			fmt.Fprintln(errw, e)
+			return 2
+		}
+		for _, v := range items {
+			fmt.Fprintf(out, "%s\t%s\t%d\n", v.Key, v.ContentSHA256, v.ArchiveSizeBytes)
+		}
+		return 0
+	case "delete":
+		if len(pos) != 1 {
+			fmt.Fprintln(errw, "usage: forge cache delete <key>")
+			return 2
+		}
+		if e := c.CacheDelete(ctx, pos[0]); e != nil {
+			fmt.Fprintln(errw, e)
+			return 2
+		}
+		return 0
+	}
+	fmt.Fprintln(errw, "unknown cache command")
+	return 2
 }
 
 func artifacts(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -356,7 +401,17 @@ func run(ctx context.Context, args []string, directory string, stdout, stderr io
 		fmt.Fprintf(stderr, "create artifact session: %v\n", err)
 		return 2
 	}
-	result := (runner.Runner{Executor: jobExecutor, Output: stdout, ErrorOutput: stderr, MaxParallel: *jobs, Artifacts: artifactSession}).Run(ctx, graph)
+	cacheStore, err := cache.Open(filepath.Join(artifactRoot, "cache"), artifact.DefaultLimits())
+	if err != nil {
+		fmt.Fprintf(stderr, "open temporary cache store: %v\n", err)
+		return 2
+	}
+	cacheSession, err := cache.NewSession(directory, filepath.Join(artifactRoot, "cache-work"), cache.NewLocalRemote(cacheStore, directory))
+	if err != nil {
+		fmt.Fprintf(stderr, "create cache session: %v\n", err)
+		return 2
+	}
+	result := (runner.Runner{Executor: jobExecutor, Output: stdout, ErrorOutput: stderr, MaxParallel: *jobs, Artifacts: artifactSession, Cache: cacheSession}).Run(ctx, graph)
 	runner.PrintSummary(stdout, graph, result)
 	if result.Interrupted {
 		fmt.Fprintln(stderr, "pipeline interrupted")

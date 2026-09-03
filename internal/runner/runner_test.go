@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	cachepkg "github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
@@ -34,6 +35,96 @@ type blockingArtifacts struct {
 	entered chan struct{}
 	release chan struct{}
 	err     error
+}
+
+type failingCache struct{ saves int }
+
+func (c *failingCache) Restore(context.Context, []config.CacheEntry, io.Writer)    {}
+func (c *failingCache) Save(_ context.Context, _ []config.CacheEntry, _ io.Writer) { c.saves++ }
+
+func TestCacheSaveFailureDoesNotFailJobOrBlockDependent(t *testing.T) {
+	cache := &failingCache{}
+	dir := t.TempDir()
+	graph := graphFor(t, map[string]config.Job{
+		"build": {Cache: config.Cache{Save: []config.CacheEntry{{Key: "save-v1", Path: "missing"}}}, Steps: []config.Step{{Run: "true"}}},
+		"test":  {Needs: []string{"build"}, Steps: []config.Step{{Run: "true"}}},
+	})
+	result := (Runner{Executor: executor.Local{Directory: dir}, Cache: cache}).Run(context.Background(), graph)
+	if !result.Succeeded() || result.States["build"] != Passed || result.States["test"] != Passed || cache.saves < 1 {
+		t.Fatalf("cache save must remain an optimization: result=%+v saves=%d", result, cache.saves)
+	}
+}
+
+type lifecycleCacheRemote struct {
+	uploadErr, commitErr error
+	committed, existing  cachepkg.Metadata
+	commitCalls          int
+}
+
+func (r *lifecycleCacheRemote) Lookup(context.Context, string) (cachepkg.Metadata, error) {
+	return cachepkg.Metadata{}, cachepkg.ErrCacheMiss
+}
+func (r *lifecycleCacheRemote) Download(context.Context, cachepkg.Metadata, io.Writer) error {
+	return nil
+}
+func (r *lifecycleCacheRemote) Upload(context.Context, cachepkg.Metadata, io.Reader) error {
+	return r.uploadErr
+}
+func (r *lifecycleCacheRemote) Commit(_ context.Context, m cachepkg.Metadata) error {
+	r.commitCalls++
+	if r.existing.Key != "" && r.existing.Key == m.Key {
+		return errors.New("cache key conflict")
+	}
+	r.committed = m
+	return r.commitErr
+}
+
+func runCacheFailureLifecycle(t *testing.T, remote cachepkg.Remote) (Result, *lifecycleCacheRemote) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".cache"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, ".cache/demo"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".cache/demo/value"), []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := cachepkg.NewSession(dir, filepath.Join(t.TempDir(), "tmp"), remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := graphFor(t, map[string]config.Job{"build": {Cache: config.Cache{Save: []config.CacheEntry{{Key: "lifecycle-v1", Path: ".cache/demo"}}}, Steps: []config.Step{{Run: "true"}}}, "test": {Needs: []string{"build"}, Steps: []config.Step{{Run: "true"}}}})
+	return (Runner{Executor: executor.Local{Directory: dir}, Cache: session}).Run(context.Background(), graph), remote.(*lifecycleCacheRemote)
+}
+
+func TestCacheUploadFailureDoesNotFailJobOrBlockDependent(t *testing.T) {
+	remote := &lifecycleCacheRemote{uploadErr: errors.New("injected upload failure")}
+	result, _ := runCacheFailureLifecycle(t, remote)
+	if !result.Succeeded() || result.States["build"] != Passed || result.States["test"] != Passed {
+		t.Fatalf("result=%+v", result)
+	}
+}
+func TestCacheCommitFailureDoesNotFailJobOrBlockDependent(t *testing.T) {
+	remote := &lifecycleCacheRemote{commitErr: errors.New("injected commit failure")}
+	result, _ := runCacheFailureLifecycle(t, remote)
+	if !result.Succeeded() || result.States["build"] != Passed || result.States["test"] != Passed {
+		t.Fatalf("result=%+v", result)
+	}
+}
+func TestCacheConflictDoesNotFailJobOrOverwriteEntry(t *testing.T) {
+	remote := &lifecycleCacheRemote{existing: cachepkg.Metadata{Key: "lifecycle-v1", ContentSHA256: "content-a"}}
+	result, used := runCacheFailureLifecycle(t, remote)
+	if !result.Succeeded() || result.States["build"] != Passed || result.States["test"] != Passed {
+		t.Fatalf("result=%+v", result)
+	}
+	if used.commitCalls != 1 {
+		t.Fatalf("cache publication not attempted: calls=%d", used.commitCalls)
+	}
+	if used.existing.ContentSHA256 != "content-a" {
+		t.Fatalf("existing cache overwritten: %+v", used.existing)
+	}
 }
 
 func (b blockingArtifacts) Restore(context.Context, string, []config.ArtifactDownload) error {

@@ -80,6 +80,16 @@ func (c *Client) Runners(ctx context.Context) ([]store.Runner, error) {
 	err := c.do(ctx, http.MethodGet, "/v1/runners", nil, &out)
 	return out.Runners, err
 }
+func (c *Client) CacheList(ctx context.Context, limit int) ([]store.CacheMetadata, error) {
+	var out struct {
+		Cache []store.CacheMetadata `json:"cache"`
+	}
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/cache?limit=%d", limit), nil, &out)
+	return out.Cache, err
+}
+func (c *Client) CacheDelete(ctx context.Context, key string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/cache/"+key, nil, nil)
+}
 func (c *Client) Inspect(ctx context.Context, id string) (*store.Run, error) {
 	var out store.Run
 	err := c.do(ctx, http.MethodGet, "/v1/runs/"+id, nil, &out)

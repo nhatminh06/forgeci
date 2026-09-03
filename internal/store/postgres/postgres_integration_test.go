@@ -23,7 +23,7 @@ func integrationStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(context.Background(), `TRUNCATE runners, job_runs, pipeline_runs CASCADE`); err != nil {
+	if _, err := s.pool.Exec(context.Background(), `TRUNCATE cache_entries, runners, job_runs, pipeline_runs CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)

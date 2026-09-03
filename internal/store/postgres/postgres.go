@@ -25,6 +25,8 @@ var migrations embed.FS
 type Store struct {
 	pool              *pgxpool.Pool
 	artifactRetention time.Duration
+	cacheRetention    time.Duration
+	cacheMaxBytes     int64
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
@@ -37,7 +39,7 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	s := &Store{pool: pool, artifactRetention: 168 * time.Hour}
+	s := &Store{pool: pool, artifactRetention: 168 * time.Hour, cacheRetention: 168 * time.Hour}
 	if err := s.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)

@@ -11,6 +11,7 @@ import (
 
 var jobNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 var artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+var cacheKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 func Validate(cfg *Pipeline) error {
 	if cfg.Version != 1 {
@@ -49,6 +50,9 @@ func Validate(cfg *Pipeline) error {
 		if err := validateArtifacts(name, job, cfg.Jobs); err != nil {
 			return err
 		}
+		if err := validateCache(name, job); err != nil {
+			return err
+		}
 		seen := make(map[string]struct{}, len(job.Needs))
 		for _, dependency := range job.Needs {
 			if dependency == name {
@@ -64,6 +68,67 @@ func Validate(cfg *Pipeline) error {
 		}
 	}
 	return nil
+}
+
+func validateCache(jobName string, job Job) error {
+	restore := make(map[string]string, len(job.Cache.Restore))
+	for _, item := range job.Cache.Restore {
+		if !cacheKeyPattern.MatchString(item.Key) {
+			return fmt.Errorf("job %q has invalid cache restore key %q", jobName, item.Key)
+		}
+		if !safeCachePath(item.Path) {
+			return fmt.Errorf("job %q cache restore key %q has unsafe path %q", jobName, item.Key, item.Path)
+		}
+		if _, exists := restore[item.Key]; exists {
+			return fmt.Errorf("job %q has duplicate cache restore key %q", jobName, item.Key)
+		}
+		restore[item.Key] = item.Path
+	}
+	save := make(map[string]string, len(job.Cache.Save))
+	for _, item := range job.Cache.Save {
+		if !cacheKeyPattern.MatchString(item.Key) {
+			return fmt.Errorf("job %q has invalid cache save key %q", jobName, item.Key)
+		}
+		if !safeCachePath(item.Path) {
+			return fmt.Errorf("job %q cache save key %q has unsafe path %q", jobName, item.Key, item.Path)
+		}
+		if _, exists := save[item.Key]; exists {
+			return fmt.Errorf("job %q has duplicate cache save key %q", jobName, item.Key)
+		}
+		save[item.Key] = item.Path
+		if restorePath, exists := restore[item.Key]; exists && restorePath != item.Path {
+			return fmt.Errorf("job %q cache key %q has conflicting restore/save paths", jobName, item.Key)
+		}
+	}
+	for _, item := range job.Cache.Restore {
+		for _, artifact := range job.Artifacts.Download {
+			if cachePathsConflict(item.Path, artifact.Into) {
+				return fmt.Errorf("job %q cache restore path %q conflicts with artifact download path %q", jobName, item.Path, artifact.Into)
+			}
+		}
+	}
+	for _, item := range job.Cache.Restore {
+		for _, artifact := range job.Artifacts.Upload {
+			if cachePathsConflict(item.Path, artifact.Path) {
+				return fmt.Errorf("job %q cache restore path %q conflicts with artifact upload path %q", jobName, item.Path, artifact.Path)
+			}
+		}
+	}
+	return nil
+}
+
+func safeCachePath(value string) bool {
+	if value == "" || value == "." || path.IsAbs(value) || strings.ContainsRune(value, 0) || strings.Contains(value, `\`) || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return false
+	}
+	clean := path.Clean(value)
+	return clean == value && clean != ".." && !strings.HasPrefix(clean, "../")
+}
+
+func cachePathsConflict(a, b string) bool {
+	a = path.Clean(a)
+	b = path.Clean(b)
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
 func validateArtifacts(jobName string, job Job, jobs map[string]Job) error {

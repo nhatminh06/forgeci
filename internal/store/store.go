@@ -110,10 +110,12 @@ type JobLease struct {
 
 // JobDefinition is the wire-neutral executable portion of a pipeline job.
 type JobDefinition struct {
-	Image     *string               `json:"image,omitempty"`
-	Steps     []string              `json:"steps"`
-	Uploads   []ArtifactDeclaration `json:"uploads,omitempty"`
-	Downloads []ArtifactDownload    `json:"downloads,omitempty"`
+	Image        *string               `json:"image,omitempty"`
+	Steps        []string              `json:"steps"`
+	Uploads      []ArtifactDeclaration `json:"uploads,omitempty"`
+	Downloads    []ArtifactDownload    `json:"downloads,omitempty"`
+	CacheRestore []CacheDeclaration    `json:"cache_restore,omitempty"`
+	CacheSave    []CacheDeclaration    `json:"cache_save,omitempty"`
 }
 
 type ArtifactDeclaration struct {
@@ -124,6 +126,20 @@ type ArtifactDownload struct {
 	From string `json:"from"`
 	Name string `json:"name"`
 	Into string `json:"into"`
+}
+
+type CacheDeclaration struct {
+	Key  string `json:"key"`
+	Path string `json:"path"`
+}
+
+type CacheMetadata struct {
+	Workspace, Key, RootName, RootKind string
+	ContentSHA256, BlobSHA256, Format  string
+	ArchiveSizeBytes, LogicalSizeBytes int64
+	EntryCount                         int
+	CreatedAt, LastAccessedAt          time.Time
+	ExpiresAt, DeletedAt               *time.Time
 }
 
 type LeaseHeartbeat struct {
@@ -157,6 +173,15 @@ type JobSchedulerStore interface {
 	HeartbeatJobLeases(context.Context, string, []LeaseHeartbeat, time.Time) ([]LeaseHeartbeatResult, error)
 	CompleteJob(context.Context, ArtifactOwnership, JobStatus, *string) error
 	ExpireJobLeases(context.Context, time.Time) error
+}
+
+type CacheStore interface {
+	LookupCache(context.Context, string, string, time.Time) (*CacheMetadata, error)
+	CommitCache(context.Context, CacheMetadata) error
+	ListCache(context.Context, string, int) ([]CacheMetadata, error)
+	DeleteCache(context.Context, string, string) error
+	ExpireCache(context.Context, time.Time, int64) ([]string, error)
+	LiveCacheBlobs(context.Context) (map[string]struct{}, error)
 }
 
 type SourceSnapshot struct {

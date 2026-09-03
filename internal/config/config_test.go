@@ -158,6 +158,38 @@ func TestLoadImageReferences(t *testing.T) {
 	}
 }
 
+func TestCacheValidation(t *testing.T) {
+	valid := &Pipeline{Version: 1, Jobs: map[string]Job{"build": {
+		Steps: []Step{{Run: "true"}},
+		Cache: Cache{Restore: []CacheEntry{{Key: "go-build-linux-amd64-v1", Path: ".cache/go"}}, Save: []CacheEntry{{Key: "go-build-linux-amd64-v1", Path: ".cache/go"}}},
+	}}}
+	if err := Validate(valid); err != nil {
+		t.Fatalf("valid cache rejected: %v", err)
+	}
+	cases := []struct {
+		name  string
+		cache Cache
+		want  string
+	}{
+		{"empty key", Cache{Restore: []CacheEntry{{Path: ".cache"}}}, "invalid cache restore key"},
+		{"space key", Cache{Restore: []CacheEntry{{Key: "go cache", Path: ".cache"}}}, "invalid cache restore key"},
+		{"slash key", Cache{Restore: []CacheEntry{{Key: "go/cache", Path: ".cache"}}}, "invalid cache restore key"},
+		{"absolute path", Cache{Restore: []CacheEntry{{Key: "go-v1", Path: "/tmp/cache"}}}, "unsafe path"},
+		{"traversal path", Cache{Restore: []CacheEntry{{Key: "go-v1", Path: "../cache"}}}, "unsafe path"},
+		{"duplicate restore", Cache{Restore: []CacheEntry{{Key: "go-v1", Path: "a"}, {Key: "go-v1", Path: "b"}}}, "duplicate cache restore"},
+		{"duplicate save", Cache{Save: []CacheEntry{{Key: "go-v1", Path: "a"}, {Key: "go-v1", Path: "a"}}}, "duplicate cache save"},
+		{"conflicting paths", Cache{Restore: []CacheEntry{{Key: "go-v1", Path: "a"}}, Save: []CacheEntry{{Key: "go-v1", Path: "b"}}}, "conflicting restore/save"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Pipeline{Version: 1, Jobs: map[string]Job{"build": {Steps: []Step{{Run: "true"}}, Cache: tc.cache}}}
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestJobNamePolicy(t *testing.T) {
 	accepted := []string{"build", "test-1", "lint_job", "A", "0build"}
 	for _, name := range accepted {

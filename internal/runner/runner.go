@@ -40,6 +40,11 @@ type ArtifactLifecycle interface {
 	Publish(context.Context, string, []config.ArtifactUpload) error
 }
 
+type CacheLifecycle interface {
+	Restore(context.Context, []config.CacheEntry, io.Writer)
+	Save(context.Context, []config.CacheEntry, io.Writer)
+}
+
 type Result struct {
 	States        map[string]State
 	Interrupted   bool
@@ -65,6 +70,7 @@ type Runner struct {
 	MaxParallel int
 	Observer    JobStateObserver
 	Artifacts   ArtifactLifecycle
+	Cache       CacheLifecycle
 }
 
 type completion struct {
@@ -207,6 +213,9 @@ func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output sync
 			return Failed, !artifact.IsPipelineError(err)
 		}
 	}
+	if r.Cache != nil {
+		r.Cache.Restore(ctx, node.Job.Cache.Restore, output.stdout)
+	}
 	if jobExecutor, ok := r.Executor.(JobExecutor); ok {
 		execution := jobExecutor.RunJob(ctx, node.Name, node.Job, output.stdout, output.stderr)
 		state, internal := finishJobExecution(ctx, node.Name, execution, output.stdout)
@@ -245,6 +254,9 @@ func (r Runner) publish(ctx context.Context, node *pipeline.Node, output io.Writ
 			fmt.Fprintf(output, "x %s (publish artifacts: %v)\n\n", node.Name, err)
 			return Failed, !artifact.IsPipelineError(err)
 		}
+	}
+	if r.Cache != nil {
+		r.Cache.Save(ctx, node.Job.Cache.Save, output)
 	}
 	fmt.Fprintf(output, "✓ %s\n\n", node.Name)
 	return Passed, false
