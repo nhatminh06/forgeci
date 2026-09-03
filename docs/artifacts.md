@@ -35,7 +35,7 @@ All blobs are present before one PostgreSQL transaction inserts the complete `(r
 
 ## Restore and security
 
-Downloads occur after a consumer becomes running and before its first step. Even in the currently shared run workspace, a runner fetches the committed CAS object through the control plane. It streams into a temporary file, verifies size and blob SHA-256, extracts into a temporary directory with entry and byte limits, rebuilds the canonical manifest, verifies the logical digest, and renames the single root into `<workspace>/<into>/<root-name>`.
+Downloads occur after a consumer becomes running and before its first step. Its runner fetches the committed CAS object through the control plane into a fresh job workspace. It streams into a temporary file, verifies size and blob SHA-256, extracts into a temporary directory with entry and byte limits, rebuilds the canonical manifest, verifies the logical digest, and renames the single root into `<workspace>/<into>/<root-name>`.
 
 Extraction rejects absolute, non-canonical, or traversing paths, hard links, special nodes, unsafe symlinks, and symlink parents. An existing final root is never overwritten. Temporary capture, upload, download, and extraction data is removed after success, failure, or cancellation.
 
@@ -57,4 +57,4 @@ The API routes are `GET /v1/runs/{id}/artifacts` and `GET /v1/runs/{id}/artifact
 
 Direct `forge run` uses the same capture, verification, and restore semantics in a temporary local CAS, without PostgreSQL or a server. The CAS is discarded at command exit. Server-backed artifacts survive runner and server restarts.
 
-All jobs in a run are still pinned to one runner and share one isolated run workspace. Explicit artifacts prove durable output transfer but do not prohibit incidental communication through that workspace. Artifacts are immutable named outputs, not a build cache: there are no cache keys, lookup policy, mutable replacement, or eviction-based reuse.
+Jobs may run on different runners and never share a mutable workspace. Only explicitly declared direct-dependency artifacts cross job boundaries. Artifacts are immutable named outputs of one run, not a build cache: there are no cache keys, cross-run lookup policy, mutable replacement, or eviction-based reuse.
