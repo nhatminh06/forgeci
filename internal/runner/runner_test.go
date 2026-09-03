@@ -36,6 +36,24 @@ type blockingArtifacts struct {
 	err     error
 }
 
+type failingCache struct{ saves int }
+
+func (c *failingCache) Restore(context.Context, []config.CacheEntry, io.Writer)    {}
+func (c *failingCache) Save(_ context.Context, _ []config.CacheEntry, _ io.Writer) { c.saves++ }
+
+func TestCacheSaveFailureDoesNotFailJobOrBlockDependent(t *testing.T) {
+	cache := &failingCache{}
+	dir := t.TempDir()
+	graph := graphFor(t, map[string]config.Job{
+		"build": {Cache: config.Cache{Save: []config.CacheEntry{{Key: "save-v1", Path: "missing"}}}, Steps: []config.Step{{Run: "true"}}},
+		"test":  {Needs: []string{"build"}, Steps: []config.Step{{Run: "true"}}},
+	})
+	result := (Runner{Executor: executor.Local{Directory: dir}, Cache: cache}).Run(context.Background(), graph)
+	if !result.Succeeded() || result.States["build"] != Passed || result.States["test"] != Passed || cache.saves < 1 {
+		t.Fatalf("cache save must remain an optimization: result=%+v saves=%d", result, cache.saves)
+	}
+}
+
 func (b blockingArtifacts) Restore(context.Context, string, []config.ArtifactDownload) error {
 	return nil
 }
