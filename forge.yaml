@@ -36,7 +36,7 @@ jobs:
           name: self-binaries
           into: binary-input
     steps:
-      - run: test -x binary-input/forge && test -x binary-input/forge-server && test -x binary-input/forge-runner && test -f binary-input/build-marker.txt && binary-input/forge --help && binary-input/forge-server --help && binary-input/forge-runner --help
+      - run: test -x binary-input/dist/forge && test -x binary-input/dist/forge-server && test -x binary-input/dist/forge-runner && test -f binary-input/dist/build-marker.txt && binary-input/dist/forge --help && binary-input/dist/forge-server --help && binary-input/dist/forge-runner --help
   docker-smoke:
     needs: [build]
     image: alpine:3.20
@@ -46,4 +46,4 @@ jobs:
           name: self-binaries
           into: docker-input
     steps:
-      - run: test -f docker-input/build-marker.txt && printf 'forgeci-docker-smoke-stdout\n' && printf 'forgeci-docker-smoke-stderr\n' >&2
+      - run: test -f docker-input/dist/build-marker.txt && printf 'forgeci-docker-smoke-stdout\n' && printf 'forgeci-docker-smoke-stderr\n' >&2
