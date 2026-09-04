@@ -34,11 +34,17 @@ type fakeStore struct {
 	artifact  *store.Artifact
 	logs      []store.JobLogChunk
 	logErr    error
+	logsOnce  bool
+	logCalls  int
 }
 
 func (s *fakeStore) AppendJobLog(context.Context, store.JobLogChunk) error    { return nil }
 func (s *fakeStore) AppendJobLogs(context.Context, []store.JobLogChunk) error { return nil }
 func (s *fakeStore) ListJobLogs(context.Context, string, string, int64, int) ([]store.JobLogChunk, error) {
+	s.logCalls++
+	if s.logsOnce && s.logCalls > 1 {
+		return nil, s.logErr
+	}
 	return s.logs, s.logErr
 }
 
@@ -70,7 +76,7 @@ func TestLogsValidationAndBinaryPayload(t *testing.T) {
 
 func TestFollowReturnsFinalUnreadChunksBeforeTerminalExit(t *testing.T) {
 	id := "00000000-0000-4000-8000-000000000001"
-	fs := &fakeStore{logs: []store.JobLogChunk{{RunID: id, JobName: "build", Sequence: 3, Stream: store.JobLogStdout, Payload: []byte("final")}}}
+	fs := &fakeStore{logsOnce: true, logs: []store.JobLogChunk{{RunID: id, JobName: "build", Sequence: 3, Stream: store.JobLogStdout, Payload: []byte("final")}}}
 	h := (Server{Manager: terminalManager{&fakeManager{}}, Store: fs}).Handler()
 	resp := request(t, h, http.MethodGet, "/v1/runs/"+id+"/logs?job=build&after=2&follow=true", "")
 	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "ZmluYWw=") {
