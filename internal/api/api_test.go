@@ -28,6 +28,18 @@ type fakeStore struct {
 	artifact  *store.Artifact
 }
 
+func (s *fakeStore) AppendJobLog(context.Context, store.JobLogChunk) error { return nil }
+func (s *fakeStore) ListJobLogs(context.Context, string, string, int64, int) ([]store.JobLogChunk, error) {
+	return nil, store.ErrNotFound
+}
+
+func TestLogsRejectsMalformedRunID(t *testing.T) {
+	handler := (Server{Manager: &fakeManager{}, Store: &fakeStore{}}).Handler()
+	if got := request(t, handler, http.MethodGet, "/v1/runs/not-a-uuid/logs?job=build", "").Code; got != http.StatusNotFound {
+		t.Fatalf("status=%d", got)
+	}
+}
+
 func (s *fakeStore) Ping(ctx context.Context) error { return s.pingErr }
 func (s *fakeStore) ListRunners(context.Context) ([]store.Runner, error) {
 	return s.runners, nil

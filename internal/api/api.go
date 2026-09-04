@@ -185,6 +185,10 @@ func (s Server) run(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
 	if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
 		logs, ok := s.Store.(store.JobLogStore)
 		if !ok {
@@ -226,10 +230,6 @@ func (s Server) run(w http.ResponseWriter, r *http.Request) {
 			items = []store.JobLogChunk{}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"logs": items})
-		return
-	}
-	if _, err := uuid.Parse(id); err != nil {
-		writeError(w, http.StatusNotFound, "run not found")
 		return
 	}
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
