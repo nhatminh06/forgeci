@@ -677,9 +677,20 @@ type remoteLogWriter struct {
 func (w *remoteLogWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(p) > 64<<10 {
-		p = p[:64<<10]
+	for offset := 0; offset < len(p); {
+		n := len(p) - offset
+		if n > 64<<10 {
+			n = 64 << 10
+		}
+		if err := w.append(p[offset : offset+n]); err != nil {
+			return offset, err
+		}
+		offset += n
 	}
+	return len(p), nil
+}
+
+func (w *remoteLogWriter) append(p []byte) error {
 	n := *w.seq + 1
 	v := url.Values{}
 	v.Set("runner_id", w.rr.id)
@@ -689,22 +700,23 @@ func (w *remoteLogWriter) Write(p []byte) (int, error) {
 	body, _ := json.Marshal(map[string]any{"runner_id": w.rr.id, "run_id": w.lease.RunID, "lease_id": w.lease.LeaseID, "generation": w.lease.Generation, "job_name": w.lease.JobName, "sequence": n, "stream": w.stream, "payload": p})
 	req, e := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 	if e != nil {
-		return 0, e
+		return e
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", w.rr.config.ServerToken))
 	resp, e := w.rr.httpClient.Do(req)
 	if e != nil {
-		return 0, e
+		return e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		return 0, fmt.Errorf("append job log: %s", resp.Status)
+		return fmt.Errorf("append job log: %s", resp.Status)
 	}
 	*w.seq = n
 	if w.dst != nil {
-		return w.dst.Write(p)
+		_, e = w.dst.Write(p)
+		return e
 	}
-	return len(p), nil
+	return nil
 }
 
 func (t remoteCacheTransport) query(path string) string {

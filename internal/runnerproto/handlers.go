@@ -518,6 +518,8 @@ type jobLogAppendRequest struct {
 	Payload    []byte             `json:"payload"`
 }
 
+const maxJobLogRequest = 1 << 20
+
 func (h *Handlers) JobLogAppend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -528,24 +530,23 @@ func (h *Handlers) JobLogAppend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid log path")
 		return
 	}
+	if r.ContentLength > maxJobLogRequest {
+		writeError(w, http.StatusRequestEntityTooLarge, "log request too large")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJobLogRequest)
 	var req jobLogAppendRequest
 	if !decodeStrict(w, r, &req) {
 		return
 	}
-	if req.RunID == "" {
-		req.RunID = r.URL.Query().Get("run_id")
+	if !validUUID(req.RunID) || !validUUID(req.RunnerID) || !validUUID(req.LeaseID) || req.RunID != r.URL.Query().Get("run_id") || req.RunnerID != r.URL.Query().Get("runner_id") || req.LeaseID != parts[3] || req.JobName != parts[5] || req.Generation < 1 {
+		writeError(w, http.StatusBadRequest, "invalid log ownership")
+		return
 	}
-	if req.RunnerID == "" {
-		req.RunnerID = r.URL.Query().Get("runner_id")
-	}
-	if req.LeaseID == "" {
-		req.LeaseID = parts[3]
-	}
-	if req.JobName == "" {
-		req.JobName = parts[5]
-	}
-	owner, ok := h.artifactOwner(w, r, parts[3], parts[5])
-	if !ok || owner.RunID != req.RunID || owner.RunnerID != req.RunnerID || owner.LeaseID != req.LeaseID || owner.Generation != req.Generation {
+	run, err := h.store.GetRun(r.Context(), req.RunID)
+	owner := store.ArtifactOwnership{RunID: req.RunID, RunnerID: req.RunnerID, LeaseID: req.LeaseID, Generation: req.Generation, JobName: req.JobName}
+	if err != nil || !validArtifactLease(run, owner, store.JobRunning) {
+		writeError(w, http.StatusConflict, "invalid or expired log lease")
 		return
 	}
 	logs, ok := h.store.(store.JobLogStore)
