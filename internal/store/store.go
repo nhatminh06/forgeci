@@ -258,7 +258,7 @@ type Store interface {
 
 type JobLogStore interface {
 	AppendJobLog(context.Context, JobLogChunk) error
-	ListJobLogs(context.Context, string, string, int64) ([]JobLogChunk, error)
+	ListJobLogs(context.Context, string, string, int64, int) ([]JobLogChunk, error)
 }
 
 type ArtifactStore interface {
