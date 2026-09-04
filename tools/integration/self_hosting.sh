@@ -7,10 +7,14 @@ pg="forgeci-$suffix-postgres"
 server_pid= runner_a_pid= runner_b_pid=
 keep=${FORGECI_DIAGNOSTICS_DIR:-}
 cleanup() {
+  if [[ -n "$keep" ]]; then
+    mkdir -p "$keep"
+    cp "$root/server/server.log" "$root/runner-a/runner.log" "$root/runner-b/runner.log" "$keep/" 2>/dev/null || true
+  fi
   for pid in "$runner_a_pid" "$runner_b_pid" "$server_pid"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done
   for pid in "$runner_a_pid" "$runner_b_pid" "$server_pid"; do [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true; done
   docker rm -f "$pg" >/dev/null 2>&1 || true
-  [[ -n "$keep" ]] || rm -rf "$root"
+  rm -rf "$root"
 }
 trap cleanup EXIT INT TERM
 fail() { echo "self-hosting failure: $*" >&2; cat "$root/server/server.log" "$root/runner-a/runner.log" "$root/runner-b/runner.log" 2>/dev/null || true; docker logs "$pg" 2>/dev/null || true; exit 1; }
