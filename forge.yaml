@@ -1,0 +1,49 @@
+version: 1
+jobs:
+  format:
+    steps:
+      - run: test -z "$(gofmt -l .)"
+  vet:
+    steps:
+      - run: go vet ./...
+  unit:
+    cache:
+      restore:
+        - key: forgeci-self-unit-gocache-v1
+          path: .forgeci-cache/unit-gocache
+      save:
+        - key: forgeci-self-unit-gocache-v1
+          path: .forgeci-cache/unit-gocache
+    steps:
+      - run: GOCACHE="$PWD/.forgeci-cache/unit-gocache" go test ./...
+  race:
+    needs: [unit]
+    steps:
+      - run: go test -race ./...
+  build:
+    needs: [format, vet, unit]
+    steps:
+      - run: mkdir -p dist && go build -o dist/forge ./cmd/forge && go build -o dist/forge-server ./cmd/forge-server && go build -o dist/forge-runner ./cmd/forge-runner && printf 'forgeci-self-host-build\n' > dist/build-marker.txt
+    artifacts:
+      upload:
+        - name: self-binaries
+          path: dist
+  binary-smoke:
+    needs: [build]
+    artifacts:
+      download:
+        - from: build
+          name: self-binaries
+          into: binary-input
+    steps:
+      - run: test -x binary-input/forge && test -x binary-input/forge-server && test -x binary-input/forge-runner && test -f binary-input/build-marker.txt && binary-input/forge --help && binary-input/forge-server --help && binary-input/forge-runner --help
+  docker-smoke:
+    needs: [build]
+    image: alpine:3.20
+    artifacts:
+      download:
+        - from: build
+          name: self-binaries
+          into: docker-input
+    steps:
+      - run: test -f docker-input/build-marker.txt && printf 'forgeci-docker-smoke-stdout\n' && printf 'forgeci-docker-smoke-stderr\n' >&2

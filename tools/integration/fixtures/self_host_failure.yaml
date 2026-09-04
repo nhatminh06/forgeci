@@ -1,0 +1,12 @@
+version: 1
+jobs:
+  independent-pass:
+    steps:
+      - run: printf 'forgeci-independent-pass\n'
+  intentional-fail:
+    steps:
+      - run: printf 'forgeci-intentional-failure\n' >&2; exit 17
+  blocked-dependent:
+    needs: [intentional-fail]
+    steps:
+      - run: printf 'must-not-run\n'; exit 1
