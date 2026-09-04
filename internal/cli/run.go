@@ -18,6 +18,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
 	"github.com/nhatminh06/forgeci/internal/runner"
+	"github.com/nhatminh06/forgeci/internal/store"
 )
 
 const helpText = `ForgeCI executes repository-local pipelines.
@@ -89,6 +90,7 @@ func logs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	job := flags.String("job", "", "job name")
 	server := flags.String("server", defaultServer, "control-plane URL")
+	follow := flags.Bool("follow", false, "wait for new durable log chunks")
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || *job == "" {
 		if *job == "" {
 			fmt.Fprintln(stderr, "logs requires --job")
@@ -98,7 +100,13 @@ func logs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	client := newControlClient(*server)
 	var after int64
 	for {
-		items, err := client.JobLogs(ctx, args[0], *job, after, 256)
+		var items []store.JobLogChunk
+		var err error
+		if *follow {
+			items, err = client.JobLogsFollow(ctx, args[0], *job, after, 256)
+		} else {
+			items, err = client.JobLogs(ctx, args[0], *job, after, 256)
+		}
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 2
@@ -112,6 +120,14 @@ func logs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			}
 		}
 		if len(items) < 256 {
+			if *follow && len(items) == 0 {
+				return 0
+			}
+			if !*follow {
+				return 0
+			}
+		}
+		if *follow && len(items) == 0 {
 			return 0
 		}
 	}

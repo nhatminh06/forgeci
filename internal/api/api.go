@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
@@ -225,6 +226,31 @@ func (s Server) run(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "database unavailable")
 			return
+		}
+		if r.URL.Query().Get("follow") == "true" && len(items) == 0 {
+			deadline := time.NewTimer(2 * time.Second)
+			tick := time.NewTicker(100 * time.Millisecond)
+			defer deadline.Stop()
+			defer tick.Stop()
+			terminal := false
+			for len(items) == 0 && !terminal {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-deadline.C:
+					items = []store.JobLogChunk{}
+				case <-tick.C:
+					items, err = logs.ListJobLogs(r.Context(), id, job, after, limit)
+					if err != nil {
+						writeError(w, http.StatusServiceUnavailable, "database unavailable")
+						return
+					}
+					if run, e := s.Manager.Get(r.Context(), id); e == nil && run.FinishedAt != nil {
+						deadline.Stop()
+						terminal = true
+					}
+				}
+			}
 		}
 		if items == nil {
 			items = []store.JobLogChunk{}
