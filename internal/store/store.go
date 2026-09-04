@@ -142,6 +142,22 @@ type CacheMetadata struct {
 	ExpiresAt, DeletedAt               *time.Time
 }
 
+type JobLogStream string
+
+const (
+	JobLogStdout JobLogStream = "stdout"
+	JobLogStderr JobLogStream = "stderr"
+)
+
+type JobLogChunk struct {
+	RunID     string
+	JobName   string
+	Sequence  int64
+	Stream    JobLogStream
+	CreatedAt time.Time
+	Payload   []byte
+}
+
 type LeaseHeartbeat struct {
 	RunID      string `json:"run_id"`
 	JobName    string `json:"job_name"`
@@ -238,6 +254,11 @@ type Store interface {
 	CompleteRun(context.Context, string, string, string, int, RunStatus, *string) error
 	ExpireLeases(context.Context, time.Time) error
 	Close()
+}
+
+type JobLogStore interface {
+	AppendJobLog(context.Context, JobLogChunk) error
+	ListJobLogs(context.Context, string, string, int64) ([]JobLogChunk, error)
 }
 
 type ArtifactStore interface {
