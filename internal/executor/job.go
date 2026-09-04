@@ -32,7 +32,6 @@ func (e Job) RunJob(ctx context.Context, name string, job config.Job, stdout, st
 		return e.Docker.RunJob(ctx, name, job, stdout, stderr)
 	}
 	for _, step := range job.Steps {
-		fmt.Fprintf(stdout, "$ %s\n", step.Run)
 		result := e.Local.Run(ctx, step.Run, stdout, stderr)
 		if result.Err != nil {
 			return result
