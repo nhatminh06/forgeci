@@ -46,14 +46,14 @@ func TestJobLogsLifecycle(t *testing.T) {
 	if err != nil || len(got) != 2 || got[0].Sequence != 2 {
 		t.Fatalf("cursor=%+v err=%v", got, err)
 	}
+	if got[0].CreatedAt.IsZero() {
+		t.Fatal("timestamp zero")
+	}
 	got, err = s.ListJobLogs(ctx, r.ID, "empty", 0, 256)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("empty=%+v err=%v", got, err)
 	}
 	if _, err = s.ListJobLogs(ctx, r.ID, "missing", 0, 256); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("unknown job=%v", err)
-	}
-	if got[0].CreatedAt.IsZero() {
-		t.Fatal("timestamp zero")
 	}
 }
