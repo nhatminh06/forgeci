@@ -20,6 +20,12 @@ type fakeManager struct {
 	cancelErr  error
 	pingErr    error
 }
+type terminalManager struct{ *fakeManager }
+
+func (m terminalManager) Get(context.Context, string) (*store.Run, error) {
+	return &store.Run{ID: "00000000-0000-4000-8000-000000000001", Status: store.RunPassed, FinishedAt: ptr(time.Now().UTC())}, nil
+}
+func ptr(t time.Time) *time.Time { return &t }
 
 type fakeStore struct {
 	runners   []store.Runner
@@ -59,6 +65,16 @@ func TestLogsValidationAndBinaryPayload(t *testing.T) {
 	fs.logErr = errors.New("db down")
 	if got := request(t, h, http.MethodGet, "/v1/runs/"+id+"/logs?job=build", "").Code; got != http.StatusServiceUnavailable {
 		t.Fatalf("error status=%d", got)
+	}
+}
+
+func TestFollowReturnsFinalUnreadChunksBeforeTerminalExit(t *testing.T) {
+	id := "00000000-0000-4000-8000-000000000001"
+	fs := &fakeStore{logs: []store.JobLogChunk{{RunID: id, JobName: "build", Sequence: 3, Stream: store.JobLogStdout, Payload: []byte("final")}}}
+	h := (Server{Manager: terminalManager{&fakeManager{}}, Store: fs}).Handler()
+	resp := request(t, h, http.MethodGet, "/v1/runs/"+id+"/logs?job=build&after=2&follow=true", "")
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "ZmluYWw=") {
+		t.Fatalf("code=%d body=%s", resp.Code, resp.Body.String())
 	}
 }
 

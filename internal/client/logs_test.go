@@ -26,6 +26,19 @@ func TestJobLogsRequestAndBinaryDecode(t *testing.T) {
 	}
 }
 
+func TestJobLogsFollowPreservesCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("after") != "9" || r.URL.Query().Get("follow") != "true" {
+			t.Fatalf("request=%s", r.URL.String())
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"logs": []store.JobLogChunk{}})
+	}))
+	defer server.Close()
+	if _, err := New(server.URL).JobLogsFollow(context.Background(), "run", "job", 9, 256); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestJobLogsHTTPAndMalformedResponses(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

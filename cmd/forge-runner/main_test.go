@@ -141,6 +141,52 @@ func TestRemoteLogWriterLargeAndPartialCancellation(t *testing.T) {
 	}
 }
 
+func TestUploadLogQueueAcknowledgesOnlyAfterResponse(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAck := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAck()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/logs") {
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	queue := runner.NewPendingLogQueue()
+	if _, err := queue.Enqueue(context.Background(), store.JobLogStdout, []byte("final")); err != nil {
+		t.Fatal(err)
+	}
+	queue.Close()
+	rr := &RemoteRunner{id: "runner", config: Config{ServerAddr: server.URL, ServerToken: "token"}, httpClient: server.Client()}
+	done := make(chan struct{})
+	go func() {
+		rr.uploadLogQueue(context.Background(), jobLease{RunID: "run", LeaseID: "lease", Generation: 1, JobName: "job"}, queue)
+		close(done)
+	}()
+	<-entered
+	if queue.PendingBytes() == 0 {
+		t.Fatal("log was acknowledged before server response")
+	}
+	select {
+	case <-done:
+		t.Fatal("uploader returned before final acknowledgement")
+	default:
+	}
+	releaseAck()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("uploader did not drain after acknowledgement")
+	}
+	if queue.PendingBytes() != 0 || queue.Err() != nil {
+		t.Fatalf("pending=%d err=%v", queue.PendingBytes(), queue.Err())
+	}
+}
+
 func TestLocalLeaseDeadlineCancelsActiveWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	rr := &RemoteRunner{active: map[string]*activeJob{"lease": {lease: jobLease{ExpiresAt: time.Now().Add(20 * time.Millisecond)}, cancel: cancel}}, shutdownChan: make(chan struct{})}

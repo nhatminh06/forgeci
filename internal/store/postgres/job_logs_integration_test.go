@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -55,6 +56,33 @@ func TestJobLogsLifecycle(t *testing.T) {
 	}
 	if _, err = s.ListJobLogs(ctx, r.ID, "missing", 0, 256); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("unknown job=%v", err)
+	}
+}
+
+func TestAcknowledgedLogsSurviveStoreReopenAndAbortedJob(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	r, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "x", PipelineYAML: []byte("version: 1"), PipelineSHA256: strings.Repeat("c", 64), Workspace: "/logs-reopen", MaxParallel: 1, Jobs: []store.Job{{Name: "build"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := store.JobLogChunk{RunID: r.ID, JobName: "build", Sequence: 1, Stream: store.JobLogStdout, Payload: []byte("acknowledged prefix")}
+	if err := s.AppendJobLog(ctx, chunk); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateJob(ctx, r.ID, "build", store.JobAborted, nil); err != nil {
+		t.Fatal(err)
+	}
+	url := os.Getenv("TEST_DATABASE_URL")
+	s.Close()
+	reopened, err := Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.ListJobLogs(ctx, r.ID, "build", 0, 10)
+	if err != nil || len(got) != 1 || string(got[0].Payload) != "acknowledged prefix" {
+		t.Fatalf("logs=%+v err=%v", got, err)
 	}
 }
 
