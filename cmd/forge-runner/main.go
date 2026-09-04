@@ -6,9 +6,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +29,8 @@ import (
 	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
+	"github.com/nhatminh06/forgeci/internal/runner"
+	"github.com/nhatminh06/forgeci/internal/runnerproto"
 	"github.com/nhatminh06/forgeci/internal/runworkspace"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store"
@@ -581,7 +585,21 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 			return
 		}
 	}
-	result := (executor.Job{Local: local, Docker: docker}).RunJob(ctx, lease.JobName, job, os.Stdout, os.Stderr)
+	logQueue := runner.NewPendingLogQueue()
+	uploadDone := make(chan struct{})
+	go func() { defer close(uploadDone); rr.uploadLogQueue(ctx, lease, logQueue) }()
+	stdout := &remoteLogWriter{ctx: ctx, queue: logQueue, stream: store.JobLogStdout, dst: os.Stdout}
+	stderr := &remoteLogWriter{ctx: ctx, queue: logQueue, stream: store.JobLogStderr, dst: os.Stderr}
+	result := (executor.Job{Local: local, Docker: docker}).RunJob(ctx, lease.JobName, job, stdout, stderr)
+	// Closing stops new writes and lets the uploader drain every acknowledged
+	// prefix before the lease is completed.
+	logQueue.Close()
+	<-uploadDone
+	if logErr := logQueue.Err(); logErr != nil && result.Err == nil {
+		message := fmt.Sprintf("durable log upload failed: %v", logErr)
+		_ = rr.sendJobComplete(lease, "ERROR", &message)
+		return
+	}
 	if result.Err != nil {
 		status := "FAILED"
 		if ctx.Err() != nil {
@@ -659,6 +677,116 @@ type remoteCacheTransport struct {
 	rr                      *RemoteRunner
 	runID, leaseID, jobName string
 	generation              int
+}
+
+type remoteLogWriter struct {
+	ctx    context.Context
+	queue  *runner.PendingLogQueue
+	stream store.JobLogStream
+	dst    io.Writer
+}
+
+func (w *remoteLogWriter) Write(p []byte) (int, error) {
+	for offset := 0; offset < len(p); {
+		n := len(p) - offset
+		if n > runnerproto.MaxLogChunkBytes {
+			n = runnerproto.MaxLogChunkBytes
+		}
+		if _, err := w.queue.Enqueue(w.ctx, w.stream, p[offset:offset+n]); err != nil {
+			return offset, err
+		}
+		if w.dst != nil {
+			if _, err := w.dst.Write(p[offset : offset+n]); err != nil {
+				return offset, err
+			}
+		}
+		offset += n
+	}
+	return len(p), nil
+}
+
+func (rr *RemoteRunner) uploadLogQueue(ctx context.Context, lease jobLease, queue *runner.PendingLogQueue) {
+	for {
+		chunks, err := queue.WaitBatch(ctx, runnerproto.MaxLogChunksPerRequest, runnerproto.MaxLogAppendBodyBytes)
+		if err != nil {
+			return
+		}
+		if err = rr.appendLogBatchWithRetry(ctx, lease, chunks); err != nil {
+			queue.Fail(err)
+			return
+		}
+		if err = queue.Ack(len(chunks)); err != nil {
+			queue.Fail(err)
+			return
+		}
+	}
+}
+
+const (
+	logUploadAttempts  = 5
+	logUploadBaseDelay = 100 * time.Millisecond
+	logUploadMaxDelay  = 2 * time.Second
+)
+
+func (rr *RemoteRunner) appendLogBatchWithRetry(ctx context.Context, lease jobLease, chunks []runner.PendingLogChunk) error {
+	var err error
+	for attempt := 0; attempt < logUploadAttempts; attempt++ {
+		err = rr.appendLogBatch(ctx, lease, chunks)
+		if err == nil || !isTransientLogUploadError(err) || attempt == logUploadAttempts-1 {
+			return err
+		}
+		delay := logUploadBaseDelay << attempt
+		if delay > logUploadMaxDelay {
+			delay = logUploadMaxDelay
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func isTransientLogUploadError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	var statusErr *logUploadStatusError
+	return errors.As(err, &statusErr) && statusErr.Code >= 500 && statusErr.Code <= 599
+}
+
+type logUploadStatusError struct {
+	Code   int
+	Status string
+}
+
+func (e *logUploadStatusError) Error() string { return fmt.Sprintf("append job log: %s", e.Status) }
+
+func (rr *RemoteRunner) appendLogBatch(ctx context.Context, lease jobLease, chunks []runner.PendingLogChunk) error {
+	v := url.Values{}
+	v.Set("runner_id", rr.id)
+	v.Set("run_id", lease.RunID)
+	v.Set("generation", strconv.Itoa(lease.Generation))
+	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/logs?%s", rr.config.ServerAddr, lease.LeaseID, url.PathEscape(lease.JobName), v.Encode())
+	body, _ := json.Marshal(map[string]any{"runner_id": rr.id, "run_id": lease.RunID, "lease_id": lease.LeaseID, "generation": lease.Generation, "job_name": lease.JobName, "chunks": chunks})
+	req, e := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if e != nil {
+		return e
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", rr.config.ServerToken))
+	resp, e := rr.httpClient.Do(req)
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return &logUploadStatusError{Code: resp.StatusCode, Status: resp.Status}
+	}
+	return nil
 }
 
 func (t remoteCacheTransport) query(path string) string {

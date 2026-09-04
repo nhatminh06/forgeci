@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
@@ -30,6 +31,7 @@ type Store interface {
 	Ping(context.Context) error
 	ListRunners(context.Context) ([]store.Runner, error)
 }
+type JobLogStore interface{ store.JobLogStore }
 
 type Server struct {
 	Manager      Manager
@@ -186,6 +188,74 @@ func (s Server) run(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := uuid.Parse(id); err != nil {
 		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
+		logs, ok := s.Store.(store.JobLogStore)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "logs unavailable")
+			return
+		}
+		job := r.URL.Query().Get("job")
+		if job == "" {
+			writeError(w, http.StatusBadRequest, "job is required")
+			return
+		}
+		after, limit := int64(0), 256
+		if v := r.URL.Query().Get("after"); v != "" {
+			n, e := strconv.ParseInt(v, 10, 64)
+			if e != nil || n < 0 {
+				writeError(w, http.StatusBadRequest, "invalid after")
+				return
+			}
+			after = n
+		}
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, e := strconv.Atoi(v)
+			if e != nil || n < 1 || n > 1000 {
+				writeError(w, http.StatusBadRequest, "invalid limit")
+				return
+			}
+			limit = n
+		}
+		items, err := logs.ListJobLogs(r.Context(), id, job, after, limit)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run or job not found")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "database unavailable")
+			return
+		}
+		if r.URL.Query().Get("follow") == "true" && len(items) == 0 {
+			deadline := time.NewTimer(2 * time.Second)
+			tick := time.NewTicker(100 * time.Millisecond)
+			defer deadline.Stop()
+			defer tick.Stop()
+			terminal := false
+			for len(items) == 0 && !terminal {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-deadline.C:
+					items = []store.JobLogChunk{}
+				case <-tick.C:
+					items, err = logs.ListJobLogs(r.Context(), id, job, after, limit)
+					if err != nil {
+						writeError(w, http.StatusServiceUnavailable, "database unavailable")
+						return
+					}
+					if run, e := s.Manager.Get(r.Context(), id); e == nil && run.FinishedAt != nil {
+						deadline.Stop()
+						terminal = true
+					}
+				}
+			}
+		}
+		if items == nil {
+			items = []store.JobLogChunk{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"logs": items})
 		return
 	}
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {

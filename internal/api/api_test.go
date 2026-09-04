@@ -26,6 +26,40 @@ type fakeStore struct {
 	pingErr   error
 	artifacts []store.Artifact
 	artifact  *store.Artifact
+	logs      []store.JobLogChunk
+	logErr    error
+}
+
+func (s *fakeStore) AppendJobLog(context.Context, store.JobLogChunk) error    { return nil }
+func (s *fakeStore) AppendJobLogs(context.Context, []store.JobLogChunk) error { return nil }
+func (s *fakeStore) ListJobLogs(context.Context, string, string, int64, int) ([]store.JobLogChunk, error) {
+	return s.logs, s.logErr
+}
+
+func TestLogsRejectsMalformedRunID(t *testing.T) {
+	handler := (Server{Manager: &fakeManager{}, Store: &fakeStore{}}).Handler()
+	if got := request(t, handler, http.MethodGet, "/v1/runs/not-a-uuid/logs?job=build", "").Code; got != http.StatusNotFound {
+		t.Fatalf("status=%d", got)
+	}
+}
+
+func TestLogsValidationAndBinaryPayload(t *testing.T) {
+	id := "00000000-0000-4000-8000-000000000001"
+	fs := &fakeStore{logs: []store.JobLogChunk{{RunID: id, JobName: "build", Sequence: 1, Stream: store.JobLogStdout, Payload: []byte{0, 0xff, 0xfe, 'A', '\n'}}, {RunID: id, JobName: "build", Sequence: 2, Stream: store.JobLogStderr, Payload: []byte("warn")}}}
+	h := (Server{Manager: &fakeManager{}, Store: fs}).Handler()
+	resp := request(t, h, http.MethodGet, "/v1/runs/"+id+"/logs?job=build&after=0&limit=2", "")
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "AP/+QQo=") {
+		t.Fatalf("code=%d body=%s", resp.Code, resp.Body)
+	}
+	for _, q := range []string{"job=build&limit=0", "job=build&limit=-1", "job=build&limit=1001", "job=build&limit=x", "job=build&after=-1", "job=build&after=x", "limit=2"} {
+		if got := request(t, h, http.MethodGet, "/v1/runs/"+id+"/logs?"+q, "").Code; got != http.StatusBadRequest {
+			t.Fatalf("query %s status=%d", q, got)
+		}
+	}
+	fs.logErr = errors.New("db down")
+	if got := request(t, h, http.MethodGet, "/v1/runs/"+id+"/logs?job=build", "").Code; got != http.StatusServiceUnavailable {
+		t.Fatalf("error status=%d", got)
+	}
 }
 
 func (s *fakeStore) Ping(ctx context.Context) error { return s.pingErr }

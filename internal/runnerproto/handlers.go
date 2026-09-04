@@ -171,7 +171,11 @@ const smallRequestLimit int64 = 16 << 10
 var runnerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 func decodeStrict(w http.ResponseWriter, r *http.Request, value any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, smallRequestLimit)
+	return decodeStrictLimit(w, r, value, smallRequestLimit)
+}
+
+func decodeStrictLimit(w http.ResponseWriter, r *http.Request, value any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
@@ -498,11 +502,92 @@ func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
 		h.ArtifactCommit(w, r)
 	} else if pathContains(path, "/artifacts/") {
 		h.ArtifactDownload(w, r)
+	} else if pathContains(path, "/jobs/") && strings.HasSuffix(path, "/logs") {
+		h.JobLogAppend(w, r)
 	} else if pathContains(path, "/complete") {
 		h.CompleteRun(w, r)
 	} else {
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+type jobLogAppendRequest struct {
+	RunnerID   string              `json:"runner_id"`
+	RunID      string              `json:"run_id"`
+	LeaseID    string              `json:"lease_id"`
+	Generation int                 `json:"generation"`
+	JobName    string              `json:"job_name"`
+	Chunks     []jobLogAppendChunk `json:"chunks"`
+}
+
+type jobLogAppendChunk struct {
+	Sequence int64              `json:"sequence"`
+	Stream   store.JobLogStream `json:"stream"`
+	Payload  []byte             `json:"payload"`
+}
+
+const (
+	MaxLogChunkBytes       = 64 << 10
+	MaxLogChunksPerRequest = 8
+	MaxLogAppendBodyBytes  = 1 << 20
+)
+
+func (h *Handlers) JobLogAppend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 7 || parts[4] != "jobs" || parts[6] != "logs" || !validUUID(parts[3]) || parts[5] == "" {
+		writeError(w, http.StatusBadRequest, "invalid log path")
+		return
+	}
+	if r.ContentLength > MaxLogAppendBodyBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "log request too large")
+		return
+	}
+	var req jobLogAppendRequest
+	if !decodeStrictLimit(w, r, &req, MaxLogAppendBodyBytes) {
+		return
+	}
+	if !validUUID(req.RunID) || !validUUID(req.RunnerID) || !validUUID(req.LeaseID) || req.RunID != r.URL.Query().Get("run_id") || req.RunnerID != r.URL.Query().Get("runner_id") || req.LeaseID != parts[3] || req.JobName != parts[5] || req.Generation < 1 {
+		writeError(w, http.StatusBadRequest, "invalid log ownership")
+		return
+	}
+	if len(req.Chunks) == 0 || len(req.Chunks) > MaxLogChunksPerRequest {
+		writeError(w, http.StatusBadRequest, "invalid log batch")
+		return
+	}
+	chunks := make([]store.JobLogChunk, len(req.Chunks))
+	var previous int64
+	for i, chunk := range req.Chunks {
+		if chunk.Sequence < 1 || chunk.Sequence <= previous || len(chunk.Payload) == 0 || len(chunk.Payload) > MaxLogChunkBytes || (chunk.Stream != store.JobLogStdout && chunk.Stream != store.JobLogStderr) {
+			writeError(w, http.StatusBadRequest, "invalid log chunk")
+			return
+		}
+		previous = chunk.Sequence
+		chunks[i] = store.JobLogChunk{RunID: req.RunID, JobName: req.JobName, Sequence: chunk.Sequence, Stream: chunk.Stream, Payload: chunk.Payload}
+	}
+	run, err := h.store.GetRun(r.Context(), req.RunID)
+	owner := store.ArtifactOwnership{RunID: req.RunID, RunnerID: req.RunnerID, LeaseID: req.LeaseID, Generation: req.Generation, JobName: req.JobName}
+	if err != nil || run.ID != req.RunID || !validArtifactLease(run, owner, store.JobRunning) {
+		writeError(w, http.StatusConflict, "invalid or expired log lease")
+		return
+	}
+	logs, ok := h.store.(store.JobLogStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "logs unavailable")
+		return
+	}
+	if err := logs.AppendJobLogs(r.Context(), chunks); err != nil {
+		if err == store.ErrConflict {
+			writeError(w, http.StatusConflict, "log conflict")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type artifactCommitRequest struct {
