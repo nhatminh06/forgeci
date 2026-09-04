@@ -6,9 +6,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -584,11 +586,20 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 		}
 	}
 	logQueue := runner.NewPendingLogQueue()
-	go rr.uploadLogQueue(ctx, lease, logQueue)
-	defer logQueue.Close()
+	uploadDone := make(chan struct{})
+	go func() { defer close(uploadDone); rr.uploadLogQueue(ctx, lease, logQueue) }()
 	stdout := &remoteLogWriter{ctx: ctx, queue: logQueue, stream: store.JobLogStdout, dst: os.Stdout}
 	stderr := &remoteLogWriter{ctx: ctx, queue: logQueue, stream: store.JobLogStderr, dst: os.Stderr}
 	result := (executor.Job{Local: local, Docker: docker}).RunJob(ctx, lease.JobName, job, stdout, stderr)
+	// Closing stops new writes and lets the uploader drain every acknowledged
+	// prefix before the lease is completed.
+	logQueue.Close()
+	<-uploadDone
+	if logErr := logQueue.Err(); logErr != nil && result.Err == nil {
+		message := fmt.Sprintf("durable log upload failed: %v", logErr)
+		_ = rr.sendJobComplete(lease, "ERROR", &message)
+		return
+	}
 	if result.Err != nil {
 		status := "FAILED"
 		if ctx.Err() != nil {
@@ -700,7 +711,7 @@ func (rr *RemoteRunner) uploadLogQueue(ctx context.Context, lease jobLease, queu
 		if err != nil {
 			return
 		}
-		if err = rr.appendLogBatch(ctx, lease, chunks); err != nil {
+		if err = rr.appendLogBatchWithRetry(ctx, lease, chunks); err != nil {
 			queue.Fail(err)
 			return
 		}
@@ -710,6 +721,50 @@ func (rr *RemoteRunner) uploadLogQueue(ctx context.Context, lease jobLease, queu
 		}
 	}
 }
+
+const (
+	logUploadAttempts  = 5
+	logUploadBaseDelay = 100 * time.Millisecond
+	logUploadMaxDelay  = 2 * time.Second
+)
+
+func (rr *RemoteRunner) appendLogBatchWithRetry(ctx context.Context, lease jobLease, chunks []runner.PendingLogChunk) error {
+	var err error
+	for attempt := 0; attempt < logUploadAttempts; attempt++ {
+		err = rr.appendLogBatch(ctx, lease, chunks)
+		if err == nil || !isTransientLogUploadError(err) || attempt == logUploadAttempts-1 {
+			return err
+		}
+		delay := logUploadBaseDelay << attempt
+		if delay > logUploadMaxDelay {
+			delay = logUploadMaxDelay
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func isTransientLogUploadError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	var statusErr *logUploadStatusError
+	return errors.As(err, &statusErr) && statusErr.Code >= 500 && statusErr.Code <= 599
+}
+
+type logUploadStatusError struct {
+	Code   int
+	Status string
+}
+
+func (e *logUploadStatusError) Error() string { return fmt.Sprintf("append job log: %s", e.Status) }
 
 func (rr *RemoteRunner) appendLogBatch(ctx context.Context, lease jobLease, chunks []runner.PendingLogChunk) error {
 	v := url.Values{}
@@ -729,7 +784,7 @@ func (rr *RemoteRunner) appendLogBatch(ctx context.Context, lease jobLease, chun
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("append job log: %s", resp.Status)
+		return &logUploadStatusError{Code: resp.StatusCode, Status: resp.Status}
 	}
 	return nil
 }

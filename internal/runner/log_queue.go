@@ -155,6 +155,9 @@ func (q *PendingLogQueue) Close() {
 }
 func (q *PendingLogQueue) PendingBytes() int { q.mu.Lock(); defer q.mu.Unlock(); return q.pending }
 
+// Err reports a terminal upload error, if one has been recorded.
+func (q *PendingLogQueue) Err() error { q.mu.Lock(); defer q.mu.Unlock(); return q.failure }
+
 // WaitForPending is intended for coordination and deterministic tests.
 func (q *PendingLogQueue) WaitForPending(ctx context.Context, target int) error {
 	for {
