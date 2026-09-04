@@ -549,7 +549,7 @@ func (h *Handlers) JobLogAppend(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := h.store.GetRun(r.Context(), req.RunID)
 	owner := store.ArtifactOwnership{RunID: req.RunID, RunnerID: req.RunnerID, LeaseID: req.LeaseID, Generation: req.Generation, JobName: req.JobName}
-	if err != nil || !validArtifactLease(run, owner, store.JobRunning) {
+	if err != nil || run.ID != req.RunID || !validArtifactLease(run, owner, store.JobRunning) {
 		writeError(w, http.StatusConflict, "invalid or expired log lease")
 		return
 	}

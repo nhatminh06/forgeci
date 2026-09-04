@@ -52,6 +52,11 @@ func TestJobLogAppendRequiresActiveLease(t *testing.T) {
 		t.Fatalf("wrong identity=%d chunks=%d", w.Code, len(s.chunks))
 	}
 	body["runner_id"] = runnerID
+	body["run_id"] = "00000000-0000-4000-8000-000000000099"
+	if w := send(body, q); w.Code != http.StatusBadRequest || len(s.chunks) != 1 {
+		t.Fatalf("wrong run=%d chunks=%d", w.Code, len(s.chunks))
+	}
+	body["run_id"] = runID
 	body["sequence"] = 0
 	if w := send(body, q); w.Code != http.StatusBadRequest || len(s.chunks) != 1 {
 		t.Fatalf("invalid sequence=%d", w.Code)
