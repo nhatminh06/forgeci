@@ -20,6 +20,15 @@ func (m *memoryLogs) AppendJobLog(_ context.Context, c store.JobLogChunk) error 
 	m.chunks = append(m.chunks, c)
 	return nil
 }
+
+func (m *memoryLogs) AppendJobLogs(ctx context.Context, chunks []store.JobLogChunk) error {
+	for _, chunk := range chunks {
+		if err := m.AppendJobLog(ctx, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (*memoryLogs) ListJobLogs(context.Context, string, string, int64, int) ([]store.JobLogChunk, error) {
 	return nil, nil
 }

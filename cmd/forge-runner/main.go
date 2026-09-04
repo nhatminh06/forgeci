@@ -27,6 +27,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
+	"github.com/nhatminh06/forgeci/internal/runnerproto"
 	"github.com/nhatminh06/forgeci/internal/runworkspace"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store"
@@ -679,8 +680,8 @@ func (w *remoteLogWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	for offset := 0; offset < len(p); {
 		n := len(p) - offset
-		if n > 64<<10 {
-			n = 64 << 10
+		if n > runnerproto.MaxLogChunkBytes {
+			n = runnerproto.MaxLogChunkBytes
 		}
 		if err := w.append(p[offset : offset+n]); err != nil {
 			return offset, err
@@ -697,7 +698,7 @@ func (w *remoteLogWriter) append(p []byte) error {
 	v.Set("run_id", w.lease.RunID)
 	v.Set("generation", strconv.Itoa(w.lease.Generation))
 	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/logs?%s", w.rr.config.ServerAddr, w.lease.LeaseID, url.PathEscape(w.lease.JobName), v.Encode())
-	body, _ := json.Marshal(map[string]any{"runner_id": w.rr.id, "run_id": w.lease.RunID, "lease_id": w.lease.LeaseID, "generation": w.lease.Generation, "job_name": w.lease.JobName, "sequence": n, "stream": w.stream, "payload": p})
+	body, _ := json.Marshal(map[string]any{"runner_id": w.rr.id, "run_id": w.lease.RunID, "lease_id": w.lease.LeaseID, "generation": w.lease.Generation, "job_name": w.lease.JobName, "chunks": []map[string]any{{"sequence": n, "stream": w.stream, "payload": p}}})
 	req, e := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 	if e != nil {
 		return e

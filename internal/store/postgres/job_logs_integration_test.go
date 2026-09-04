@@ -57,3 +57,39 @@ func TestJobLogsLifecycle(t *testing.T) {
 		t.Fatalf("unknown job=%v", err)
 	}
 }
+
+func TestAppendJobLogsAtomicBatch(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	r, err := s.CreateRun(ctx, store.CreateRun{ID: uuid.NewString(), PipelineFile: "x", PipelineYAML: []byte("version: 1"), PipelineSHA256: strings.Repeat("b", 64), Workspace: "/logs-batch", MaxParallel: 1, Jobs: []store.Job{{Name: "build"}}, Snapshot: testSnapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := []store.JobLogChunk{
+		{RunID: r.ID, JobName: "build", Sequence: 1, Stream: store.JobLogStdout, Payload: []byte("alpha")},
+		{RunID: r.ID, JobName: "build", Sequence: 2, Stream: store.JobLogStderr, Payload: []byte("warning")},
+	}
+	if err := s.AppendJobLogs(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendJobLogs(ctx, batch); err != nil {
+		t.Fatalf("identical replay: %v", err)
+	}
+	if err := s.AppendJobLogs(ctx, []store.JobLogChunk{{RunID: r.ID, JobName: "build", Sequence: 2, Stream: store.JobLogStderr, Payload: []byte("conflict")}}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("conflicting batch: %v", err)
+	}
+	got, err := s.ListJobLogs(ctx, r.ID, "build", 0, 100)
+	if err != nil || len(got) != 2 || string(got[0].Payload) != "alpha" || string(got[1].Payload) != "warning" {
+		t.Fatalf("atomic result=%+v err=%v", got, err)
+	}
+	if err := s.AppendJobLogs(ctx, []store.JobLogChunk{
+		{RunID: r.ID, JobName: "build", Sequence: 3, Stream: store.JobLogStdout, Payload: []byte("three")},
+		{RunID: r.ID, JobName: "build", Sequence: 5, Stream: store.JobLogStdout, Payload: []byte("gap")},
+	}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("gap batch: %v", err)
+	}
+	got, err = s.ListJobLogs(ctx, r.ID, "build", 0, 100)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("gap must rollback: %+v err=%v", got, err)
+	}
+}

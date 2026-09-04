@@ -30,7 +30,8 @@ type fakeStore struct {
 	logErr    error
 }
 
-func (s *fakeStore) AppendJobLog(context.Context, store.JobLogChunk) error { return nil }
+func (s *fakeStore) AppendJobLog(context.Context, store.JobLogChunk) error    { return nil }
+func (s *fakeStore) AppendJobLogs(context.Context, []store.JobLogChunk) error { return nil }
 func (s *fakeStore) ListJobLogs(context.Context, string, string, int64, int) ([]store.JobLogChunk, error) {
 	return s.logs, s.logErr
 }
