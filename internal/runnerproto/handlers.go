@@ -498,11 +498,70 @@ func (h *Handlers) HandleLeaseRoute(w http.ResponseWriter, r *http.Request) {
 		h.ArtifactCommit(w, r)
 	} else if pathContains(path, "/artifacts/") {
 		h.ArtifactDownload(w, r)
+	} else if pathContains(path, "/jobs/") && strings.HasSuffix(path, "/logs") {
+		h.JobLogAppend(w, r)
 	} else if pathContains(path, "/complete") {
 		h.CompleteRun(w, r)
 	} else {
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+type jobLogAppendRequest struct {
+	RunnerID   string             `json:"runner_id"`
+	RunID      string             `json:"run_id"`
+	LeaseID    string             `json:"lease_id"`
+	Generation int                `json:"generation"`
+	JobName    string             `json:"job_name"`
+	Sequence   int64              `json:"sequence"`
+	Stream     store.JobLogStream `json:"stream"`
+	Payload    []byte             `json:"payload"`
+}
+
+func (h *Handlers) JobLogAppend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 8 || parts[4] != "jobs" || parts[7] != "logs" || !validUUID(parts[3]) || parts[5] == "" {
+		writeError(w, http.StatusBadRequest, "invalid log path")
+		return
+	}
+	var req jobLogAppendRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	if req.RunID == "" {
+		req.RunID = r.URL.Query().Get("run_id")
+	}
+	if req.RunnerID == "" {
+		req.RunnerID = r.URL.Query().Get("runner_id")
+	}
+	if req.LeaseID == "" {
+		req.LeaseID = parts[3]
+	}
+	if req.JobName == "" {
+		req.JobName = parts[5]
+	}
+	owner, ok := h.artifactOwner(w, r, parts[3], parts[5])
+	if !ok || owner.RunID != req.RunID || owner.RunnerID != req.RunnerID || owner.LeaseID != req.LeaseID || owner.Generation != req.Generation {
+		return
+	}
+	logs, ok := h.store.(store.JobLogStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "logs unavailable")
+		return
+	}
+	if err := logs.AppendJobLog(r.Context(), store.JobLogChunk{RunID: req.RunID, JobName: req.JobName, Sequence: req.Sequence, Stream: req.Stream, Payload: req.Payload}); err != nil {
+		if err == store.ErrConflict {
+			writeError(w, http.StatusConflict, "log conflict")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type artifactCommitRequest struct {

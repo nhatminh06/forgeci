@@ -69,6 +69,8 @@ func TestRemoteRunnerExecutesPipelineAndSignalsCompletion(t *testing.T) {
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]bool{"accepted": true})
+		case strings.HasSuffix(r.URL.Path, "/logs"):
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}

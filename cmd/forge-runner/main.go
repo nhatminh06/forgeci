@@ -581,7 +581,11 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 			return
 		}
 	}
-	result := (executor.Job{Local: local, Docker: docker}).RunJob(ctx, lease.JobName, job, os.Stdout, os.Stderr)
+	var logMu sync.Mutex
+	var logSeq int64
+	stdout := &remoteLogWriter{rr: rr, lease: lease, stream: store.JobLogStdout, mu: &logMu, seq: &logSeq, dst: os.Stdout}
+	stderr := &remoteLogWriter{rr: rr, lease: lease, stream: store.JobLogStderr, mu: &logMu, seq: &logSeq, dst: os.Stderr}
+	result := (executor.Job{Local: local, Docker: docker}).RunJob(ctx, lease.JobName, job, stdout, stderr)
 	if result.Err != nil {
 		status := "FAILED"
 		if ctx.Err() != nil {
@@ -659,6 +663,48 @@ type remoteCacheTransport struct {
 	rr                      *RemoteRunner
 	runID, leaseID, jobName string
 	generation              int
+}
+
+type remoteLogWriter struct {
+	rr     *RemoteRunner
+	lease  jobLease
+	stream store.JobLogStream
+	mu     *sync.Mutex
+	seq    *int64
+	dst    io.Writer
+}
+
+func (w *remoteLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(p) > 64<<10 {
+		p = p[:64<<10]
+	}
+	n := *w.seq + 1
+	v := url.Values{}
+	v.Set("runner_id", w.rr.id)
+	v.Set("run_id", w.lease.RunID)
+	v.Set("generation", strconv.Itoa(w.lease.Generation))
+	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/logs?%s", w.rr.config.ServerAddr, w.lease.LeaseID, url.PathEscape(w.lease.JobName), v.Encode())
+	body, _ := json.Marshal(map[string]any{"runner_id": w.rr.id, "run_id": w.lease.RunID, "lease_id": w.lease.LeaseID, "generation": w.lease.Generation, "job_name": w.lease.JobName, "sequence": n, "stream": w.stream, "payload": p})
+	req, e := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if e != nil {
+		return 0, e
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", w.rr.config.ServerToken))
+	resp, e := w.rr.httpClient.Do(req)
+	if e != nil {
+		return 0, e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return 0, fmt.Errorf("append job log: %s", resp.Status)
+	}
+	*w.seq = n
+	if w.dst != nil {
+		return w.dst.Write(p)
+	}
+	return len(p), nil
 }
 
 func (t remoteCacheTransport) query(path string) string {
