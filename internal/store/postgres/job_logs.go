@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
+	"time"
 
 	"github.com/nhatminh06/forgeci/internal/store"
 )
@@ -14,6 +15,9 @@ const maxJobLogChunk = 64 << 10
 func (s *Store) AppendJobLog(ctx context.Context, c store.JobLogChunk) error {
 	if c.RunID == "" || c.JobName == "" || c.Sequence < 1 || len(c.Payload) == 0 || len(c.Payload) > maxJobLogChunk || (c.Stream != store.JobLogStdout && c.Stream != store.JobLogStderr) {
 		return fmt.Errorf("invalid job log chunk")
+	}
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = time.Now().UTC()
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -58,6 +62,13 @@ func (s *Store) ListJobLogs(ctx context.Context, runID, jobName string, after in
 	}
 	if limit > 1000 {
 		limit = 1000
+	}
+	var exists int
+	if err := s.pool.QueryRow(ctx, `SELECT 1 FROM job_runs WHERE run_id=$1 AND job_name=$2`, runID, jobName).Scan(&exists); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, store.ErrNotFound
+		}
+		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `SELECT run_id::text,job_name,sequence,stream,created_at,payload FROM job_log_chunks WHERE run_id=$1 AND job_name=$2 AND sequence>$3 ORDER BY sequence LIMIT $4`, runID, jobName, after, limit)
 	if err != nil {

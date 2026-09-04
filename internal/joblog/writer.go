@@ -51,11 +51,12 @@ func (w *Writer) Write(stream store.JobLogStream, p []byte) (int, error) {
 		if n > MaxChunk {
 			n = MaxChunk
 		}
-		w.sequence++
-		err := w.store.AppendJobLog(w.ctx, store.JobLogChunk{RunID: w.runID, JobName: w.jobName, Sequence: w.sequence, Stream: stream, Payload: append([]byte(nil), p[offset:offset+n]...)})
+		candidate := w.sequence + 1
+		err := w.store.AppendJobLog(w.ctx, store.JobLogChunk{RunID: w.runID, JobName: w.jobName, Sequence: candidate, Stream: stream, Payload: append([]byte(nil), p[offset:offset+n]...)})
 		if err != nil {
 			return offset, err
 		}
+		w.sequence = candidate
 		offset += n
 	}
 	return len(p), nil
