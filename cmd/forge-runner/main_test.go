@@ -146,7 +146,6 @@ func TestUploadLogQueueAcknowledgesOnlyAfterResponse(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseAck := func() { releaseOnce.Do(func() { close(release) }) }
-	defer releaseAck()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/logs") {
 			t.Fatalf("path=%s", r.URL.Path)
@@ -156,6 +155,7 @@ func TestUploadLogQueueAcknowledgesOnlyAfterResponse(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
+	defer releaseAck()
 	queue := runner.NewPendingLogQueue()
 	if _, err := queue.Enqueue(context.Background(), store.JobLogStdout, []byte("final")); err != nil {
 		t.Fatal(err)
