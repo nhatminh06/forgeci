@@ -1,4 +1,4 @@
-# Milestone 8 architecture
+# ForgeCI architecture
 
 ```text
 HTTP API
@@ -50,6 +50,21 @@ Each remote workspace is keyed by run, job, and lease, uses restrictive permissi
 
 Successful producer steps are followed by deterministic artifact capture, blob upload, and one transactional metadata-set commit before `PASSED`. A consumer downloads only explicitly declared upstream artifacts through durable storage, verifies blob and logical identity, and atomically materializes them before steps. Snapshot and artifact stores remain semantically separate.
 
+## Current distributed flow
+
+forge submits a pipeline and immutable source snapshot. forge-server persists
+the DAG, job states, leases, artifact/cache metadata, and chunked logs in
+PostgreSQL. Runners restore source, declared artifacts and caches, execute
+local or Docker jobs, upload logs, publish artifacts/caches, and complete the
+lease. Source, artifact, and cache CAS stores are distinct.
+
+M11 uses GitHub Actions only as bootstrap infrastructure. The harness starts
+PostgreSQL, forge-server, and two production runners; ForgeCI owns the project
+CI DAG. See self-hosting.md.
+
 ## Intentionally absent
 
-Milestone 8 has no build cache, Git/SCM checkout, automatic retry or reassignment, runner labels/selectors, GPU scheduling, persistent logs, Kubernetes/autoscaling, secrets, RBAC, or high-availability control plane. Docker execution remains unsuitable as hostile-code isolation.
+ForgeCI has no native Git/SCM checkout, automatic retry or reassignment, runner
+labels/selectors, GPU scheduling, Kubernetes/autoscaling, secrets, RBAC, or
+high-availability control plane. Docker execution remains unsuitable as
+hostile-code isolation.
