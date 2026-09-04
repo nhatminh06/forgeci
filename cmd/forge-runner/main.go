@@ -27,6 +27,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
+	"github.com/nhatminh06/forgeci/internal/runner"
 	"github.com/nhatminh06/forgeci/internal/runnerproto"
 	"github.com/nhatminh06/forgeci/internal/runworkspace"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
@@ -582,10 +583,11 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 			return
 		}
 	}
-	var logMu sync.Mutex
-	var logSeq int64
-	stdout := &remoteLogWriter{rr: rr, lease: lease, stream: store.JobLogStdout, mu: &logMu, seq: &logSeq, dst: os.Stdout}
-	stderr := &remoteLogWriter{rr: rr, lease: lease, stream: store.JobLogStderr, mu: &logMu, seq: &logSeq, dst: os.Stderr}
+	logQueue := runner.NewPendingLogQueue()
+	go rr.uploadLogQueue(ctx, lease, logQueue)
+	defer logQueue.Close()
+	stdout := &remoteLogWriter{ctx: ctx, queue: logQueue, stream: store.JobLogStdout, dst: os.Stdout}
+	stderr := &remoteLogWriter{ctx: ctx, queue: logQueue, stream: store.JobLogStderr, dst: os.Stderr}
 	result := (executor.Job{Local: local, Docker: docker}).RunJob(ctx, lease.JobName, job, stdout, stderr)
 	if result.Err != nil {
 		status := "FAILED"
@@ -667,55 +669,67 @@ type remoteCacheTransport struct {
 }
 
 type remoteLogWriter struct {
-	rr     *RemoteRunner
-	lease  jobLease
+	ctx    context.Context
+	queue  *runner.PendingLogQueue
 	stream store.JobLogStream
-	mu     *sync.Mutex
-	seq    *int64
 	dst    io.Writer
 }
 
 func (w *remoteLogWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	for offset := 0; offset < len(p); {
 		n := len(p) - offset
 		if n > runnerproto.MaxLogChunkBytes {
 			n = runnerproto.MaxLogChunkBytes
 		}
-		if err := w.append(p[offset : offset+n]); err != nil {
+		if _, err := w.queue.Enqueue(w.ctx, w.stream, p[offset:offset+n]); err != nil {
 			return offset, err
+		}
+		if w.dst != nil {
+			if _, err := w.dst.Write(p[offset : offset+n]); err != nil {
+				return offset, err
+			}
 		}
 		offset += n
 	}
 	return len(p), nil
 }
 
-func (w *remoteLogWriter) append(p []byte) error {
-	n := *w.seq + 1
+func (rr *RemoteRunner) uploadLogQueue(ctx context.Context, lease jobLease, queue *runner.PendingLogQueue) {
+	for {
+		chunks, err := queue.WaitBatch(ctx, runnerproto.MaxLogChunksPerRequest, runnerproto.MaxLogAppendBodyBytes)
+		if err != nil {
+			return
+		}
+		if err = rr.appendLogBatch(ctx, lease, chunks); err != nil {
+			queue.Fail(err)
+			return
+		}
+		if err = queue.Ack(len(chunks)); err != nil {
+			queue.Fail(err)
+			return
+		}
+	}
+}
+
+func (rr *RemoteRunner) appendLogBatch(ctx context.Context, lease jobLease, chunks []runner.PendingLogChunk) error {
 	v := url.Values{}
-	v.Set("runner_id", w.rr.id)
-	v.Set("run_id", w.lease.RunID)
-	v.Set("generation", strconv.Itoa(w.lease.Generation))
-	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/logs?%s", w.rr.config.ServerAddr, w.lease.LeaseID, url.PathEscape(w.lease.JobName), v.Encode())
-	body, _ := json.Marshal(map[string]any{"runner_id": w.rr.id, "run_id": w.lease.RunID, "lease_id": w.lease.LeaseID, "generation": w.lease.Generation, "job_name": w.lease.JobName, "chunks": []map[string]any{{"sequence": n, "stream": w.stream, "payload": p}}})
-	req, e := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	v.Set("runner_id", rr.id)
+	v.Set("run_id", lease.RunID)
+	v.Set("generation", strconv.Itoa(lease.Generation))
+	endpoint := fmt.Sprintf("%s/v1/runner/leases/%s/jobs/%s/logs?%s", rr.config.ServerAddr, lease.LeaseID, url.PathEscape(lease.JobName), v.Encode())
+	body, _ := json.Marshal(map[string]any{"runner_id": rr.id, "run_id": lease.RunID, "lease_id": lease.LeaseID, "generation": lease.Generation, "job_name": lease.JobName, "chunks": chunks})
+	req, e := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if e != nil {
 		return e
 	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", w.rr.config.ServerToken))
-	resp, e := w.rr.httpClient.Do(req)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", rr.config.ServerToken))
+	resp, e := rr.httpClient.Do(req)
 	if e != nil {
 		return e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("append job log: %s", resp.Status)
-	}
-	*w.seq = n
-	if w.dst != nil {
-		_, e = w.dst.Write(p)
-		return e
 	}
 	return nil
 }

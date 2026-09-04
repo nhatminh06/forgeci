@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/runner"
+	"github.com/nhatminh06/forgeci/internal/runnerproto"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
@@ -89,6 +93,51 @@ func TestRemoteRunnerExecutesPipelineAndSignalsCompletion(t *testing.T) {
 	}
 	if _, err := os.Stat(workDir + "/hello.out"); err == nil {
 		// optional; no-op
+	}
+}
+
+func TestRemoteLogWriterLargeAndPartialCancellation(t *testing.T) {
+	q := runner.NewPendingLogQueue()
+	writer := &remoteLogWriter{ctx: context.Background(), queue: q, stream: store.JobLogStdout}
+	payload := bytes.Repeat([]byte("z"), 2*runnerproto.MaxLogChunkBytes+17)
+	if n, err := writer.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("write=%d err=%v", n, err)
+	}
+	batch := q.PeekBatch(runnerproto.MaxLogChunksPerRequest, runnerproto.MaxLogAppendBodyBytes)
+	var restored []byte
+	for _, c := range batch {
+		restored = append(restored, c.Payload...)
+	}
+	if !bytes.Equal(restored, payload) {
+		t.Fatal("large write was not lossless")
+	}
+
+	q = runner.NewPendingLogQueue()
+	for q.PendingBytes()+runnerproto.MaxLogChunkBytes < runner.MaxPendingLogBytes {
+		if _, err := q.Enqueue(context.Background(), store.JobLogStdout, bytes.Repeat([]byte("x"), runnerproto.MaxLogChunkBytes)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	writer = &remoteLogWriter{ctx: ctx, queue: q, stream: store.JobLogStdout}
+	done := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, err := writer.Write(payload)
+		done <- struct {
+			n   int
+			err error
+		}{n, err}
+	}()
+	if err := q.WaitForPending(context.Background(), runner.MaxPendingLogBytes); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	result := <-done
+	if result.n != runnerproto.MaxLogChunkBytes || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("partial=%d err=%v", result.n, result.err)
 	}
 }
 
