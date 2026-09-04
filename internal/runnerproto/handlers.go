@@ -526,7 +526,7 @@ func (h *Handlers) JobLogAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 8 || parts[4] != "jobs" || parts[7] != "logs" || !validUUID(parts[3]) || parts[5] == "" {
+	if len(parts) != 7 || parts[4] != "jobs" || parts[6] != "logs" || !validUUID(parts[3]) || parts[5] == "" {
 		writeError(w, http.StatusBadRequest, "invalid log path")
 		return
 	}
@@ -541,6 +541,10 @@ func (h *Handlers) JobLogAppend(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validUUID(req.RunID) || !validUUID(req.RunnerID) || !validUUID(req.LeaseID) || req.RunID != r.URL.Query().Get("run_id") || req.RunnerID != r.URL.Query().Get("runner_id") || req.LeaseID != parts[3] || req.JobName != parts[5] || req.Generation < 1 {
 		writeError(w, http.StatusBadRequest, "invalid log ownership")
+		return
+	}
+	if req.Sequence < 1 || len(req.Payload) == 0 || len(req.Payload) > 64<<10 || (req.Stream != store.JobLogStdout && req.Stream != store.JobLogStderr) {
+		writeError(w, http.StatusBadRequest, "invalid log chunk")
 		return
 	}
 	run, err := h.store.GetRun(r.Context(), req.RunID)
