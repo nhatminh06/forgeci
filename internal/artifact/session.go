@@ -180,7 +180,11 @@ func (s *Session) Restore(ctx context.Context, _ string, items []config.Artifact
 			}
 			return fmt.Errorf("close artifact transfer")
 		}
-		stage, err := os.MkdirTemp(s.temp, ".extract-*")
+		if err := os.MkdirAll(destination, 0700); err != nil {
+			_ = os.Remove(archiveName)
+			return err
+		}
+		stage, err := os.MkdirTemp(destination, ".extract-*")
 		if err != nil {
 			_ = os.Remove(archiveName)
 			return err

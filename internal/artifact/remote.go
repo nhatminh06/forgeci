@@ -109,7 +109,7 @@ func (s *RemoteSession) Restore(ctx context.Context, consumer string, items []co
 			_ = os.Remove(archiveName)
 			return err
 		}
-		stage, err := os.MkdirTemp(s.local.temp, ".extract-*")
+		stage, err := os.MkdirTemp(destination, ".extract-*")
 		if err != nil {
 			_ = os.Remove(archiveName)
 			return err
