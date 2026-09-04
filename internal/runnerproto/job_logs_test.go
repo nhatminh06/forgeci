@@ -72,13 +72,16 @@ func (f logFixture) body(chunks []map[string]any) map[string]any {
 }
 func (f logFixture) query() string { return "runner_id=" + f.runnerID + "&run_id=" + f.runID }
 func (f logFixture) send(body any, query string) *httptest.ResponseRecorder {
+	return f.sendToLease(body, query, f.leaseID)
+}
+func (f logFixture) sendToLease(body any, query, leaseID string) *httptest.ResponseRecorder {
 	var data []byte
 	if raw, ok := body.([]byte); ok {
 		data = raw
 	} else {
 		data, _ = json.Marshal(body)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/runner/leases/"+f.leaseID+"/jobs/build/logs?"+query, bytes.NewReader(data))
+	req := httptest.NewRequest(http.MethodPost, "/v1/runner/leases/"+leaseID+"/jobs/build/logs?"+query, bytes.NewReader(data))
 	req.Header.Set("Authorization", "Bearer token")
 	w := httptest.NewRecorder()
 	f.h.AuthMiddleware(http.HandlerFunc(f.h.HandleLeaseRoute)).ServeHTTP(w, req)
@@ -177,6 +180,22 @@ func TestJobLogAppendStrictDecodingAndOwnership(t *testing.T) {
 		f := newLogFixture(t)
 		expired := time.Now().Add(-time.Minute)
 		f.s.run.Jobs[0].LeaseExpiresAt = &expired
+		if w := f.send(f.body([]map[string]any{chunk(1, "stdout", "alpha")}), f.query()); w.Code != http.StatusConflict || len(f.s.chunks) != 0 {
+			t.Fatalf("status=%d chunks=%d", w.Code, len(f.s.chunks))
+		}
+	})
+	t.Run("wrong live lease", func(t *testing.T) {
+		f := newLogFixture(t)
+		wrongLease := "00000000-0000-4000-8000-000000000099"
+		body := f.body([]map[string]any{chunk(1, "stdout", "alpha")})
+		body["lease_id"] = wrongLease
+		if w := f.sendToLease(body, f.query(), wrongLease); w.Code != http.StatusConflict || len(f.s.chunks) != 0 {
+			t.Fatalf("status=%d chunks=%d", w.Code, len(f.s.chunks))
+		}
+	})
+	t.Run("terminal job", func(t *testing.T) {
+		f := newLogFixture(t)
+		f.s.run.Jobs[0].Status = store.JobPassed
 		if w := f.send(f.body([]map[string]any{chunk(1, "stdout", "alpha")}), f.query()); w.Code != http.StatusConflict || len(f.s.chunks) != 0 {
 			t.Fatalf("status=%d chunks=%d", w.Code, len(f.s.chunks))
 		}
