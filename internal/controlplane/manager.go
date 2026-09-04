@@ -19,6 +19,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/config"
 	"github.com/nhatminh06/forgeci/internal/executor"
+	"github.com/nhatminh06/forgeci/internal/joblog"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
 	"github.com/nhatminh06/forgeci/internal/runner"
 	"github.com/nhatminh06/forgeci/internal/runworkspace"
@@ -43,6 +44,12 @@ type Manager struct {
 	mu            sync.Mutex
 	activeID      string
 	activeCancel  context.CancelFunc
+}
+
+type durableLogs struct{ session *joblog.Session }
+
+func (d durableLogs) OpenJob(ctx context.Context, name string, out, err io.Writer) runner.JobLogs {
+	return d.session.OpenJob(ctx, name, out, err)
 }
 
 func (m *Manager) SetArtifactStore(value *artifact.Store) { m.artifacts = value }
@@ -359,6 +366,10 @@ func (m *Manager) execute(runRecord *store.Run) {
 		}
 	}
 	var cacheSession *cache.Session
+	var logSession *joblog.Session
+	if persistence, ok := m.store.(store.JobLogStore); ok {
+		logSession = joblog.NewSession(persistence, runRecord.ID)
+	}
 	if m.cacheStore != nil {
 		remote := cache.NewLocalRemote(m.cacheStore, runRecord.Workspace)
 		if persistence, ok := m.store.(store.CacheStore); ok {
@@ -380,7 +391,11 @@ func (m *Manager) execute(runRecord *store.Run) {
 			return
 		}
 	}
-	result := (runner.Runner{Executor: exec, Output: m.output, ErrorOutput: m.output, MaxParallel: runRecord.MaxParallel, Observer: obs, Artifacts: artifactSession, Cache: cacheSession}).Run(ctx, graph)
+	var logs runner.JobLogLifecycle
+	if logSession != nil {
+		logs = durableLogs{session: logSession}
+	}
+	result := (runner.Runner{Executor: exec, Output: m.output, ErrorOutput: m.output, MaxParallel: runRecord.MaxParallel, Observer: obs, Artifacts: artifactSession, Cache: cacheSession, Logs: logs}).Run(ctx, graph)
 	status := store.RunFailed
 	var message *string
 	if obs.err != nil {

@@ -45,6 +45,16 @@ type CacheLifecycle interface {
 	Save(context.Context, []config.CacheEntry, io.Writer)
 }
 
+type JobLogs interface {
+	Stdout() io.Writer
+	Stderr() io.Writer
+	Err() error
+	Close() error
+}
+type JobLogLifecycle interface {
+	OpenJob(context.Context, string, io.Writer, io.Writer) JobLogs
+}
+
 type Result struct {
 	States        map[string]State
 	Interrupted   bool
@@ -71,6 +81,7 @@ type Runner struct {
 	Observer    JobStateObserver
 	Artifacts   ArtifactLifecycle
 	Cache       CacheLifecycle
+	Logs        JobLogLifecycle
 }
 
 type completion struct {
@@ -203,6 +214,15 @@ func hasFailedDependency(graph *pipeline.Graph, states map[string]State, name st
 }
 
 func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output synchronizedOutput) (State, bool) {
+	var logs JobLogs
+	if r.Logs != nil {
+		logs = r.Logs.OpenJob(ctx, node.Name, output.stdout, output.stderr)
+		defer logs.Close()
+	}
+	stdout, stderr := output.stdout, output.stderr
+	if logs != nil {
+		stdout, stderr = logs.Stdout(), logs.Stderr()
+	}
 	if r.Artifacts != nil {
 		if err := r.Artifacts.Restore(ctx, node.Name, node.Job.Artifacts.Download); err != nil {
 			if ctx.Err() != nil {
@@ -217,7 +237,10 @@ func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output sync
 		r.Cache.Restore(ctx, node.Job.Cache.Restore, output.stdout)
 	}
 	if jobExecutor, ok := r.Executor.(JobExecutor); ok {
-		execution := jobExecutor.RunJob(ctx, node.Name, node.Job, output.stdout, output.stderr)
+		execution := jobExecutor.RunJob(ctx, node.Name, node.Job, stdout, stderr)
+		if logs != nil && logs.Err() != nil {
+			return Failed, true
+		}
 		state, internal := finishJobExecution(ctx, node.Name, execution, output.stdout)
 		if state != Passed {
 			return state, internal
@@ -226,7 +249,10 @@ func (r Runner) executeJob(ctx context.Context, node *pipeline.Node, output sync
 	}
 	for _, step := range node.Job.Steps {
 		fmt.Fprintf(output.stdout, "$ %s\n", step.Run)
-		execution := r.Executor.Run(ctx, step.Run, output.stdout, output.stderr)
+		execution := r.Executor.Run(ctx, step.Run, stdout, stderr)
+		if logs != nil && logs.Err() != nil {
+			return Failed, true
+		}
 		if execution.Err == nil {
 			continue
 		}

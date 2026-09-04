@@ -16,6 +16,7 @@ type Writer struct {
 	runID, jobName string
 	sequence       int64
 	ctx            context.Context
+	firstErr       error
 }
 
 func New(s store.JobLogStore, runID, jobName string) *Writer {
@@ -43,6 +44,9 @@ func (w *Writer) Write(stream store.JobLogStream, p []byte) (int, error) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.firstErr != nil {
+		return 0, w.firstErr
+	}
 	for offset := 0; offset < len(p); {
 		if err := w.ctx.Err(); err != nil {
 			return offset, err
@@ -54,6 +58,7 @@ func (w *Writer) Write(stream store.JobLogStream, p []byte) (int, error) {
 		candidate := w.sequence + 1
 		err := w.store.AppendJobLog(w.ctx, store.JobLogChunk{RunID: w.runID, JobName: w.jobName, Sequence: candidate, Stream: stream, Payload: append([]byte(nil), p[offset:offset+n]...)})
 		if err != nil {
+			w.firstErr = err
 			return offset, err
 		}
 		w.sequence = candidate
@@ -61,3 +66,5 @@ func (w *Writer) Write(stream store.JobLogStream, p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func (w *Writer) Err() error { w.mu.Lock(); defer w.mu.Unlock(); return w.firstErr }

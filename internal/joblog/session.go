@@ -16,10 +16,20 @@ type Session struct {
 
 func NewSession(s store.JobLogStore, runID string) *Session { return &Session{store: s, runID: runID} }
 
-func (s *Session) OpenJob(ctx context.Context, job string, stdout, stderr io.Writer) (io.Writer, io.Writer) {
+func (s *Session) OpenJob(ctx context.Context, job string, stdout, stderr io.Writer) *Job {
 	w := NewWithContext(ctx, s.store, s.runID, job)
-	return tee{w: w.For(store.JobLogStdout), dst: stdout}, tee{w: w.For(store.JobLogStderr), dst: stderr}
+	return &Job{stdout: tee{w: w.For(store.JobLogStdout), dst: stdout}, stderr: tee{w: w.For(store.JobLogStderr), dst: stderr}, writer: w}
 }
+
+type Job struct {
+	stdout, stderr io.Writer
+	writer         *Writer
+}
+
+func (j *Job) Stdout() io.Writer { return j.stdout }
+func (j *Job) Stderr() io.Writer { return j.stderr }
+func (j *Job) Err() error        { return j.writer.Err() }
+func (j *Job) Close() error      { return j.writer.Err() }
 
 type tee struct{ w, dst io.Writer }
 
