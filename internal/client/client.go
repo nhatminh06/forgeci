@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -97,6 +98,13 @@ func (c *Client) Inspect(ctx context.Context, id string) (*store.Run, error) {
 }
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodPost, "/v1/runs/"+id+"/cancel", nil, nil)
+}
+func (c *Client) JobLogs(ctx context.Context, id, job string, after, limit int64) ([]store.JobLogChunk, error) {
+	var out struct {
+		Logs []store.JobLogChunk `json:"logs"`
+	}
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/runs/%s/logs?job=%s&after=%d&limit=%d", id, url.QueryEscape(job), after, limit), nil, &out)
+	return out.Logs, err
 }
 func (c *Client) Artifacts(ctx context.Context, id string) ([]store.Artifact, error) {
 	var out []store.Artifact

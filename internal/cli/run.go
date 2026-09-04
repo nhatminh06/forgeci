@@ -32,6 +32,7 @@ Usage:
   forge artifacts <run-id> [--server <url>]
   forge artifact download <run-id> <job> <name> --output <path> [--server <url>]
   forge inspect <run-id> [--server <url>]
+  forge logs <run-id> --job <job> [--server <url>]
   forge cancel <run-id> [--server <url>]
   forge --help
 
@@ -65,6 +66,8 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		return cacheCommand(ctx, args[1:], stdout, stderr)
 	case "inspect":
 		return inspect(ctx, args[1:], stdout, stderr)
+	case "logs":
+		return logs(ctx, args[1:], stdout, stderr)
 	case "cancel":
 		return cancelRun(ctx, args[1:], stdout, stderr)
 	case "artifacts":
@@ -74,6 +77,43 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], helpText)
 		return 2
+	}
+}
+
+func logs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "logs requires a run ID")
+		return 2
+	}
+	flags := flag.NewFlagSet("logs", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	job := flags.String("job", "", "job name")
+	server := flags.String("server", defaultServer, "control-plane URL")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || *job == "" {
+		if *job == "" {
+			fmt.Fprintln(stderr, "logs requires --job")
+		}
+		return 2
+	}
+	client := newControlClient(*server)
+	var after int64
+	for {
+		items, err := client.JobLogs(ctx, args[0], *job, after, 256)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		for _, c := range items {
+			if _, err := stdout.Write(c.Payload); err != nil {
+				return 2
+			}
+			if c.Sequence > after {
+				after = c.Sequence
+			}
+		}
+		if len(items) < 256 {
+			return 0
+		}
 	}
 }
 
