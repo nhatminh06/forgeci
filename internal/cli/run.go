@@ -120,7 +120,7 @@ func waitRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		case <-ctx.Done():
 			fmt.Fprintln(stderr, ctx.Err())
 			return 2
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(waitPollInterval):
 		}
 	}
 }
@@ -297,6 +297,7 @@ func parseLooseFlags(args []string, defaults map[string]string) (map[string]stri
 const defaultServer = "http://127.0.0.1:8080"
 
 var newControlClient = controlclient.New
+var waitPollInterval = 500 * time.Millisecond
 
 func submit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("submit", flag.ContinueOnError)
