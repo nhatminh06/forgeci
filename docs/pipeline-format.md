@@ -1,6 +1,7 @@
 # Pipeline format
 
-Milestone 3 extends version 1 with an optional per-job `image`. The default file is `forge.yaml`; `forge run --file <path>` selects another file. Concurrency remains a CLI concern.
+The default file is `forge.yaml`; `forge run --file <path>` selects another
+file. The root `forge.yaml` is a concrete valid example.
 
 ```yaml
 version: 1
@@ -48,6 +49,21 @@ jobs:
 ## Execution behavior
 
 Jobs may declare named outputs with `artifacts.upload` (`name`, `path`) and inputs with `artifacts.download` (`from`, `name`, `into`). A producer must be a direct `needs` dependency and declare the requested name. Upload follows successful steps and precedes `PASSED`; verified restore precedes consumer steps. See [artifacts.md](artifacts.md).
+
+Jobs may also restore and save caches by explicit key and path:
+
+```yaml
+cache:
+  restore:
+    - key: example-v1
+      path: .cache
+  save:
+    - key: example-v1
+      path: .cache
+```
+
+Supported schema fields are `version`, `jobs`, `needs`, `image`, `steps`,
+`artifacts.upload`, `artifacts.download`, `cache.restore`, and `cache.save`.
 
 `forge run` defaults to one active job. `forge run --jobs N` permits at most `N` ready jobs to overlap. Ready jobs are admitted in deterministic graph order; their completion and live output order may vary. Steps within each job always run sequentially in declaration order through `/bin/sh -c`.
 

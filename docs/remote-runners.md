@@ -35,8 +35,20 @@ Each job lease executes below:
 
 Local jobs run in `source/`; Docker jobs mount it read-write at `/workspace`. Each job starts from the immutable source plus only its declared artifact downloads. Passed, failed, canceled, error, shutdown, and lease-loss paths remove temporary downloads and the isolated workspace. Deletion fails closed unless the path is beneath the configured root, matches the run/job/lease shape, and its ownership marker matches. On restart, the runner removes stale marked workspaces left by a crash and preserves unmarked user directories.
 
+## Runner responsibilities
+
+A production runner registers, heartbeats, claims a job lease, restores its
+source snapshot and declared artifacts/caches, executes locally or in Docker,
+uploads durable logs, publishes artifacts, saves caches, and completes its
+lease. The M11 dogfood harness exercises this same production protocol on two
+runners; it does not use a special runner mode.
+
 ## Lease and security model
 
 One heartbeat reports every active job lease. Each result independently renews or cancels only its exact lease. Expired, wrong-runner, wrong-job, and stale ownership tuples cannot download source, transfer artifacts, or complete a job. Runner loss conservatively marks only uncertain running jobs `ABORTED`, blocks their descendants, permits independent work to continue, and never automatically reassigns them.
 
-The shared bearer token is still not per-runner cryptographic identity. Artifact routes additionally require an exact live consumer/producer job lease and durable dependency edge. Pipelines and sources are trusted; workspaces are writable; Docker daemon access is privileged; and ForgeCI provides no hostile multi-tenant sandbox, secret isolation, build cache, retries, or automatic reassignment.
+The shared bearer token is still not per-runner cryptographic identity. Artifact
+routes additionally require an exact live consumer/producer job lease and
+durable dependency edge. Pipelines and sources are trusted; workspaces are
+writable; Docker daemon access is privileged; and ForgeCI provides no hostile
+multi-tenant sandbox, secret isolation, retries, or automatic reassignment.

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -65,6 +66,129 @@ func TestCaptureExtractDeterministicDirectory(t *testing.T) {
 	if err := os.Chmod(filepath.Join(destination, "dist", "bin"), 0755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type memoryTransport struct {
+	meta Metadata
+	blob []byte
+}
+
+func (m *memoryTransport) Upload(_ context.Context, _ string, meta Metadata, r io.Reader) error {
+	b, e := io.ReadAll(r)
+	m.meta, m.blob = meta, b
+	return e
+}
+func (m *memoryTransport) Commit(context.Context, string, []Metadata) error { return nil }
+func (m *memoryTransport) Download(_ context.Context, _, _, _ string, w io.Writer) (Metadata, error) {
+	_, e := w.Write(m.blob)
+	return m.meta, e
+}
+
+func TestRemoteRestoreStagesOnDestinationFilesystem(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux tmpfs")
+	}
+	root := t.TempDir()
+	workspace, err := os.MkdirTemp("/dev/shm", "forgeci-artifact-*")
+	if err != nil {
+		t.Skip(err)
+	}
+	defer os.RemoveAll(workspace)
+	if sameDevice(t, root, workspace) {
+		t.Skip("no separate destination filesystem")
+	}
+	source := filepath.Join(root, "source")
+	mustMkdir(t, source)
+	mustWrite(t, filepath.Join(source, "app"), []byte("ok"), 0755)
+	temp := filepath.Join(root, "temp")
+	transport := &memoryTransport{}
+	producer, err := NewRemoteSession(source, temp, transport, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Publish(context.Background(), "build", []config.ArtifactUpload{{Name: "app", Path: "app"}}); err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := NewRemoteSession(workspace, temp, transport, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Restore(context.Background(), "use", []config.ArtifactDownload{{From: "build", Name: "app", Into: "input"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(workspace, "input", "app"))
+	if err != nil || string(got) != "ok" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	info, _ := os.Stat(filepath.Join(workspace, "input", "app"))
+	if info.Mode().Perm()&0100 == 0 {
+		t.Fatal("mode not preserved")
+	}
+	stages, _ := filepath.Glob(filepath.Join(workspace, "input", ".extract-*"))
+	if len(stages) != 0 {
+		t.Fatalf("stages=%v", stages)
+	}
+}
+
+func TestLocalRestoreStagesOnDestinationFilesystem(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux tmpfs")
+	}
+	root := t.TempDir()
+	workspace, err := os.MkdirTemp("/dev/shm", "forgeci-artifact-*")
+	if err != nil {
+		t.Skip(err)
+	}
+	defer os.RemoveAll(workspace)
+	if sameDevice(t, root, workspace) {
+		t.Skip("no separate destination filesystem")
+	}
+	source := filepath.Join(root, "source")
+	mustMkdir(t, source)
+	mustWrite(t, filepath.Join(source, "tool"), []byte("ok"), 0755)
+	store, err := Open(filepath.Join(root, "store"), DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := NewSession(source, filepath.Join(root, "temp"), store, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Publish(context.Background(), "build", []config.ArtifactUpload{{Name: "tool", Path: "tool"}}); err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := NewSession(workspace, filepath.Join(root, "temp"), store, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer.records = producer.records
+	if err := consumer.Restore(context.Background(), "use", []config.ArtifactDownload{{From: "build", Name: "tool", Into: "input"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(workspace, "input", "tool"))
+	if err != nil || string(got) != "ok" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	info, _ := os.Stat(filepath.Join(workspace, "input", "tool"))
+	if info.Mode().Perm()&0100 == 0 {
+		t.Fatal("mode not preserved")
+	}
+	stages, _ := filepath.Glob(filepath.Join(workspace, "input", ".extract-*"))
+	if len(stages) != 0 {
+		t.Fatalf("stages=%v", stages)
+	}
+}
+func sameDevice(t *testing.T, a, b string) bool {
+	t.Helper()
+	ai, e := os.Stat(a)
+	if e != nil {
+		t.Fatal(e)
+	}
+	bi, e := os.Stat(b)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return ai.Sys().(*syscall.Stat_t).Dev == bi.Sys().(*syscall.Stat_t).Dev
 }
 
 func TestStoreDeduplicatesAndCollectsOnlyOldOrphans(t *testing.T) {

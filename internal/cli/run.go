@@ -33,6 +33,7 @@ Usage:
   forge artifacts <run-id> [--server <url>]
   forge artifact download <run-id> <job> <name> --output <path> [--server <url>]
   forge inspect <run-id> [--server <url>]
+  forge wait <run-id> [--server <url>] [--timeout <duration>]
   forge logs <run-id> --job <job> [--server <url>]
   forge cancel <run-id> [--server <url>]
   forge --help
@@ -67,6 +68,8 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		return cacheCommand(ctx, args[1:], stdout, stderr)
 	case "inspect":
 		return inspect(ctx, args[1:], stdout, stderr)
+	case "wait":
+		return waitRun(ctx, args[1:], stdout, stderr)
 	case "logs":
 		return logs(ctx, args[1:], stdout, stderr)
 	case "cancel":
@@ -78,6 +81,47 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], helpText)
 		return 2
+	}
+}
+
+func waitRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "wait requires one run ID")
+		return 2
+	}
+	flags := flag.NewFlagSet("wait", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", defaultServer, "control-plane URL")
+	timeout := flags.Duration("timeout", 15*time.Minute, "maximum wait duration")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || *timeout <= 0 {
+		fmt.Fprintln(stderr, "invalid wait arguments")
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+	client := newControlClient(*server)
+	for {
+		run, err := client.Inspect(ctx, args[0])
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		if run.FinishedAt != nil {
+			fmt.Fprintf(stdout, "Run %s %s\n", run.ID, run.Status)
+			for _, job := range run.Jobs {
+				fmt.Fprintf(stdout, "%s %s\n", job.Name, job.Status)
+			}
+			if run.Status == store.RunPassed {
+				return 0
+			}
+			return 1
+		}
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(stderr, ctx.Err())
+			return 2
+		case <-time.After(waitPollInterval):
+		}
 	}
 }
 
@@ -253,6 +297,7 @@ func parseLooseFlags(args []string, defaults map[string]string) (map[string]stri
 const defaultServer = "http://127.0.0.1:8080"
 
 var newControlClient = controlclient.New
+var waitPollInterval = 500 * time.Millisecond
 
 func submit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("submit", flag.ContinueOnError)
@@ -260,6 +305,7 @@ func submit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	server := flags.String("server", defaultServer, "control-plane URL")
 	file := flags.String("file", "forge.yaml", "pipeline file relative to server workspace")
 	jobs := flags.Int("jobs", 1, "maximum concurrent jobs")
+	quiet := flags.Bool("quiet", false, "print only the run ID")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -272,7 +318,11 @@ func submit(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	fmt.Fprintf(stdout, "Run %s queued\n", id)
+	if *quiet {
+		fmt.Fprintln(stdout, id)
+	} else {
+		fmt.Fprintf(stdout, "Run %s queued\n", id)
+	}
 	return 0
 }
 func runs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
