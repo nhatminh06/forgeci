@@ -59,3 +59,27 @@ func TestWaitEventuallyPassesAndRejectsBadArguments(t *testing.T) {
 		}
 	}
 }
+
+func TestWaitTimeoutCancellationAndBackendFailure(t *testing.T) {
+	old := waitPollInterval
+	waitPollInterval = time.Millisecond
+	defer func() { waitPollInterval = old }()
+	running := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(store.Run{ID: "run", Status: store.RunRunning})
+	}))
+	defer running.Close()
+	var errOut strings.Builder
+	if got := Main(context.Background(), []string{"wait", "run", "--server", running.URL, "--timeout", "3ms"}, "", io.Discard, &errOut); got != 2 || !strings.Contains(errOut.String(), "deadline") {
+		t.Fatalf("code=%d err=%s", got, errOut.String())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := Main(ctx, []string{"wait", "run", "--server", running.URL, "--timeout", "1s"}, "", io.Discard, io.Discard); got != 2 {
+		t.Fatalf("cancel code=%d", got)
+	}
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "down", http.StatusServiceUnavailable) }))
+	defer broken.Close()
+	if got := Main(context.Background(), []string{"wait", "run", "--server", broken.URL}, "", io.Discard, io.Discard); got != 2 {
+		t.Fatalf("backend code=%d", got)
+	}
+}
