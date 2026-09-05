@@ -20,6 +20,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
 	"github.com/nhatminh06/forgeci/internal/runnerproto"
+	githubscm "github.com/nhatminh06/forgeci/internal/scm/github"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store/postgres"
 )
@@ -61,6 +62,10 @@ func run() error {
 	runnerTLSCert := flags.String("runner-tls-cert", "", "runner listener TLS certificate")
 	runnerTLSKey := flags.String("runner-tls-key", "", "runner listener TLS private key")
 	githubWebhookSecretFile := flags.String("github-webhook-secret-file", "", "file containing the GitHub webhook secret")
+	githubAppID := flags.Int64("github-app-id", 0, "GitHub App ID")
+	githubPrivateKeyFile := flags.String("github-private-key-file", "", "file containing the GitHub App RSA private key")
+	githubAPIBaseURL := flags.String("github-api-base-url", "https://api.github.com", "GitHub API base URL")
+	githubCloneBaseURL := flags.String("github-clone-base-url", "https://github.com", "GitHub clone base URL")
 
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -109,6 +114,25 @@ func run() error {
 	githubWebhookSecret, err := readSecretFile(*githubWebhookSecretFile)
 	if err != nil {
 		return fmt.Errorf("read GitHub webhook secret file: %w", err)
+	}
+	if (*githubAppID == 0) != (*githubPrivateKeyFile == "") {
+		return fmt.Errorf("GitHub App ID and private key file must be configured together")
+	}
+	if err := githubscm.ValidateCloneBase(*githubCloneBaseURL); err != nil {
+		return err
+	}
+	if *githubAppID != 0 {
+		keyData, err := readSecretFile(*githubPrivateKeyFile)
+		if err != nil {
+			return fmt.Errorf("read GitHub private key file: %w", err)
+		}
+		key, err := githubscm.ParsePrivateKey(keyData)
+		if err != nil {
+			return err
+		}
+		if _, err := githubscm.NewClient(*githubAPIBaseURL, githubscm.App{ID: *githubAppID, Key: key}, nil); err != nil {
+			return err
+		}
 	}
 
 	if err := validateLoopback(*listen); err != nil {
