@@ -25,6 +25,10 @@ jobs:
 
 `jobs` is required and must be a non-empty mapping. Job names are identifiers matching `[A-Za-z0-9][A-Za-z0-9_-]*`.
 
+For native SCM runs, the registered pipeline path is a clean relative path.
+ForgeCI resolves it inside the exact checkout and rejects traversal and symlink
+escape before parsing this same format.
+
 Each job has optional `needs` and `image` fields and a required, non-empty `steps` list. `image` must be a non-empty string with no leading, trailing, embedded whitespace, or control characters. Docker performs full image-reference validation. Every dependency must name another job, cannot name the job itself, and cannot be repeated. The dependency graph must be acyclic.
 
 Each step has exactly one supported field, `run`, whose value must be a non-empty string. Unknown fields and malformed structural types are rejected.

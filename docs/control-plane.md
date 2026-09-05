@@ -42,12 +42,13 @@ uses this production control plane with PostgreSQL and two remote runners.
 
 ## Recovery and limitations
 
-Snapshot and artifact blobs and metadata survive server restart. In remote mode, startup preserves queued jobs but conservatively marks uncertain running job leases `ABORTED`, blocks their descendants, and leaves independent pending jobs schedulable. The server never guesses that an old worker stopped, and it does not automatically retry or reassign lost work.
+Snapshot and artifact blobs and metadata survive server restart. In remote mode, startup preserves queued jobs but conservatively marks uncertain running job leases `ABORTED`, blocks their descendants, and leaves independent pending jobs schedulable. The run scheduler never guesses that an old runner stopped, and it does not automatically retry or reassign lost jobs. SCM delivery workers are different: fenced leases expire and are reclaimed, and typed transient source/API failures use bounded exponential retry.
 
 Startup and GC remove stale temporary data after conservative grace periods.
 Capture observes exact bytes read but is not a filesystem-atomic point-in-time
 operation; obvious mutation during capture fails. `.git` is excluded, while
-untracked files and other source content are included. There are no custom
-ignores, Git commit identities, SCM checkout, xattrs, or ACL preservation.
+untracked files and other source content are included for manual submissions.
+Native SCM snapshots exclude `.git` and record Git commit and snapshot digests
+as separate identities. There are no custom ignores, xattrs, or ACL preservation.
 See [artifacts.md](artifacts.md), [job-scheduling.md](job-scheduling.md), and
 [self-hosting.md](self-hosting.md).

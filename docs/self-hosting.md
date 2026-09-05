@@ -1,7 +1,10 @@
 # ForgeCI runs ForgeCI
 
-ForgeCI dogfoods its distributed execution path. GitHub Actions supplies a
-fresh checkout and a bootstrap host; it does not schedule the project DAG.
+ForgeCI dogfoods its distributed execution path. Native GitHub SCM can ingest
+the repository and report Checks. The GitHub Actions workflow remains as the
+external bootstrap gate until a configured sandbox GitHub App has completed
+the live push, pull-request, and failure smoke tests; it does not schedule the
+project DAG.
 The self-hosting harness builds bootstrap binaries, starts isolated PostgreSQL,
 one server, and two remote runners, then submits the root forge.yaml.
 
@@ -29,7 +32,7 @@ artifact/cache paths.
 
 ## Boundary and limitations
 
-A bootstrap machine is unavoidable: GitHub Actions provides checkout and an
-execution host, while ForgeCI owns the CI DAG and determines its result. M11
-does not add GitHub webhooks, repository registration, ForgeCI Git clone/fetch,
-GitHub Checks reporting, or GitHub App authentication; those are M12 concerns.
+An execution host is still required. Native SCM now provides signed webhooks,
+registration, exact Git fetch, GitHub App authentication, and Checks; ForgeCI
+owns the CI DAG and determines its result. The bootstrap workflow is retained
+only to avoid removing the existing external gate before live-app verification.

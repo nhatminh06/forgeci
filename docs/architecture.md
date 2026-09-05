@@ -62,9 +62,21 @@ M11 uses GitHub Actions only as bootstrap infrastructure. The harness starts
 PostgreSQL, forge-server, and two production runners; ForgeCI owns the project
 CI DAG. See self-hosting.md.
 
+## Native SCM flow
+
+GitHub webhooks are authenticated over the bounded raw body and persisted before
+returning. Bounded workers atomically claim deliveries with PostgreSQL lease
+tokens, acquire a memory-only installation token, fetch the registered repository
+and exact webhook SHA, compile its pipeline, and capture an immutable source
+snapshot. The normal run and its SCM trigger are inserted in one transaction.
+A durable reconciler creates or adopts the run's GitHub Check and updates it as
+the ForgeCI run changes state. Delivery and Check work recover after restart.
+New pull-request revisions supersede older work through fenced delivery leases
+and the normal run cancellation path.
+
 ## Intentionally absent
 
-ForgeCI has no native Git/SCM checkout, automatic retry or reassignment, runner
-labels/selectors, GPU scheduling, Kubernetes/autoscaling, secrets, RBAC, or
+ForgeCI has no runner job retry/reassignment, runner labels/selectors, GPU
+scheduling, Kubernetes/autoscaling, general pipeline secrets, RBAC, or
 high-availability control plane. Docker execution remains unsuitable as
 hostile-code isolation.
