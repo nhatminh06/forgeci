@@ -95,21 +95,18 @@ func repoCommand(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, "usage: forge repo add|list|remove")
 		return 2
 	}
-	flags := flag.NewFlagSet("repo", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	server := flags.String("server", defaultServer, "control-plane URL")
-	pipelinePath := flags.String("pipeline", "forge.yaml", "repository-relative pipeline path")
-	if err := flags.Parse(args[1:]); err != nil {
+	values, positionals, err := parseLooseFlags(args[1:], map[string]string{"--server": defaultServer, "--pipeline": "forge.yaml"})
+	if err != nil {
 		return 2
 	}
-	client := newControlClient(*server)
+	client := newControlClient(values["--server"])
 	switch args[0] {
 	case "add":
-		if flags.NArg() != 2 {
+		if len(positionals) != 2 {
 			fmt.Fprintln(stderr, "usage: forge repo add <provider> <owner/repo> [--pipeline <path>] [--server <url>]")
 			return 2
 		}
-		item, err := client.AddRepository(ctx, scm.Provider(flags.Arg(0)), flags.Arg(1), *pipelinePath)
+		item, err := client.AddRepository(ctx, scm.Provider(positionals[0]), positionals[1], values["--pipeline"])
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 2
@@ -117,7 +114,7 @@ func repoCommand(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintf(stdout, "Registered %s %s\nPipeline: %s\nEnabled: %t\n", item.Provider, item.FullName, item.PipelinePath, item.Enabled)
 		return 0
 	case "list":
-		if flags.NArg() != 0 {
+		if len(positionals) != 0 {
 			fmt.Fprintln(stderr, "usage: forge repo list [--server <url>]")
 			return 2
 		}
@@ -132,11 +129,11 @@ func repoCommand(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		}
 		return 0
 	case "remove":
-		if flags.NArg() != 1 {
+		if len(positionals) != 1 {
 			fmt.Fprintln(stderr, "usage: forge repo remove <repository-id> [--server <url>]")
 			return 2
 		}
-		if err := client.RemoveRepository(ctx, flags.Arg(0)); err != nil {
+		if err := client.RemoveRepository(ctx, positionals[0]); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 2
 		}
