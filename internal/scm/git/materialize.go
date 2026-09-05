@@ -28,6 +28,7 @@ type Prepared struct {
 	Provider                                    scm.Provider
 	Repository, GitCommitSHA, Ref, PipelinePath string
 	PullRequestNumber                           *int
+	PipelineYAML                                []byte
 	Snapshot                                    snapshot.Metadata
 	Pipeline                                    *pipeline.Graph
 }
@@ -43,19 +44,19 @@ var (
 
 func Prepare(ctx context.Context, snapshots *snapshot.Store, in Request) (Prepared, error) {
 	if snapshots == nil || in.Provider != scm.GitHub || !validSHA(in.CommitSHA) {
-		return Prepared{}, fmt.Errorf("invalid source request")
+		return Prepared{}, scm.Permanent(fmt.Errorf("invalid source request"))
 	}
 	repo, err := scm.NormalizeRepository(in.Provider, in.Repository)
 	if err != nil {
-		return Prepared{}, err
+		return Prepared{}, scm.Permanent(err)
 	}
 	pipelinePath, err := scm.ValidatePipelinePath(in.PipelinePath)
 	if err != nil {
-		return Prepared{}, err
+		return Prepared{}, scm.Permanent(err)
 	}
 	remote, err := Remote(in.CloneBase, repo)
 	if err != nil {
-		return Prepared{}, err
+		return Prepared{}, scm.Permanent(err)
 	}
 	dir, err := os.MkdirTemp("", "forgeci-scm-")
 	if err != nil {
@@ -76,39 +77,39 @@ func Prepare(ctx context.Context, snapshots *snapshot.Store, in Request) (Prepar
 		ref = fmt.Sprintf("refs/pull/%d/head", *in.PullRequestNumber)
 	}
 	if ref == "" {
-		return Prepared{}, fmt.Errorf("missing source ref")
+		return Prepared{}, scm.Permanent(fmt.Errorf("missing source ref"))
 	}
 	if err := run(ctx, dir, in.Token, "fetch", "--no-tags", "origin", ref); err != nil {
 		return Prepared{}, err
 	}
 	if err := run(ctx, dir, in.Token, "checkout", "--detach", in.CommitSHA); err != nil {
-		return Prepared{}, err
+		return Prepared{}, scm.Permanent(fmt.Errorf("requested source revision unavailable: %w", err))
 	}
 	head, err := output(ctx, dir, "rev-parse", "HEAD")
 	if err != nil || !strings.EqualFold(strings.TrimSpace(head), in.CommitSHA) {
-		return Prepared{}, fmt.Errorf("requested source revision unavailable")
+		return Prepared{}, scm.Permanent(fmt.Errorf("requested source revision unavailable"))
 	}
 	path, err := safePath(dir, pipelinePath)
 	if err != nil {
-		return Prepared{}, err
+		return Prepared{}, scm.Permanent(err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Prepared{}, fmt.Errorf("read pipeline: %w", err)
+		return Prepared{}, scm.Permanent(fmt.Errorf("read pipeline: %w", err))
 	}
 	cfg, err := config.ParseBytes(data, pipelinePath)
 	if err != nil {
-		return Prepared{}, err
+		return Prepared{}, scm.Permanent(err)
 	}
 	graph, err := pipeline.Compile(cfg)
 	if err != nil {
-		return Prepared{}, fmt.Errorf("compile pipeline: %w", err)
+		return Prepared{}, scm.Permanent(fmt.Errorf("compile pipeline: %w", err))
 	}
 	meta, err := captureSnapshot(snapshots, dir)
 	if err != nil {
 		return Prepared{}, fmt.Errorf("capture source snapshot: %w", err)
 	}
-	return Prepared{Provider: in.Provider, Repository: repo, GitCommitSHA: strings.ToLower(in.CommitSHA), Ref: ref, PullRequestNumber: in.PullRequestNumber, PipelinePath: pipelinePath, Snapshot: meta, Pipeline: graph}, nil
+	return Prepared{Provider: in.Provider, Repository: repo, GitCommitSHA: strings.ToLower(in.CommitSHA), Ref: ref, PullRequestNumber: in.PullRequestNumber, PipelinePath: pipelinePath, PipelineYAML: append([]byte(nil), data...), Snapshot: meta, Pipeline: graph}, nil
 }
 func Remote(base, repo string) (string, error) {
 	if _, err := scm.NormalizeRepository(scm.GitHub, repo); err != nil {

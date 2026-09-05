@@ -107,41 +107,48 @@ func (s *Store) CreateRun(ctx context.Context, in store.CreateRun) (*store.Run, 
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	if in.Snapshot == nil {
-		return nil, fmt.Errorf("source snapshot is required for new runs")
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO source_snapshots(source_digest,blob_digest,format,archive_size_bytes,logical_size_bytes,entry_count,created_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(source_digest) DO NOTHING`, in.Snapshot.SourceDigest, in.Snapshot.BlobDigest, in.Snapshot.Format, in.Snapshot.ArchiveSizeBytes, in.Snapshot.LogicalSizeBytes, in.Snapshot.EntryCount, in.Snapshot.CreatedAt)
-	if err != nil {
-		return nil, fmt.Errorf("insert source snapshot: %w", err)
-	}
-	var blob, format string
-	var archive, logical int64
-	var entries int
-	if err = tx.QueryRow(ctx, `SELECT blob_digest,format,archive_size_bytes,logical_size_bytes,entry_count FROM source_snapshots WHERE source_digest=$1`, in.Snapshot.SourceDigest).Scan(&blob, &format, &archive, &logical, &entries); err != nil {
+	if err := createRun(ctx, tx, in); err != nil {
 		return nil, err
-	}
-	if blob != in.Snapshot.BlobDigest || format != in.Snapshot.Format || archive != in.Snapshot.ArchiveSizeBytes || logical != in.Snapshot.LogicalSizeBytes || entries != in.Snapshot.EntryCount {
-		return nil, fmt.Errorf("conflicting source snapshot metadata")
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO pipeline_runs(id,status,pipeline_file,pipeline_yaml,pipeline_sha256,workspace,max_parallel,source_snapshot_sha256) VALUES($1,'QUEUED',$2,$3,$4,$5,$6,$7)`, in.ID, in.PipelineFile, in.PipelineYAML, in.PipelineSHA256, in.Workspace, in.MaxParallel, in.Snapshot.SourceDigest)
-	if err != nil {
-		return nil, fmt.Errorf("insert run: %w", err)
-	}
-	for _, job := range in.Jobs {
-		if _, err = tx.Exec(ctx, `INSERT INTO job_runs(run_id,job_name,status,image) VALUES($1,$2,'PENDING',$3)`, in.ID, job.Name, job.Image); err != nil {
-			return nil, fmt.Errorf("insert job %q: %w", job.Name, err)
-		}
-	}
-	for _, dependency := range in.Dependencies {
-		if _, err = tx.Exec(ctx, `INSERT INTO job_dependencies(run_id,job_name,depends_on_job) VALUES($1,$2,$3)`, in.ID, dependency.JobName, dependency.DependsOn); err != nil {
-			return nil, fmt.Errorf("insert dependency %q -> %q: %w", dependency.JobName, dependency.DependsOn, err)
-		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit run: %w", err)
 	}
 	return s.GetRun(ctx, in.ID)
+}
+
+func createRun(ctx context.Context, tx pgx.Tx, in store.CreateRun) error {
+	if in.Snapshot == nil {
+		return fmt.Errorf("source snapshot is required for new runs")
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO source_snapshots(source_digest,blob_digest,format,archive_size_bytes,logical_size_bytes,entry_count,created_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(source_digest) DO NOTHING`, in.Snapshot.SourceDigest, in.Snapshot.BlobDigest, in.Snapshot.Format, in.Snapshot.ArchiveSizeBytes, in.Snapshot.LogicalSizeBytes, in.Snapshot.EntryCount, in.Snapshot.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("insert source snapshot: %w", err)
+	}
+	var blob, format string
+	var archive, logical int64
+	var entries int
+	if err = tx.QueryRow(ctx, `SELECT blob_digest,format,archive_size_bytes,logical_size_bytes,entry_count FROM source_snapshots WHERE source_digest=$1`, in.Snapshot.SourceDigest).Scan(&blob, &format, &archive, &logical, &entries); err != nil {
+		return err
+	}
+	if blob != in.Snapshot.BlobDigest || format != in.Snapshot.Format || archive != in.Snapshot.ArchiveSizeBytes || logical != in.Snapshot.LogicalSizeBytes || entries != in.Snapshot.EntryCount {
+		return fmt.Errorf("conflicting source snapshot metadata")
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO pipeline_runs(id,status,pipeline_file,pipeline_yaml,pipeline_sha256,workspace,max_parallel,source_snapshot_sha256) VALUES($1,'QUEUED',$2,$3,$4,$5,$6,$7)`, in.ID, in.PipelineFile, in.PipelineYAML, in.PipelineSHA256, in.Workspace, in.MaxParallel, in.Snapshot.SourceDigest)
+	if err != nil {
+		return fmt.Errorf("insert run: %w", err)
+	}
+	for _, job := range in.Jobs {
+		if _, err = tx.Exec(ctx, `INSERT INTO job_runs(run_id,job_name,status,image) VALUES($1,$2,'PENDING',$3)`, in.ID, job.Name, job.Image); err != nil {
+			return fmt.Errorf("insert job %q: %w", job.Name, err)
+		}
+	}
+	for _, dependency := range in.Dependencies {
+		if _, err = tx.Exec(ctx, `INSERT INTO job_dependencies(run_id,job_name,depends_on_job) VALUES($1,$2,$3)`, in.ID, dependency.JobName, dependency.DependsOn); err != nil {
+			return fmt.Errorf("insert dependency %q -> %q: %w", dependency.JobName, dependency.DependsOn, err)
+		}
+	}
+	return nil
 }
 
 const runColumns = `p.id::text,p.status,p.pipeline_file,p.pipeline_yaml,p.pipeline_sha256,p.source_snapshot_sha256,COALESCE(s.blob_digest,''),COALESCE(s.format,''),COALESCE(s.archive_size_bytes,0),COALESCE(s.logical_size_bytes,0),COALESCE(s.entry_count,0),p.workspace,p.max_parallel,p.created_at,p.started_at,p.finished_at,p.cancel_requested_at,p.error_message,p.runner_id::text,p.lease_id::text,p.lease_generation,p.lease_expires_at,p.effective_parallel`

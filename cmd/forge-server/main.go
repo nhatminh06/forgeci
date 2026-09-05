@@ -20,7 +20,10 @@ import (
 	"github.com/nhatminh06/forgeci/internal/cache"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
 	"github.com/nhatminh06/forgeci/internal/runnerproto"
+	"github.com/nhatminh06/forgeci/internal/scm"
+	gittransport "github.com/nhatminh06/forgeci/internal/scm/git"
 	githubscm "github.com/nhatminh06/forgeci/internal/scm/github"
+	"github.com/nhatminh06/forgeci/internal/scmworker"
 	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store/postgres"
 )
@@ -66,6 +69,8 @@ func run() error {
 	githubPrivateKeyFile := flags.String("github-private-key-file", "", "file containing the GitHub App RSA private key")
 	githubAPIBaseURL := flags.String("github-api-base-url", "https://api.github.com", "GitHub API base URL")
 	githubCloneBaseURL := flags.String("github-clone-base-url", "https://github.com", "GitHub clone base URL")
+	scmWorkerConcurrency := flags.Int("scm-worker-concurrency", 2, "maximum concurrent SCM deliveries")
+	scmWorkerLease := flags.Duration("scm-worker-lease", 2*time.Minute, "SCM delivery processing lease")
 
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -121,6 +126,7 @@ func run() error {
 	if err := githubscm.ValidateCloneBase(*githubCloneBaseURL); err != nil {
 		return err
 	}
+	var githubClient *githubscm.Client
 	if *githubAppID != 0 {
 		keyData, err := readSecretFile(*githubPrivateKeyFile)
 		if err != nil {
@@ -130,9 +136,13 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		if _, err := githubscm.NewClient(*githubAPIBaseURL, githubscm.App{ID: *githubAppID, Key: key}, nil); err != nil {
+		githubClient, err = githubscm.NewClient(*githubAPIBaseURL, githubscm.App{ID: *githubAppID, Key: key}, nil)
+		if err != nil {
 			return err
 		}
+	}
+	if *scmWorkerConcurrency < 1 || *scmWorkerConcurrency > 32 || *scmWorkerLease < 10*time.Second {
+		return fmt.Errorf("SCM worker concurrency or lease is invalid")
 	}
 
 	if err := validateLoopback(*listen); err != nil {
@@ -207,6 +217,32 @@ func run() error {
 		return fmt.Errorf("recover remote jobs: %w", err)
 	}
 	defer manager.Close()
+	var deliveryWorker *scmworker.Worker
+	var checkWorker *scmworker.CheckWorker
+	if githubClient != nil {
+		deliveryWorker, err = scmworker.New(scmworker.Config{Store: persistence, Concurrency: *scmWorkerConcurrency, Lease: *scmWorkerLease, Notify: manager.Notify,
+			Prepare: func(workerCtx context.Context, repository scm.Repository, delivery scm.Delivery) (gittransport.Prepared, error) {
+				return githubscm.PrepareSource(workerCtx, githubClient, snapshotStore, *githubCloneBaseURL, repository, delivery)
+			}})
+		if err != nil {
+			return err
+		}
+		deliveryWorker.Start(ctx)
+		defer deliveryWorker.Close()
+		checkWorker, err = scmworker.NewCheckWorker(scmworker.CheckConfig{Store: persistence,
+			Report: func(checkCtx context.Context, repository scm.Repository, trigger scm.RunTrigger) (string, error) {
+				checkID := ""
+				if trigger.CheckRunID != nil {
+					checkID = *trigger.CheckRunID
+				}
+				return githubClient.ReconcileCheck(checkCtx, githubscm.CheckRequest{Repository: repository.FullName, InstallationID: trigger.InstallationID, CommitSHA: trigger.CommitSHA, ExternalID: trigger.ExternalID, CheckRunID: checkID, Status: trigger.DesiredCheckStatus, Conclusion: trigger.DesiredCheckConclusion})
+			}})
+		if err != nil {
+			return err
+		}
+		checkWorker.Start(ctx)
+		defer checkWorker.Close()
+	}
 
 	server := &http.Server{Addr: *listen, Handler: (api.Server{Manager: manager, Store: persistence, OpenArtifact: artifactStore.OpenBlob, Workspace: workspaceRoot, GitHubWebhookSecret: githubWebhookSecret}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)

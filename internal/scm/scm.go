@@ -2,11 +2,36 @@
 package scm
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"strings"
 	"time"
 )
+
+type FailureKind uint8
+
+const (
+	FailureTransient FailureKind = iota + 1
+	FailurePermanent
+)
+
+type ProcessingError struct {
+	Kind FailureKind
+	Err  error
+}
+
+func (e *ProcessingError) Error() string { return e.Err.Error() }
+func (e *ProcessingError) Unwrap() error { return e.Err }
+func Transient(err error) error          { return &ProcessingError{Kind: FailureTransient, Err: err} }
+func Permanent(err error) error          { return &ProcessingError{Kind: FailurePermanent, Err: err} }
+func Failure(err error) FailureKind {
+	var target *ProcessingError
+	if errors.As(err, &target) {
+		return target.Kind
+	}
+	return FailureTransient
+}
 
 type Provider string
 
@@ -57,6 +82,8 @@ type Delivery struct {
 	AttemptCount                                                              int
 	NextAttemptAt                                                             *time.Time
 	LastError                                                                 *string
+	ClaimToken, ClaimedBy                                                     string
+	ClaimExpiresAt                                                            *time.Time
 	ReceivedAt, ProcessedAt                                                   time.Time
 }
 
@@ -64,6 +91,11 @@ type RunTrigger struct {
 	ID, DeliveryID, RepositoryID, RunID, Provider, CommitSHA, Ref, InstallationID string
 	PullRequestNumber                                                             *int
 	CheckRunID, CheckState, LastCheckError                                        *string
+	ExternalID, DesiredCheckStatus                                                string
+	DesiredCheckConclusion, LastCheckConclusion                                   *string
+	CheckClaimToken, CheckClaimedBy                                               string
+	CheckClaimExpiresAt, NextCheckAttemptAt                                       *time.Time
+	CheckAttemptCount                                                             int
 	CreatedAt, UpdatedAt                                                          time.Time
 }
 

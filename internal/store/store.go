@@ -289,6 +289,22 @@ type SCMStore interface {
 	GetSCMRunTriggerByRunID(context.Context, string) (*scm.RunTrigger, error)
 }
 
+type SCMWorkerStore interface {
+	SCMStore
+	ClaimSCMDelivery(context.Context, string, time.Time, time.Duration) (*scm.Delivery, error)
+	RenewSCMDeliveryClaim(context.Context, string, string, time.Time, time.Duration) error
+	CompleteSCMDelivery(context.Context, string, string, scm.DeliveryStatus) error
+	FailSCMDelivery(context.Context, string, string, *time.Time, string) error
+	CreateSCMRun(context.Context, string, CreateRun, scm.RunTrigger) (*Run, *scm.RunTrigger, error)
+}
+
+type SCMCheckStore interface {
+	SCMStore
+	ClaimSCMCheck(context.Context, string, time.Time, time.Duration) (*scm.RunTrigger, error)
+	CompleteSCMCheck(context.Context, string, string, string, string, *string) error
+	FailSCMCheck(context.Context, string, string, time.Time, string) error
+}
+
 func Terminal(status RunStatus) bool {
 	switch status {
 	case RunPassed, RunFailed, RunCanceled, RunError, RunAborted:
