@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/scm"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -23,7 +25,7 @@ func integrationStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(context.Background(), `TRUNCATE cache_entries, runners, job_runs, pipeline_runs CASCADE`); err != nil {
+	if _, err := s.pool.Exec(context.Background(), `TRUNCATE scm_run_triggers, scm_deliveries, scm_repositories, cache_entries, runners, job_runs, pipeline_runs CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
@@ -41,6 +43,99 @@ func createRemoteRun(t *testing.T, s *Store, image *string) *store.Run {
 		t.Fatal(err)
 	}
 	return r
+}
+
+func TestSCMRepositoryDeliveryAndTriggerLifecycle(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "NhatMinh06/ForgeCI", PipelinePath: "ci/forge.yaml", Enabled: true})
+	if err != nil || repo.ID == "" || repo.CreatedAt.IsZero() || repo.UpdatedAt.IsZero() {
+		t.Fatalf("repository=%+v err=%v", repo, err)
+	}
+	byName, err := s.GetSCMRepositoryByIdentity(ctx, scm.GitHub, "nhatminh06/forgeci")
+	if err != nil || byName.ID != repo.ID {
+		t.Fatalf("lookup=%+v err=%v", byName, err)
+	}
+	if _, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "nhatminh06/forgeci", PipelinePath: "forge.yaml", Enabled: true}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("duplicate err=%v", err)
+	}
+	next := time.Now().UTC().Add(time.Minute)
+	last := "temporary failure"
+	pr := 7
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "delivery-1", RepositoryID: repo.ID, EventType: string(scm.EventPullRequest), Action: "synchronize", InstallationID: "42", CommitSHA: strings.Repeat("a", 40), Ref: "refs/heads/topic", PullRequestNumber: &pr, PayloadSHA256: strings.Repeat("b", 64), Status: scm.DeliveryPending, AttemptCount: 2, NextAttemptAt: &next, LastError: &last, ReceivedAt: time.Now().UTC()})
+	if err != nil || delivery.ID == "" || delivery.AttemptCount != 2 || delivery.LastError == nil {
+		t.Fatalf("delivery=%+v err=%v", delivery, err)
+	}
+	replay, err := s.CreateSCMDelivery(ctx, *delivery)
+	if err != nil || replay.ID != delivery.ID {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	conflict := *delivery
+	conflict.PayloadSHA256 = strings.Repeat("c", 64)
+	if _, err := s.CreateSCMDelivery(ctx, conflict); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("delivery conflict err=%v", err)
+	}
+	run := createRemoteRun(t, s, nil)
+	trigger, err := s.CreateSCMRunTrigger(ctx, scm.RunTrigger{DeliveryID: delivery.ID, RepositoryID: repo.ID, RunID: run.ID, Provider: string(scm.GitHub), CommitSHA: delivery.CommitSHA, Ref: delivery.Ref})
+	if err != nil || trigger.ID == "" {
+		t.Fatalf("trigger=%+v err=%v", trigger, err)
+	}
+	if got, err := s.GetSCMRunTriggerByRunID(ctx, run.ID); err != nil || got.ID != trigger.ID {
+		t.Fatalf("trigger lookup=%+v err=%v", got, err)
+	}
+	other := *trigger
+	other.RunID = uuid.NewString()
+	if _, err := s.CreateSCMRunTrigger(ctx, other); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("trigger conflict err=%v", err)
+	}
+	if err := s.DeleteSCMRepository(ctx, repo.ID); err == nil {
+		t.Fatal("repository delete accepted despite history")
+	}
+}
+
+func TestSCMDeliveryConcurrentReplay(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 20
+	ids := make(chan string, callers)
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			item, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "same", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: strings.Repeat("d", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+			if item != nil {
+				ids <- item.ID
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	close(errs)
+	var id string
+	for value := range ids {
+		if id == "" {
+			id = value
+		}
+		if value != id {
+			t.Fatalf("ids %q %q", id, value)
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_deliveries WHERE provider='github' AND delivery_id='same'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
 }
 
 func TestArtifactSetCommitPrecedesPassedAndExpires(t *testing.T) {
