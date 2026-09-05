@@ -165,6 +165,98 @@ func TestSCMRepositoryConcurrentNormalization(t *testing.T) {
 	}
 }
 
+func TestSCMDeliveryConcurrentConflict(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digests := []string{strings.Repeat("e", 64), strings.Repeat("f", 64)}
+	type result struct {
+		digest string
+		err    error
+	}
+	results := make(chan result, 24)
+	var wg sync.WaitGroup
+	for n := 0; n < cap(results); n++ {
+		wg.Add(1)
+		go func(digest string) {
+			defer wg.Done()
+			_, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "conflict", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: digest, Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+			results <- result{digest, err}
+		}(digests[n%len(digests)])
+	}
+	wg.Wait()
+	close(results)
+	winner, err := s.GetSCMDeliveryByProviderDeliveryID(ctx, scm.GitHub, "conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for item := range results {
+		if item.digest == winner.PayloadSHA256 {
+			if item.err != nil {
+				t.Fatalf("winner err=%v", item.err)
+			}
+		} else if !errors.Is(item.err, store.ErrConflict) {
+			t.Fatalf("loser digest=%s err=%v", item.digest, item.err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_deliveries WHERE provider='github' AND delivery_id='conflict'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestSCMTriggerConcurrentReplay(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "trigger", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: strings.Repeat("a", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := createRemoteRun(t, s, nil)
+	ids := make(chan string, 20)
+	errs := make(chan error, 20)
+	var wg sync.WaitGroup
+	for range cap(ids) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			item, err := s.CreateSCMRunTrigger(ctx, scm.RunTrigger{DeliveryID: delivery.ID, RepositoryID: repo.ID, RunID: run.ID, Provider: string(scm.GitHub), CommitSHA: strings.Repeat("b", 40)})
+			if item != nil {
+				ids <- item.ID
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	close(errs)
+	var id string
+	for value := range ids {
+		if id == "" {
+			id = value
+		}
+		if value != id {
+			t.Fatalf("ids %q %q", id, value)
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_run_triggers WHERE delivery_id=$1`, delivery.ID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
 func TestArtifactSetCommitPrecedesPassedAndExpires(t *testing.T) {
 	s := integrationStore(t)
 	s.SetArtifactRetention(time.Hour)
