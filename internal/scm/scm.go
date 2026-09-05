@@ -52,6 +52,7 @@ type Delivery struct {
 	ID, Provider, DeliveryID, RepositoryID, EventType, Action, InstallationID string
 	CommitSHA, Ref, PayloadSHA256                                             string
 	PullRequestNumber                                                         *int
+	PullRequestHeadRef, PullRequestBaseRef                                    string
 	Status                                                                    DeliveryStatus
 	AttemptCount                                                              int
 	NextAttemptAt                                                             *time.Time

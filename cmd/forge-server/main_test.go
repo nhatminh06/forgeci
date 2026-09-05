@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestValidateLoopback(t *testing.T) {
 	for _, address := range []string{"127.0.0.1:8080", "[::1]:8080", "localhost:8080"} {
@@ -12,6 +16,27 @@ func TestValidateLoopback(t *testing.T) {
 		if err := validateLoopback(address); err == nil {
 			t.Fatalf("accepted %s", address)
 		}
+	}
+}
+
+func TestReadSecretFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret")
+	if err := os.WriteFile(path, []byte(" value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSecretFile(path)
+	if err != nil || string(got) != "value" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	if _, err := readSecretFile(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSecretFile(path); err == nil {
+		t.Fatal("accepted public secret file")
 	}
 }
 
