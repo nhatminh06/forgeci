@@ -18,6 +18,7 @@ import (
 	"github.com/nhatminh06/forgeci/internal/executor"
 	"github.com/nhatminh06/forgeci/internal/pipeline"
 	"github.com/nhatminh06/forgeci/internal/runner"
+	"github.com/nhatminh06/forgeci/internal/scm"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -28,6 +29,9 @@ Usage:
   forge submit [--server <url>] [--file <path>] [--jobs <N>]
   forge runs [--server <url>] [--limit <N>]
   forge runners [--server <url>]
+  forge repo add <provider> <owner/repo> [--pipeline <path>] [--server <url>]
+  forge repo list [--server <url>]
+  forge repo remove <repository-id> [--server <url>]
   forge cache list [--server <url>]
   forge cache delete <key> [--server <url>]
   forge artifacts <run-id> [--server <url>]
@@ -66,6 +70,8 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		return runners(ctx, args[1:], stdout, stderr)
 	case "cache":
 		return cacheCommand(ctx, args[1:], stdout, stderr)
+	case "repo":
+		return repoCommand(ctx, args[1:], stdout, stderr)
 	case "inspect":
 		return inspect(ctx, args[1:], stdout, stderr)
 	case "wait":
@@ -80,6 +86,64 @@ func Main(ctx context.Context, args []string, directory string, stdout, stderr i
 		return artifactCommand(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], helpText)
+		return 2
+	}
+}
+
+func repoCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: forge repo add|list|remove")
+		return 2
+	}
+	flags := flag.NewFlagSet("repo", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	server := flags.String("server", defaultServer, "control-plane URL")
+	pipelinePath := flags.String("pipeline", "forge.yaml", "repository-relative pipeline path")
+	if err := flags.Parse(args[1:]); err != nil {
+		return 2
+	}
+	client := newControlClient(*server)
+	switch args[0] {
+	case "add":
+		if flags.NArg() != 2 {
+			fmt.Fprintln(stderr, "usage: forge repo add <provider> <owner/repo> [--pipeline <path>] [--server <url>]")
+			return 2
+		}
+		item, err := client.AddRepository(ctx, scm.Provider(flags.Arg(0)), flags.Arg(1), *pipelinePath)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		fmt.Fprintf(stdout, "Registered %s %s\nPipeline: %s\nEnabled: %t\n", item.Provider, item.FullName, item.PipelinePath, item.Enabled)
+		return 0
+	case "list":
+		if flags.NArg() != 0 {
+			fmt.Fprintln(stderr, "usage: forge repo list [--server <url>]")
+			return 2
+		}
+		items, err := client.Repositories(ctx)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		fmt.Fprintln(stdout, "ID\tPROVIDER\tREPOSITORY\tPIPELINE\tENABLED")
+		for _, item := range items {
+			fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%t\n", item.ID, item.Provider, item.FullName, item.PipelinePath, item.Enabled)
+		}
+		return 0
+	case "remove":
+		if flags.NArg() != 1 {
+			fmt.Fprintln(stderr, "usage: forge repo remove <repository-id> [--server <url>]")
+			return 2
+		}
+		if err := client.RemoveRepository(ctx, flags.Arg(0)); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		fmt.Fprintln(stdout, "Repository removed")
+		return 0
+	default:
+		fmt.Fprintln(stderr, "usage: forge repo add|list|remove")
 		return 2
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
+	"github.com/nhatminh06/forgeci/internal/scm"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -53,6 +54,12 @@ func (s Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.list(w, r)
 	case r.URL.Path == "/v1/runners" && r.Method == http.MethodGet:
 		s.runners(w, r)
+	case r.URL.Path == "/v1/repos" && r.Method == http.MethodPost:
+		s.createRepository(w, r)
+	case r.URL.Path == "/v1/repos" && r.Method == http.MethodGet:
+		s.listRepositories(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/repos/") && r.Method == http.MethodDelete:
+		s.deleteRepository(w, r)
 	case r.URL.Path == "/v1/cache" && r.Method == http.MethodGet:
 		s.cacheList(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/cache/") && r.Method == http.MethodDelete:
@@ -62,6 +69,82 @@ func (s Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+type createRepositoryRequest struct {
+	Provider string `json:"provider"`
+	FullName string `json:"full_name"`
+	Pipeline string `json:"pipeline"`
+}
+
+func (s Server) scmStore() (store.SCMStore, bool) {
+	value, ok := s.Store.(store.SCMStore)
+	return value, ok
+}
+
+func (s Server) createRepository(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.scmStore()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "SCM repositories unavailable")
+		return
+	}
+	var req createRepositoryRequest
+	if err := decodeStrict(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Pipeline == "" {
+		req.Pipeline = "forge.yaml"
+	}
+	item, err := b.CreateSCMRepository(r.Context(), scm.Repository{Provider: scm.Provider(req.Provider), FullName: req.FullName, PipelinePath: req.Pipeline, Enabled: true})
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeError(w, http.StatusConflict, "repository already registered")
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (s Server) listRepositories(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.scmStore()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "SCM repositories unavailable")
+		return
+	}
+	items, err := b.ListSCMRepositories(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	if items == nil {
+		items = []scm.Repository{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"repositories": items})
+}
+
+func (s Server) deleteRepository(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.scmStore()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "SCM repositories unavailable")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/repos/")
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	if err := b.DeleteSCMRepository(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "repository not found")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s Server) cacheList(w http.ResponseWriter, r *http.Request) {
