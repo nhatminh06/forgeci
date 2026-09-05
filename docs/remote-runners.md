@@ -22,6 +22,12 @@ with `--docker-memory-bytes`, `--docker-nano-cpus`, and
 `--docker-pids-limit`. These limits contain resource usage; they do not make
 Docker execution a sandbox for hostile code.
 
+Orphan reconciliation cannot distinguish a container left by a crashed runner
+from one owned by another live runner sharing the same Docker daemon: both have
+the `forgeci.managed=true` label. The supported deployment model is one
+`forge-runner` process per Docker daemon. Multiple runners sharing one daemon
+are unsupported and may remove one another's in-flight job containers.
+
 ## Download and verification
 
 The runner requests `GET /v1/runner/leases/{lease-id}/source` with its runner ID, run ID, job name, and generation. The shared bearer token is necessary but insufficient: the server also requires the exact current job owner, matching lease/generation, and unexpired deadline. There is no generic public digest endpoint.
