@@ -283,6 +283,10 @@ func TestRepositoryRoutes(t *testing.T) {
 			t.Fatalf("body=%s status=%d", body, got)
 		}
 	}
+	oversized := `{"provider":"github","full_name":"x/y","pipeline":"` + strings.Repeat("a", repositoryMaxBody) + `"}`
+	if got := request(t, handler, http.MethodPost, "/v1/repos", oversized).Code; got != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized=%d", got)
+	}
 	persistence.repoErr = store.ErrConflict
 	if got := request(t, handler, http.MethodPost, "/v1/repos", `{"provider":"github","full_name":"x/y"}`).Code; got != http.StatusConflict {
 		t.Fatalf("conflict=%d", got)

@@ -19,6 +19,7 @@ import (
 )
 
 const maxBody = 1 << 20
+const repositoryMaxBody = 16 << 10
 
 type Manager interface {
 	Ping(context.Context) error
@@ -89,7 +90,12 @@ func (s Server) createRepository(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createRepositoryRequest
-	if err := decodeStrict(w, r, &req); err != nil {
+	if err := decodeStrictLimit(w, r, &req, repositoryMaxBody); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "repository request too large")
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -444,7 +450,10 @@ func (s Server) downloadArtifact(w http.ResponseWriter, r *http.Request, runID, 
 	_, _ = io.CopyN(w, f, item.ArchiveSizeBytes)
 }
 func decodeStrict(w http.ResponseWriter, r *http.Request, target any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	return decodeStrictLimit(w, r, target, maxBody)
+}
+func decodeStrictLimit(w http.ResponseWriter, r *http.Request, target any, limit int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	defer r.Body.Close()
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
