@@ -17,7 +17,20 @@ cleanup() {
   rm -rf "$root"
 }
 trap cleanup EXIT INT TERM
-fail() { echo "self-hosting failure: $*" >&2; cat "$root/server/server.log" "$root/runner-a/runner.log" "$root/runner-b/runner.log" 2>/dev/null || true; docker logs "$pg" 2>/dev/null || true; exit 1; }
+fail() { echo "self-hosting failure: $*" >&2; cat "$root/server/server.log" "$root/runner-a/runner.log" "$root/runner-b/runner.log" 2>/dev/null || true; docker inspect -f 'container={{.State.Status}} exit={{.State.ExitCode}}' "$pg" 2>/dev/null || true; docker logs "$pg" 2>/dev/null || true; exit 1; }
+wait_for_postgres() {
+  for n in $(seq 1 300); do
+    docker logs "$pg" 2>&1 | grep -Fq 'PostgreSQL init process complete; ready for start up.' && break
+    sleep .2
+  done
+  docker logs "$pg" 2>&1 | grep -Fq 'PostgreSQL init process complete; ready for start up.' || return 1
+  for n in $(seq 1 300); do
+    [[ $(docker inspect -f '{{.State.Running}}' "$pg" 2>/dev/null || true) = true ]] &&
+      [[ $(docker exec "$pg" psql -U postgres -d forgeci -At -c 'SELECT 1' 2>/dev/null || true) = 1 ]] && return 0
+    sleep .2
+  done
+  return 1
+}
 mkdir -p "$root"/{bin,snapshots,artifacts,cache,server,runner-a,runner-b,downloads,source}
 dogfood_commit=$(git -C "$repo" rev-parse HEAD)
 git -C "$repo" archive HEAD | tar -x -C "$root/source"
@@ -34,10 +47,7 @@ printf '%s\n' "$token" >"$root/runner-token"; chmod 600 "$root/runner-token"
 go build -o "$root/bin/forge" "$repo/cmd/forge"; go build -o "$root/bin/forge-server" "$repo/cmd/forge-server"; go build -o "$root/bin/forge-runner" "$repo/cmd/forge-runner"
 docker run -d --name "$pg" -e POSTGRES_PASSWORD=forgeci -e POSTGRES_DB=forgeci -p 127.0.0.1::5432 postgres:17-alpine >/dev/null
 db_port=$(docker port "$pg" 5432/tcp | sed 's/.*://')
-for n in $(seq 1 300); do docker exec "$pg" pg_isready -U postgres -d forgeci >/dev/null 2>&1 && break; sleep .2; done
-docker exec "$pg" pg_isready -U postgres -d forgeci >/dev/null || fail "postgres not ready"
-for n in $(seq 1 300); do docker exec "$pg" psql -U postgres -d forgeci -At -c 'SELECT 1' >/dev/null 2>&1 && break; sleep .2; done
-docker exec "$pg" psql -U postgres -d forgeci -At -c 'SELECT 1' >/dev/null || fail "database not ready"
+wait_for_postgres || fail "final postgres server not ready"
 "$root/bin/forge-server" --execution-mode remote --listen "127.0.0.1:$api_port" --runner-listen "127.0.0.1:$runner_port" --runner-token-file "$root/runner-token" --workspace "$root/source" --snapshot-dir "$root/snapshots" --artifact-dir "$root/artifacts" --cache-dir "$root/cache" --database-url "postgres://postgres:forgeci@127.0.0.1:$db_port/forgeci?sslmode=disable" >"$root/server/server.log" 2>&1 & server_pid=$!
 for n in $(seq 1 100); do curl -fsS "$server/healthz" >/dev/null 2>&1 && break; sleep .1; done
 curl -fsS "$server/healthz" >/dev/null || fail "server not ready"
