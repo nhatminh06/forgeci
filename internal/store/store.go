@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/nhatminh06/forgeci/internal/scm"
 )
 
 type RunStatus string
@@ -270,6 +272,21 @@ type ArtifactStore interface {
 	SetArtifactExpiry(context.Context, string, time.Time) error
 	ExpireArtifacts(context.Context, time.Time) ([]string, error)
 	LiveArtifactBlobs(context.Context) (map[string]struct{}, error)
+}
+
+type SCMStore interface {
+	CreateSCMRepository(context.Context, scm.Repository) (*scm.Repository, error)
+	GetSCMRepository(context.Context, string) (*scm.Repository, error)
+	GetSCMRepositoryByIdentity(context.Context, scm.Provider, string) (*scm.Repository, error)
+	ListSCMRepositories(context.Context) ([]scm.Repository, error)
+	DeleteSCMRepository(context.Context, string) error
+	CreateSCMDelivery(context.Context, scm.Delivery) (*scm.Delivery, error)
+	GetSCMDelivery(context.Context, string) (*scm.Delivery, error)
+	GetSCMDeliveryByProviderDeliveryID(context.Context, scm.Provider, string) (*scm.Delivery, error)
+	CreateSCMRunTrigger(context.Context, scm.RunTrigger) (*scm.RunTrigger, error)
+	GetSCMRunTrigger(context.Context, string) (*scm.RunTrigger, error)
+	GetSCMRunTriggerByDelivery(context.Context, string) (*scm.RunTrigger, error)
+	GetSCMRunTriggerByRunID(context.Context, string) (*scm.RunTrigger, error)
 }
 
 func Terminal(status RunStatus) bool {
