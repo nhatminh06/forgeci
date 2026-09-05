@@ -71,7 +71,7 @@ func NormalizeRepository(provider Provider, fullName string) (string, error) {
 	if provider != GitHub {
 		return "", fmt.Errorf("unsupported SCM provider %q", provider)
 	}
-	if len(fullName) == 0 || len(fullName) > 256 || strings.TrimSpace(fullName) != fullName || strings.ContainsAny(fullName, " \t\r\n\x00?#:\\") {
+	if len(fullName) == 0 || len(fullName) > 256 || strings.TrimSpace(fullName) != fullName || strings.ContainsAny(fullName, " \t\r\n\x00?#:\\@") {
 		return "", fmt.Errorf("invalid repository name")
 	}
 	parts := strings.Split(fullName, "/")
