@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/scm"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -36,6 +37,49 @@ type fakeStore struct {
 	logErr    error
 	logsOnce  bool
 	logCalls  int
+	repos     []scm.Repository
+	repoErr   error
+	deleteErr error
+}
+
+func (s *fakeStore) CreateSCMRepository(_ context.Context, item scm.Repository) (*scm.Repository, error) {
+	if s.repoErr != nil {
+		return nil, s.repoErr
+	}
+	item.ID = "00000000-0000-4000-8000-000000000001"
+	item.CreatedAt, item.UpdatedAt = time.Unix(1, 0).UTC(), time.Unix(1, 0).UTC()
+	return &item, nil
+}
+func (s *fakeStore) GetSCMRepository(context.Context, string) (*scm.Repository, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRepositoryByIdentity(context.Context, scm.Provider, string) (*scm.Repository, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) ListSCMRepositories(context.Context) ([]scm.Repository, error) {
+	return s.repos, s.repoErr
+}
+func (s *fakeStore) DeleteSCMRepository(context.Context, string) error { return s.deleteErr }
+func (s *fakeStore) CreateSCMDelivery(context.Context, scm.Delivery) (*scm.Delivery, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMDelivery(context.Context, string) (*scm.Delivery, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMDeliveryByProviderDeliveryID(context.Context, scm.Provider, string) (*scm.Delivery, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) CreateSCMRunTrigger(context.Context, scm.RunTrigger) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRunTrigger(context.Context, string) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRunTriggerByDelivery(context.Context, string) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRunTriggerByRunID(context.Context, string) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
 }
 
 func (s *fakeStore) AppendJobLog(context.Context, store.JobLogChunk) error    { return nil }
@@ -224,5 +268,35 @@ func TestRunnersList(t *testing.T) {
 	runners, ok := payload["runners"].([]any)
 	if !ok || len(runners) != 2 {
 		t.Fatalf("runners=%+v", payload)
+	}
+}
+
+func TestRepositoryRoutes(t *testing.T) {
+	persistence := &fakeStore{}
+	handler := (Server{Manager: &fakeManager{}, Store: persistence}).Handler()
+	create := request(t, handler, http.MethodPost, "/v1/repos", `{"provider":"github","full_name":"Foo/Bar"}`)
+	if create.Code != http.StatusCreated || !strings.Contains(create.Body.String(), `"pipeline":"forge.yaml"`) {
+		t.Fatalf("create=%d %s", create.Code, create.Body.String())
+	}
+	for _, body := range []string{`{"provider":"gitlab","full_name":"x/y"}`, `{"provider":"github","full_name":"x/y","extra":true}`, `{`, `{"provider":"github","full_name":"x/y"}{}`} {
+		if got := request(t, handler, http.MethodPost, "/v1/repos", body).Code; got != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d", body, got)
+		}
+	}
+	persistence.repoErr = store.ErrConflict
+	if got := request(t, handler, http.MethodPost, "/v1/repos", `{"provider":"github","full_name":"x/y"}`).Code; got != http.StatusConflict {
+		t.Fatalf("conflict=%d", got)
+	}
+	persistence.repoErr = nil
+	persistence.repos = []scm.Repository{{ID: "1", Provider: scm.GitHub, FullName: "x/y", PipelinePath: "forge.yaml", Enabled: true}}
+	if got := request(t, handler, http.MethodGet, "/v1/repos", "").Code; got != http.StatusOK {
+		t.Fatalf("list=%d", got)
+	}
+	if got := request(t, handler, http.MethodDelete, "/v1/repos/not-a-uuid", "").Code; got != http.StatusNotFound {
+		t.Fatalf("invalid delete=%d", got)
+	}
+	persistence.deleteErr = store.ErrNotFound
+	if got := request(t, handler, http.MethodDelete, "/v1/repos/00000000-0000-4000-8000-000000000001", "").Code; got != http.StatusNotFound {
+		t.Fatalf("missing delete=%d", got)
 	}
 }

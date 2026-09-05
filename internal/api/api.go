@@ -96,7 +96,16 @@ func (s Server) createRepository(w http.ResponseWriter, r *http.Request) {
 	if req.Pipeline == "" {
 		req.Pipeline = "forge.yaml"
 	}
-	item, err := b.CreateSCMRepository(r.Context(), scm.Repository{Provider: scm.Provider(req.Provider), FullName: req.FullName, PipelinePath: req.Pipeline, Enabled: true})
+	provider := scm.Provider(req.Provider)
+	if _, err := scm.NormalizeRepository(provider, req.FullName); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := scm.ValidatePipelinePath(req.Pipeline); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	item, err := b.CreateSCMRepository(r.Context(), scm.Repository{Provider: provider, FullName: req.FullName, PipelinePath: req.Pipeline, Enabled: true})
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			writeError(w, http.StatusConflict, "repository already registered")

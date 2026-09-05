@@ -13,13 +13,13 @@ type Provider string
 const GitHub Provider = "github"
 
 type Repository struct {
-	ID           string
-	Provider     Provider
-	FullName     string
-	PipelinePath string
-	Enabled      bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID           string    `json:"id"`
+	Provider     Provider  `json:"provider"`
+	FullName     string    `json:"full_name"`
+	PipelinePath string    `json:"pipeline"`
+	Enabled      bool      `json:"enabled"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type EventType string
