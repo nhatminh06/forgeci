@@ -138,6 +138,33 @@ func TestSCMDeliveryConcurrentReplay(t *testing.T) {
 	}
 }
 
+func TestSCMRepositoryConcurrentNormalization(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	names := []string{"nhatminh06/forgeci", "NHATMINH06/FORGECI", "NhatMinh06/ForgeCI"}
+	errs := make(chan error, 24)
+	var wg sync.WaitGroup
+	for n := 0; n < cap(errs); n++ {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			_, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: name, PipelinePath: "forge.yaml", Enabled: true})
+			errs <- err
+		}(names[n%len(names)])
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil && !errors.Is(err, store.ErrConflict) {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_repositories WHERE provider='github' AND normalized_full_name='nhatminh06/forgeci'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
 func TestArtifactSetCommitPrecedesPassedAndExpires(t *testing.T) {
 	s := integrationStore(t)
 	s.SetArtifactRetention(time.Hour)
