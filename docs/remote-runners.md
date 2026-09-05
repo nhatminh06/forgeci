@@ -15,6 +15,13 @@ FORGECI_RUNNER_TOKEN=... ./build/forge-runner \
 
 Runner-side snapshot and artifact bounds default to 512 MiB compressed, 1 GiB extracted, and 100,000 entries. Artifact bounds use the corresponding `--artifact-max-*` flags.
 
+A Docker-capable runner removes containers left by an earlier crashed runner
+process before registering and leasing work. Job containers default to 1 GiB
+of memory, two CPUs, and 256 processes. Operators can override those bounds
+with `--docker-memory-bytes`, `--docker-nano-cpus`, and
+`--docker-pids-limit`. These limits contain resource usage; they do not make
+Docker execution a sandbox for hostile code.
+
 ## Download and verification
 
 The runner requests `GET /v1/runner/leases/{lease-id}/source` with its runner ID, run ID, job name, and generation. The shared bearer token is necessary but insufficient: the server also requires the exact current job owner, matching lease/generation, and unexpired deadline. There is no generic public digest endpoint.

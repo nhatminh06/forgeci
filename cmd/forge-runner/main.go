@@ -73,6 +73,9 @@ type Config struct {
 	MaxArtifactArchive int64
 	MaxArtifactLogical int64
 	MaxArtifactEntries int
+	DockerMemoryBytes  int64
+	DockerNanoCPUs     int64
+	DockerPidsLimit    int64
 }
 
 type RemoteRunner struct {
@@ -105,6 +108,9 @@ func main() {
 	flag.Int64Var(&cfg.MaxArtifactArchive, "artifact-max-archive-bytes", 512<<20, "maximum transferred artifact bytes")
 	flag.Int64Var(&cfg.MaxArtifactLogical, "artifact-max-logical-bytes", 1<<30, "maximum extracted artifact bytes")
 	flag.IntVar(&cfg.MaxArtifactEntries, "artifact-max-entries", 100000, "maximum extracted artifact entries")
+	flag.Int64Var(&cfg.DockerMemoryBytes, "docker-memory-bytes", 0, "job container memory limit in bytes (default: 1 GiB)")
+	flag.Int64Var(&cfg.DockerNanoCPUs, "docker-nano-cpus", 0, "job container CPU quota in billionths of a CPU (default: 2 CPUs)")
+	flag.Int64Var(&cfg.DockerPidsLimit, "docker-pids-limit", 0, "job container process limit (default: 256)")
 	flag.Parse()
 
 	if cfg.ServerToken == "" {
@@ -126,6 +132,10 @@ func main() {
 	}
 	if cfg.MaxArtifactArchive < 1 || cfg.MaxArtifactLogical < 1 || cfg.MaxArtifactEntries < 1 {
 		fmt.Fprintln(os.Stderr, "Error: artifact limits must be greater than zero")
+		os.Exit(1)
+	}
+	if cfg.DockerMemoryBytes < 0 || cfg.DockerNanoCPUs < 0 || cfg.DockerPidsLimit < 0 {
+		fmt.Fprintln(os.Stderr, "Error: Docker resource limits must not be negative")
 		os.Exit(1)
 	}
 
@@ -294,6 +304,15 @@ func loadOrCreateRunnerID(stateDir string) (string, error) {
 }
 
 func (rr *RemoteRunner) run() error {
+	if hasDocker() {
+		docker, err := executor.NewDockerWithLimits(rr.config.WorkspaceRoot, rr.dockerLimits())
+		if err != nil {
+			return fmt.Errorf("configure Docker executor: %w", err)
+		}
+		if err := docker.ReconcileOrphans(rr.ctx); err != nil {
+			return fmt.Errorf("reconcile Docker containers: %w", err)
+		}
+	}
 	// Register with control plane
 	if err := rr.register(); err != nil {
 		return fmt.Errorf("register: %w", err)
@@ -579,7 +598,7 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 	local := executor.Local{Directory: sourceDir}
 	var docker *executor.Docker
 	if job.Image != nil {
-		docker, err = executor.NewDocker(sourceDir)
+		docker, err = executor.NewDockerWithLimits(sourceDir, rr.dockerLimits())
 		if err != nil {
 			rr.completeJobError(lease, err)
 			return
@@ -617,6 +636,14 @@ func (rr *RemoteRunner) executeLeasedJob(ctx context.Context, lease jobLease) {
 	}
 	cacheSession.Save(ctx, cacheSave, os.Stdout)
 	_ = rr.sendJobComplete(lease, "PASSED", nil)
+}
+
+func (rr *RemoteRunner) dockerLimits() executor.DockerLimits {
+	return executor.DockerLimits{
+		MemoryBytes: rr.config.DockerMemoryBytes,
+		NanoCPUs:    rr.config.DockerNanoCPUs,
+		PidsLimit:   rr.config.DockerPidsLimit,
+	}
 }
 
 func (rr *RemoteRunner) completeArtifactFailure(lease jobLease, ctx context.Context, err error) {

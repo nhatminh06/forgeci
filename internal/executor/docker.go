@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"time"
 
@@ -18,11 +19,22 @@ const (
 	workspace       = "/workspace"
 	cleanupTimeout  = 15 * time.Second
 	managedLabelKey = "forgeci.managed"
+
+	defaultMemoryBytes = int64(1 << 30)
+	defaultNanoCPUs    = int64(2_000_000_000)
+	defaultPidsLimit   = int64(256)
 )
+
+type DockerLimits struct {
+	MemoryBytes int64
+	NanoCPUs    int64
+	PidsLimit   int64
+}
 
 type dockerAPI interface {
 	ImageInspect(context.Context, string, ...client.ImageInspectOption) (client.ImageInspectResult, error)
 	ImagePull(context.Context, string, client.ImagePullOptions) (client.ImagePullResponse, error)
+	ContainerList(context.Context, client.ContainerListOptions) (client.ContainerListResult, error)
 	ContainerCreate(context.Context, client.ContainerCreateOptions) (client.ContainerCreateResult, error)
 	ContainerStart(context.Context, string, client.ContainerStartOptions) (client.ContainerStartResult, error)
 	ExecCreate(context.Context, string, client.ExecCreateOptions) (client.ExecCreateResult, error)
@@ -35,17 +47,70 @@ type dockerAPI interface {
 type Docker struct {
 	client    dockerAPI
 	directory string
+	limits    DockerLimits
 }
 
 func NewDocker(directory string) (*Docker, error) {
+	return NewDockerWithLimits(directory, DockerLimits{})
+}
+
+func NewDockerWithLimits(directory string, limits DockerLimits) (*Docker, error) {
+	limits, err := normalizeDockerLimits(limits)
+	if err != nil {
+		return nil, err
+	}
 	api, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("configure Docker client: %w", err)
 	}
-	return &Docker{client: api, directory: directory}, nil
+	return &Docker{client: api, directory: directory, limits: limits}, nil
+}
+
+func normalizeDockerLimits(limits DockerLimits) (DockerLimits, error) {
+	if limits.MemoryBytes < 0 || limits.NanoCPUs < 0 || limits.PidsLimit < 0 {
+		return DockerLimits{}, fmt.Errorf("Docker resource limits must not be negative")
+	}
+	if limits.MemoryBytes == 0 {
+		limits.MemoryBytes = defaultMemoryBytes
+	}
+	if limits.NanoCPUs == 0 {
+		limits.NanoCPUs = defaultNanoCPUs
+	}
+	if limits.PidsLimit == 0 {
+		limits.PidsLimit = defaultPidsLimit
+	}
+	return limits, nil
+}
+
+func (d *Docker) ReconcileOrphans(ctx context.Context) error {
+	cleanupCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
+	defer cancel()
+	listed, err := d.client.ContainerList(cleanupCtx, client.ContainerListOptions{
+		All:     true,
+		Filters: make(client.Filters).Add("label", managedLabelKey+"=true"),
+	})
+	if err != nil {
+		return fmt.Errorf("list ForgeCI-managed containers: %w", err)
+	}
+	removed := make([]string, 0, len(listed.Items))
+	for _, item := range listed.Items {
+		if item.Labels[managedLabelKey] != "true" {
+			continue
+		}
+		if _, err := d.client.ContainerRemove(cleanupCtx, item.ID, client.ContainerRemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+			return fmt.Errorf("remove orphaned container %s: %w", item.ID, err)
+		}
+		removed = append(removed, item.ID)
+	}
+	log.Printf("reconciled %d orphaned ForgeCI containers: %v", len(removed), removed)
+	return nil
 }
 
 func (d *Docker) RunJob(ctx context.Context, name string, job config.Job, stdout, stderr io.Writer) (result Result) {
+	limits, err := normalizeDockerLimits(d.limits)
+	if err != nil {
+		return infrastructureError("configure resource limits", err)
+	}
 	image := *job.Image
 	if _, err := d.client.ImageInspect(ctx, image); err != nil {
 		if !cerrdefs.IsNotFound(err) {
@@ -75,7 +140,14 @@ func (d *Docker) RunJob(ctx context.Context, name string, job config.Job, stdout
 				"forgeci.job":   name,
 			},
 		},
-		HostConfig: &container.HostConfig{Binds: []string{d.directory + ":" + workspace + ":rw"}},
+		HostConfig: &container.HostConfig{
+			Binds: []string{d.directory + ":" + workspace + ":rw"},
+			Resources: container.Resources{
+				Memory:    limits.MemoryBytes,
+				NanoCPUs:  limits.NanoCPUs,
+				PidsLimit: &limits.PidsLimit,
+			},
+		},
 	})
 	if err != nil {
 		return infrastructureError("create container", err)

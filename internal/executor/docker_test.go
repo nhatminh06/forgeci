@@ -17,6 +17,7 @@ import (
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
 	"github.com/nhatminh06/forgeci/internal/config"
@@ -40,6 +41,10 @@ type fakeDocker struct {
 	createErr   error
 	startErr    error
 	createOpts  []client.ContainerCreateOptions
+	containers  []container.Summary
+	listOpts    []client.ContainerListOptions
+	removedIDs  []string
+	removeOpts  []client.ContainerRemoveOptions
 	exitCodes   []int
 	outputs     [][2]string
 	kills       int
@@ -68,6 +73,13 @@ func (f *fakeDocker) ImagePull(context.Context, string, client.ImagePullOptions)
 		return nil, f.pullErr
 	}
 	return &fakePull{}, nil
+}
+func (f *fakeDocker) ContainerList(_ context.Context, options client.ContainerListOptions) (client.ContainerListResult, error) {
+	f.event("list")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listOpts = append(f.listOpts, options)
+	return client.ContainerListResult{Items: f.containers}, nil
 }
 func (f *fakeDocker) ContainerCreate(_ context.Context, options client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
 	f.event("create")
@@ -135,12 +147,64 @@ func (f *fakeDocker) ContainerKill(context.Context, string, client.ContainerKill
 	f.event("kill")
 	return client.ContainerKillResult{}, nil
 }
-func (f *fakeDocker) ContainerRemove(context.Context, string, client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+func (f *fakeDocker) ContainerRemove(_ context.Context, id string, options client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
 	f.mu.Lock()
 	f.removes++
+	f.removedIDs = append(f.removedIDs, id)
+	f.removeOpts = append(f.removeOpts, options)
 	f.mu.Unlock()
 	f.event("remove")
 	return client.ContainerRemoveResult{}, nil
+}
+
+func TestDockerReconcileOrphansRemovesOnlyManagedContainers(t *testing.T) {
+	fake := &fakeDocker{containers: []container.Summary{
+		{ID: "managed-running", Labels: map[string]string{managedLabelKey: "true"}},
+		{ID: "unmanaged", Labels: map[string]string{"other": "true"}},
+		{ID: "managed-stopped", Labels: map[string]string{managedLabelKey: "true"}},
+	}}
+	docker := &Docker{client: fake}
+	if err := docker.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.listOpts) != 1 || !fake.listOpts[0].All || !fake.listOpts[0].Filters["label"][managedLabelKey+"=true"] {
+		t.Fatalf("list options=%+v", fake.listOpts)
+	}
+	if got := strings.Join(fake.removedIDs, ","); got != "managed-running,managed-stopped" {
+		t.Fatalf("removed=%q", got)
+	}
+	for _, options := range fake.removeOpts {
+		if !options.Force {
+			t.Fatalf("orphan removal was not forced: %+v", options)
+		}
+	}
+}
+
+func TestDockerContainerCreateAppliesConfiguredResourceLimits(t *testing.T) {
+	fake := &fakeDocker{}
+	limits := DockerLimits{MemoryBytes: 768 << 20, NanoCPUs: 1_500_000_000, PidsLimit: 96}
+	docker := &Docker{client: fake, directory: t.TempDir(), limits: limits}
+	result := docker.RunJob(context.Background(), "limited", imageJob("image", "true"), io.Discard, io.Discard)
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	resources := fake.createOpts[0].HostConfig.Resources
+	if resources.Memory != limits.MemoryBytes || resources.NanoCPUs != limits.NanoCPUs || resources.PidsLimit == nil || *resources.PidsLimit != limits.PidsLimit {
+		t.Fatalf("resources=%+v", resources)
+	}
+}
+
+func TestDockerContainerCreateAppliesDefaultResourceLimits(t *testing.T) {
+	fake := &fakeDocker{}
+	docker := &Docker{client: fake, directory: t.TempDir()}
+	result := docker.RunJob(context.Background(), "default-limits", imageJob("image", "true"), io.Discard, io.Discard)
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	resources := fake.createOpts[0].HostConfig.Resources
+	if resources.Memory != defaultMemoryBytes || resources.NanoCPUs != defaultNanoCPUs || resources.PidsLimit == nil || *resources.PidsLimit != defaultPidsLimit {
+		t.Fatalf("resources=%+v", resources)
+	}
 }
 
 func imageJob(image string, commands ...string) config.Job {
