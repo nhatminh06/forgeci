@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/nhatminh06/forgeci/internal/scm"
 )
 
 type RunStatus string
@@ -270,6 +272,37 @@ type ArtifactStore interface {
 	SetArtifactExpiry(context.Context, string, time.Time) error
 	ExpireArtifacts(context.Context, time.Time) ([]string, error)
 	LiveArtifactBlobs(context.Context) (map[string]struct{}, error)
+}
+
+type SCMStore interface {
+	CreateSCMRepository(context.Context, scm.Repository) (*scm.Repository, error)
+	GetSCMRepository(context.Context, string) (*scm.Repository, error)
+	GetSCMRepositoryByIdentity(context.Context, scm.Provider, string) (*scm.Repository, error)
+	ListSCMRepositories(context.Context) ([]scm.Repository, error)
+	DeleteSCMRepository(context.Context, string) error
+	CreateSCMDelivery(context.Context, scm.Delivery) (*scm.Delivery, error)
+	GetSCMDelivery(context.Context, string) (*scm.Delivery, error)
+	GetSCMDeliveryByProviderDeliveryID(context.Context, scm.Provider, string) (*scm.Delivery, error)
+	CreateSCMRunTrigger(context.Context, scm.RunTrigger) (*scm.RunTrigger, error)
+	GetSCMRunTrigger(context.Context, string) (*scm.RunTrigger, error)
+	GetSCMRunTriggerByDelivery(context.Context, string) (*scm.RunTrigger, error)
+	GetSCMRunTriggerByRunID(context.Context, string) (*scm.RunTrigger, error)
+}
+
+type SCMWorkerStore interface {
+	SCMStore
+	ClaimSCMDelivery(context.Context, string, time.Time, time.Duration) (*scm.Delivery, error)
+	RenewSCMDeliveryClaim(context.Context, string, string, time.Time, time.Duration) error
+	CompleteSCMDelivery(context.Context, string, string, scm.DeliveryStatus) error
+	FailSCMDelivery(context.Context, string, string, *time.Time, string) error
+	CreateSCMRun(context.Context, string, CreateRun, scm.RunTrigger) (*Run, *scm.RunTrigger, error)
+}
+
+type SCMCheckStore interface {
+	SCMStore
+	ClaimSCMCheck(context.Context, string, time.Time, time.Duration) (*scm.RunTrigger, error)
+	CompleteSCMCheck(context.Context, string, string, string, string, *string) error
+	FailSCMCheck(context.Context, string, string, time.Time, string) error
 }
 
 func Terminal(status RunStatus) bool {

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/scm"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -90,6 +91,25 @@ func (c *Client) CacheList(ctx context.Context, limit int) ([]store.CacheMetadat
 }
 func (c *Client) CacheDelete(ctx context.Context, key string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/cache/"+key, nil, nil)
+}
+func (c *Client) AddRepository(ctx context.Context, provider scm.Provider, fullName, pipeline string) (*scm.Repository, error) {
+	var out scm.Repository
+	err := c.do(ctx, http.MethodPost, "/v1/repos", struct {
+		Provider string `json:"provider"`
+		FullName string `json:"full_name"`
+		Pipeline string `json:"pipeline"`
+	}{string(provider), fullName, pipeline}, &out)
+	return &out, err
+}
+func (c *Client) Repositories(ctx context.Context) ([]scm.Repository, error) {
+	var out struct {
+		Repositories []scm.Repository `json:"repositories"`
+	}
+	err := c.do(ctx, http.MethodGet, "/v1/repos", nil, &out)
+	return out.Repositories, err
+}
+func (c *Client) RemoveRepository(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/repos/"+url.PathEscape(id), nil, nil)
 }
 func (c *Client) Inspect(ctx context.Context, id string) (*store.Run, error) {
 	var out store.Run

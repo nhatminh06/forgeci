@@ -2,14 +2,18 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nhatminh06/forgeci/internal/scm"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -28,14 +32,76 @@ func (m terminalManager) Get(context.Context, string) (*store.Run, error) {
 func ptr(t time.Time) *time.Time { return &t }
 
 type fakeStore struct {
-	runners   []store.Runner
-	pingErr   error
-	artifacts []store.Artifact
-	artifact  *store.Artifact
-	logs      []store.JobLogChunk
-	logErr    error
-	logsOnce  bool
-	logCalls  int
+	runners     []store.Runner
+	pingErr     error
+	artifacts   []store.Artifact
+	artifact    *store.Artifact
+	logs        []store.JobLogChunk
+	logErr      error
+	logsOnce    bool
+	logCalls    int
+	repos       []scm.Repository
+	repoErr     error
+	deleteErr   error
+	repository  *scm.Repository
+	deliveries  []scm.Delivery
+	deliveryErr error
+}
+
+func (s *fakeStore) CreateSCMRepository(_ context.Context, item scm.Repository) (*scm.Repository, error) {
+	if s.repoErr != nil {
+		return nil, s.repoErr
+	}
+	item.ID = "00000000-0000-4000-8000-000000000001"
+	item.CreatedAt, item.UpdatedAt = time.Unix(1, 0).UTC(), time.Unix(1, 0).UTC()
+	return &item, nil
+}
+func (s *fakeStore) GetSCMRepository(context.Context, string) (*scm.Repository, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRepositoryByIdentity(_ context.Context, provider scm.Provider, name string) (*scm.Repository, error) {
+	if s.repository == nil || s.repository.Provider != provider || s.repository.FullName != name {
+		return nil, store.ErrNotFound
+	}
+	return s.repository, nil
+}
+func (s *fakeStore) ListSCMRepositories(context.Context) ([]scm.Repository, error) {
+	return s.repos, s.repoErr
+}
+func (s *fakeStore) DeleteSCMRepository(context.Context, string) error { return s.deleteErr }
+func (s *fakeStore) CreateSCMDelivery(_ context.Context, item scm.Delivery) (*scm.Delivery, error) {
+	if s.deliveryErr != nil {
+		return nil, s.deliveryErr
+	}
+	for _, existing := range s.deliveries {
+		if existing.Provider == item.Provider && existing.DeliveryID == item.DeliveryID {
+			if existing.PayloadSHA256 != item.PayloadSHA256 {
+				return nil, store.ErrConflict
+			}
+			return &existing, nil
+		}
+	}
+	item.ID = "00000000-0000-4000-8000-000000000002"
+	s.deliveries = append(s.deliveries, item)
+	return &item, nil
+}
+func (s *fakeStore) GetSCMDelivery(context.Context, string) (*scm.Delivery, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMDeliveryByProviderDeliveryID(context.Context, scm.Provider, string) (*scm.Delivery, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) CreateSCMRunTrigger(context.Context, scm.RunTrigger) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRunTrigger(context.Context, string) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRunTriggerByDelivery(context.Context, string) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
+}
+func (s *fakeStore) GetSCMRunTriggerByRunID(context.Context, string) (*scm.RunTrigger, error) {
+	return nil, store.ErrNotFound
 }
 
 func (s *fakeStore) AppendJobLog(context.Context, store.JobLogChunk) error    { return nil }
@@ -163,6 +229,117 @@ func TestCreateRunStrictJSONAndDefaults(t *testing.T) {
 	}
 }
 
+func githubSignature(secret, body string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(body))
+	return "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+}
+
+func githubRequest(t *testing.T, handler http.Handler, secret, event, delivery, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/hooks/github", strings.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", githubSignature(secret, body))
+	req.Header.Set("X-GitHub-Event", event)
+	req.Header.Set("X-GitHub-Delivery", delivery)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func TestGitHubWebhook(t *testing.T) {
+	const secret = "webhook-secret"
+	registered := &scm.Repository{ID: "00000000-0000-4000-8000-000000000001", Provider: scm.GitHub, FullName: "owner/repo", Enabled: true}
+	backend := &fakeStore{repository: registered}
+	handler := (Server{Manager: &fakeManager{}, Store: backend, GitHubWebhookSecret: []byte(secret)}).Handler()
+	push := `{"after":"0123456789abcdef0123456789abcdef01234567","ref":"refs/heads/main","repository":{"full_name":"Owner/Repo","clone_url":"http://169.254.169.254/latest","ssh_url":"ssh://bad"},"installation":{"id":7}}`
+	if got := githubRequest(t, handler, secret, "push", "delivery-1", push).Code; got != http.StatusAccepted {
+		t.Fatalf("push status=%d", got)
+	}
+	if len(backend.deliveries) != 1 || backend.deliveries[0].RepositoryID != registered.ID || backend.deliveries[0].PayloadSHA256 == "" || backend.deliveries[0].Status != scm.DeliveryPending || backend.deliveries[0].CommitSHA != "0123456789abcdef0123456789abcdef01234567" {
+		t.Fatalf("delivery=%+v", backend.deliveries)
+	}
+	if got := githubRequest(t, handler, secret, "push", "delivery-1", push).Code; got != http.StatusAccepted {
+		t.Fatalf("replay status=%d", got)
+	}
+	if got := githubRequest(t, handler, secret, "push", "delivery-1", strings.Replace(push, "main", "next", 1)).Code; got != http.StatusConflict {
+		t.Fatalf("conflict status=%d", got)
+	}
+	for _, tc := range []struct{ event, body string }{
+		{"ping", `{}`},
+		{"issues", `{"repository":{"full_name":"owner/repo"}}`},
+		{"push", `{"after":"0123456789abcdef0123456789abcdef01234567","ref":"refs/tags/v1","repository":{"full_name":"owner/repo"}}`},
+		{"push", `{"after":"0000000000000000000000000000000000000000","ref":"refs/heads/main","repository":{"full_name":"owner/repo"}}`},
+	} {
+		if got := githubRequest(t, handler, secret, tc.event, "ignored-"+tc.event, tc.body).Code; got != http.StatusAccepted {
+			t.Fatalf("%s status=%d", tc.event, got)
+		}
+	}
+	pr := `{"action":"opened","repository":{"full_name":"owner/repo"},"pull_request":{"number":4,"head":{"sha":"0123456789abcdef0123456789abcdef01234567","ref":"feature"},"base":{"ref":"main"}}}`
+	for _, action := range []string{"opened", "reopened", "synchronize", "ready_for_review"} {
+		if got := githubRequest(t, handler, secret, "pull_request", "pr-"+action, strings.Replace(pr, "opened", action, 1)).Code; got != http.StatusAccepted {
+			t.Fatalf("action=%s status=%d", action, got)
+		}
+	}
+	draft := strings.Replace(pr, `"number":4`, `"number":4,"draft":true`, 1)
+	if got := githubRequest(t, handler, secret, "pull_request", "draft", draft).Code; got != http.StatusAccepted {
+		t.Fatalf("draft status=%d", got)
+	}
+	if got := githubRequest(t, handler, secret, "pull_request", "closed", strings.Replace(pr, "opened", "closed", 1)).Code; got != http.StatusAccepted {
+		t.Fatalf("closed status=%d", got)
+	}
+	if len(backend.deliveries) != 7 || backend.deliveries[len(backend.deliveries)-1].Status != scm.DeliveryIgnored {
+		t.Fatalf("deliveries=%+v", backend.deliveries)
+	}
+}
+
+func TestGitHubWebhookValidationAndRegistrationGate(t *testing.T) {
+	const secret = "webhook-secret"
+	body := `{"after":"0123456789abcdef0123456789abcdef01234567","ref":"refs/heads/main","repository":{"full_name":"owner/repo"}}`
+	for _, enabled := range []bool{false} {
+		backend := &fakeStore{repository: &scm.Repository{ID: "00000000-0000-4000-8000-000000000001", Provider: scm.GitHub, FullName: "owner/repo", Enabled: enabled}}
+		handler := (Server{Manager: &fakeManager{}, Store: backend, GitHubWebhookSecret: []byte(secret)}).Handler()
+		if got := githubRequest(t, handler, secret, "push", "delivery", body).Code; got != http.StatusAccepted || len(backend.deliveries) != 0 {
+			t.Fatalf("enabled=%t status=%d deliveries=%d", enabled, got, len(backend.deliveries))
+		}
+	}
+	unregistered := &fakeStore{}
+	if got := githubRequest(t, (Server{Manager: &fakeManager{}, Store: unregistered, GitHubWebhookSecret: []byte(secret)}).Handler(), secret, "push", "delivery", body).Code; got != http.StatusAccepted || len(unregistered.deliveries) != 0 {
+		t.Fatalf("unregistered status=%d deliveries=%d", got, len(unregistered.deliveries))
+	}
+	backend := &fakeStore{repository: &scm.Repository{ID: "00000000-0000-4000-8000-000000000001", Provider: scm.GitHub, FullName: "owner/repo", Enabled: true}}
+	handler := (Server{Manager: &fakeManager{}, Store: backend, GitHubWebhookSecret: []byte(secret)}).Handler()
+	for _, signature := range []string{"", "sha1=abcd", "sha256=abcd", "sha256=" + strings.Repeat("z", 64)} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/hooks/github", strings.NewReader(body))
+		req.Header.Set("X-Hub-Signature-256", signature)
+		req.Header.Set("X-GitHub-Event", "push")
+		req.Header.Set("X-GitHub-Delivery", "delivery")
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusUnauthorized {
+			t.Fatalf("signature=%q status=%d", signature, resp.Code)
+		}
+	}
+	for _, header := range []string{"X-GitHub-Event", "X-GitHub-Delivery"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/hooks/github", strings.NewReader(body))
+		req.Header.Set("X-Hub-Signature-256", githubSignature(secret, body))
+		req.Header.Set("X-GitHub-Event", "push")
+		req.Header.Set("X-GitHub-Delivery", "delivery")
+		req.Header.Del(header)
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("header=%s status=%d", header, resp.Code)
+		}
+	}
+	oversized := strings.Repeat("x", githubWebhookMaxBody+1)
+	if got := githubRequest(t, handler, secret, "push", "oversized", oversized).Code; got != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status=%d", got)
+	}
+	if got := githubRequest(t, handler, secret, "push", "malformed", `{`).Code; got != http.StatusBadRequest {
+		t.Fatalf("malformed status=%d", got)
+	}
+}
+
 func TestListLimitValidation(t *testing.T) {
 	handler := (Server{Manager: &fakeManager{}}).Handler()
 	for _, path := range []string{"/v1/runs?limit=0", "/v1/runs?limit=101", "/v1/runs?limit=nope", "/v1/runs?unknown=1"} {
@@ -224,5 +401,39 @@ func TestRunnersList(t *testing.T) {
 	runners, ok := payload["runners"].([]any)
 	if !ok || len(runners) != 2 {
 		t.Fatalf("runners=%+v", payload)
+	}
+}
+
+func TestRepositoryRoutes(t *testing.T) {
+	persistence := &fakeStore{}
+	handler := (Server{Manager: &fakeManager{}, Store: persistence}).Handler()
+	create := request(t, handler, http.MethodPost, "/v1/repos", `{"provider":"github","full_name":"Foo/Bar"}`)
+	if create.Code != http.StatusCreated || !strings.Contains(create.Body.String(), `"pipeline":"forge.yaml"`) {
+		t.Fatalf("create=%d %s", create.Code, create.Body.String())
+	}
+	for _, body := range []string{`{"provider":"gitlab","full_name":"x/y"}`, `{"provider":"github","full_name":"x/y","extra":true}`, `{`, `{"provider":"github","full_name":"x/y"}{}`} {
+		if got := request(t, handler, http.MethodPost, "/v1/repos", body).Code; got != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d", body, got)
+		}
+	}
+	oversized := `{"provider":"github","full_name":"x/y","pipeline":"` + strings.Repeat("a", repositoryMaxBody) + `"}`
+	if got := request(t, handler, http.MethodPost, "/v1/repos", oversized).Code; got != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized=%d", got)
+	}
+	persistence.repoErr = store.ErrConflict
+	if got := request(t, handler, http.MethodPost, "/v1/repos", `{"provider":"github","full_name":"x/y"}`).Code; got != http.StatusConflict {
+		t.Fatalf("conflict=%d", got)
+	}
+	persistence.repoErr = nil
+	persistence.repos = []scm.Repository{{ID: "1", Provider: scm.GitHub, FullName: "x/y", PipelinePath: "forge.yaml", Enabled: true}}
+	if got := request(t, handler, http.MethodGet, "/v1/repos", "").Code; got != http.StatusOK {
+		t.Fatalf("list=%d", got)
+	}
+	if got := request(t, handler, http.MethodDelete, "/v1/repos/not-a-uuid", "").Code; got != http.StatusNotFound {
+		t.Fatalf("invalid delete=%d", got)
+	}
+	persistence.deleteErr = store.ErrNotFound
+	if got := request(t, handler, http.MethodDelete, "/v1/repos/00000000-0000-4000-8000-000000000001", "").Code; got != http.StatusNotFound {
+		t.Fatalf("missing delete=%d", got)
 	}
 }

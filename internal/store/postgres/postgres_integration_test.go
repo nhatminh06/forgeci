@@ -2,14 +2,23 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/artifact"
+	"github.com/nhatminh06/forgeci/internal/config"
+	"github.com/nhatminh06/forgeci/internal/pipeline"
+	"github.com/nhatminh06/forgeci/internal/scm"
+	gittransport "github.com/nhatminh06/forgeci/internal/scm/git"
+	"github.com/nhatminh06/forgeci/internal/scmworker"
+	"github.com/nhatminh06/forgeci/internal/snapshot"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
@@ -23,7 +32,7 @@ func integrationStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(context.Background(), `TRUNCATE cache_entries, runners, job_runs, pipeline_runs CASCADE`); err != nil {
+	if _, err := s.pool.Exec(context.Background(), `TRUNCATE scm_run_triggers, scm_deliveries, scm_repositories, cache_entries, runners, job_runs, pipeline_runs CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
@@ -41,6 +50,590 @@ func createRemoteRun(t *testing.T, s *Store, image *string) *store.Run {
 		t.Fatal(err)
 	}
 	return r
+}
+
+func TestSCMRepositoryDeliveryAndTriggerLifecycle(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "NhatMinh06/ForgeCI", PipelinePath: "ci/forge.yaml", Enabled: true})
+	if err != nil || repo.ID == "" || repo.CreatedAt.IsZero() || repo.UpdatedAt.IsZero() {
+		t.Fatalf("repository=%+v err=%v", repo, err)
+	}
+	byName, err := s.GetSCMRepositoryByIdentity(ctx, scm.GitHub, "nhatminh06/forgeci")
+	if err != nil || byName.ID != repo.ID {
+		t.Fatalf("lookup=%+v err=%v", byName, err)
+	}
+	if _, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "nhatminh06/forgeci", PipelinePath: "forge.yaml", Enabled: true}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("duplicate err=%v", err)
+	}
+	next := time.Now().UTC().Add(time.Minute)
+	last := "temporary failure"
+	pr := 7
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "delivery-1", RepositoryID: repo.ID, EventType: string(scm.EventPullRequest), Action: "synchronize", InstallationID: "42", CommitSHA: strings.Repeat("a", 40), Ref: "refs/heads/topic", PullRequestNumber: &pr, PayloadSHA256: strings.Repeat("b", 64), Status: scm.DeliveryPending, AttemptCount: 2, NextAttemptAt: &next, LastError: &last, ReceivedAt: time.Now().UTC()})
+	if err != nil || delivery.ID == "" || delivery.AttemptCount != 2 || delivery.LastError == nil {
+		t.Fatalf("delivery=%+v err=%v", delivery, err)
+	}
+	replay, err := s.CreateSCMDelivery(ctx, *delivery)
+	if err != nil || replay.ID != delivery.ID {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	conflict := *delivery
+	conflict.PayloadSHA256 = strings.Repeat("c", 64)
+	if _, err := s.CreateSCMDelivery(ctx, conflict); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("delivery conflict err=%v", err)
+	}
+	run := createRemoteRun(t, s, nil)
+	trigger, err := s.CreateSCMRunTrigger(ctx, scm.RunTrigger{DeliveryID: delivery.ID, RepositoryID: repo.ID, RunID: run.ID, Provider: string(scm.GitHub), CommitSHA: delivery.CommitSHA, Ref: delivery.Ref})
+	if err != nil || trigger.ID == "" {
+		t.Fatalf("trigger=%+v err=%v", trigger, err)
+	}
+	if got, err := s.GetSCMRunTriggerByRunID(ctx, run.ID); err != nil || got.ID != trigger.ID {
+		t.Fatalf("trigger lookup=%+v err=%v", got, err)
+	}
+	other := *trigger
+	other.RunID = uuid.NewString()
+	if _, err := s.CreateSCMRunTrigger(ctx, other); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("trigger conflict err=%v", err)
+	}
+	if err := s.DeleteSCMRepository(ctx, repo.ID); err == nil {
+		t.Fatal("repository delete accepted despite history")
+	}
+}
+
+func TestSCMDeliveryConcurrentReplay(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 20
+	ids := make(chan string, callers)
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			item, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "same", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: strings.Repeat("d", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+			if item != nil {
+				ids <- item.ID
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	close(errs)
+	var id string
+	for value := range ids {
+		if id == "" {
+			id = value
+		}
+		if value != id {
+			t.Fatalf("ids %q %q", id, value)
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_deliveries WHERE provider='github' AND delivery_id='same'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestSCMDeliveryClaimHasOneOwnerAndCountsOneAttempt(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "claim-race", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: strings.Repeat("a", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const claimers = 20
+	results := make(chan *scm.Delivery, claimers)
+	errs := make(chan error, claimers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range claimers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			item, err := s.ClaimSCMDelivery(ctx, fmt.Sprintf("worker-%d", i), time.Now().UTC(), time.Minute)
+			results <- item
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	owners := 0
+	for item := range results {
+		if item != nil {
+			owners++
+			if item.ID != delivery.ID || item.ClaimToken == "" || item.ClaimedBy == "" || item.AttemptCount != 1 {
+				t.Fatalf("claim=%+v", item)
+			}
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if owners != 1 {
+		t.Fatalf("owners=%d want 1", owners)
+	}
+	stored, err := s.GetSCMDelivery(ctx, delivery.ID)
+	if err != nil || stored.AttemptCount != 1 {
+		t.Fatalf("stored=%+v err=%v", stored, err)
+	}
+}
+
+func TestSCMDeliveryClaimRejectsWrongAndExpiredOwners(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "lease", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: strings.Repeat("b", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	first, err := s.ClaimSCMDelivery(ctx, "first", now, 100*time.Millisecond)
+	if err != nil || first == nil {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	wrongToken := uuid.NewString()
+	if err := s.CompleteSCMDelivery(ctx, delivery.ID, wrongToken, scm.DeliveryProcessed); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("wrong owner completed: %v", err)
+	}
+	retry := now.Add(time.Minute)
+	if err := s.FailSCMDelivery(ctx, delivery.ID, wrongToken, &retry, "temporary"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("wrong owner retried: %v", err)
+	}
+	second, err := s.ClaimSCMDelivery(ctx, "second", now.Add(time.Second), time.Minute)
+	if err != nil || second == nil || second.ClaimToken == first.ClaimToken || second.AttemptCount != 2 {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	if err := s.CompleteSCMDelivery(ctx, delivery.ID, first.ClaimToken, scm.DeliveryProcessed); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expired owner completed reclaimed delivery: %v", err)
+	}
+	if err := s.FailSCMDelivery(ctx, delivery.ID, first.ClaimToken, &retry, "stale"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expired owner retried reclaimed delivery: %v", err)
+	}
+	if err := s.RenewSCMDeliveryClaim(ctx, delivery.ID, second.ClaimToken, time.Now().UTC(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteSCMDelivery(ctx, delivery.ID, second.ClaimToken, scm.DeliveryProcessed); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.GetSCMDelivery(ctx, delivery.ID)
+	if err != nil || stored.Status != scm.DeliveryProcessed || stored.AttemptCount != 2 || stored.ClaimToken != "" || stored.ProcessedAt.IsZero() {
+		t.Fatalf("stored=%+v err=%v", stored, err)
+	}
+}
+
+func TestSCMDeliveryRetryEligibilityAndPermanentFailure(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "retry", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: strings.Repeat("c", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := s.ClaimSCMDelivery(ctx, "worker", now, time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	retryAt := now.Add(time.Minute)
+	if err := s.FailSCMDelivery(ctx, claim.ID, claim.ClaimToken, &retryAt, strings.Repeat("x", 5000)); err != nil {
+		t.Fatal(err)
+	}
+	if item, err := s.ClaimSCMDelivery(ctx, "early", now.Add(30*time.Second), time.Minute); err != nil || item != nil {
+		t.Fatalf("early=%+v err=%v", item, err)
+	}
+	reclaimed, err := s.ClaimSCMDelivery(ctx, "retry", now.Add(2*time.Minute), time.Minute)
+	if err != nil || reclaimed == nil || reclaimed.AttemptCount != 2 {
+		t.Fatalf("reclaimed=%+v err=%v", reclaimed, err)
+	}
+	if err := s.FailSCMDelivery(ctx, reclaimed.ID, reclaimed.ClaimToken, nil, "permanent"); err != nil {
+		t.Fatal(err)
+	}
+	if item, err := s.ClaimSCMDelivery(ctx, "never", now.Add(24*time.Hour), time.Minute); err != nil || item != nil {
+		t.Fatalf("permanent claim=%+v err=%v", item, err)
+	}
+	stored, err := s.GetSCMDelivery(ctx, claim.ID)
+	if err != nil || stored.LastError == nil || *stored.LastError != "permanent" || stored.NextAttemptAt != nil {
+		t.Fatalf("stored=%+v err=%v", stored, err)
+	}
+}
+
+func TestSCMRunCreationAndTriggerAreAtomicAndIdempotent(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "atomic-run", RepositoryID: repo.ID, EventType: string(scm.EventPush), CommitSHA: strings.Repeat("a", 40), PayloadSHA256: strings.Repeat("d", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := s.ClaimSCMDelivery(ctx, "worker", time.Now().UTC(), time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	makeInput := func(id string) store.CreateRun {
+		return store.CreateRun{ID: id, PipelineFile: "forge.yaml", PipelineYAML: []byte("version: 1\njobs:\n  build:\n    steps:\n      - run: true\n"), PipelineSHA256: strings.Repeat("e", 64), Workspace: "owner/repo", MaxParallel: 1, Jobs: []store.Job{{Name: "build"}}, Snapshot: testSnapshot()}
+	}
+	brokenID := uuid.NewString()
+	broken := scm.RunTrigger{DeliveryID: delivery.ID, RepositoryID: uuid.NewString(), RunID: brokenID, Provider: string(scm.GitHub), CommitSHA: delivery.CommitSHA}
+	if _, _, err := s.CreateSCMRun(ctx, claim.ClaimToken, makeInput(brokenID), broken); err == nil {
+		t.Fatal("invalid trigger unexpectedly committed")
+	}
+	if _, err := s.GetRun(ctx, brokenID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("orphan run survived trigger failure: %v", err)
+	}
+
+	const contenders = 2
+	results := make(chan error, contenders)
+	start := make(chan struct{})
+	for range contenders {
+		go func() {
+			<-start
+			id := uuid.NewString()
+			_, _, err := s.CreateSCMRun(ctx, claim.ClaimToken, makeInput(id), scm.RunTrigger{DeliveryID: delivery.ID, RepositoryID: repo.ID, RunID: id, Provider: string(scm.GitHub), CommitSHA: delivery.CommitSHA})
+			results <- err
+		}()
+	}
+	close(start)
+	successes := 0
+	for range contenders {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful creators=%d want 1", successes)
+	}
+	var runs, triggers int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM pipeline_runs`).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_run_triggers WHERE delivery_id=$1`, delivery.ID).Scan(&triggers); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || triggers != 1 {
+		t.Fatalf("runs=%d triggers=%d", runs, triggers)
+	}
+}
+
+func TestSCMWorkerProcessesDurableDeliveryIntoOneRun(t *testing.T) {
+	s := integrationStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "worker-run", RepositoryID: repo.ID, EventType: string(scm.EventPush), InstallationID: "42", CommitSHA: strings.Repeat("a", 40), Ref: "refs/heads/main", PayloadSHA256: strings.Repeat("f", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	yaml := []byte("version: 1\njobs:\n  build:\n    steps:\n      - run: true\n")
+	cfg, err := config.ParseBytes(yaml, "forge.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph, err := pipeline.Compile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := gittransport.Prepared{Provider: scm.GitHub, Repository: repo.FullName, GitCommitSHA: delivery.CommitSHA, Ref: delivery.Ref, PipelinePath: repo.PipelinePath, PipelineYAML: yaml, Pipeline: graph,
+		Snapshot: snapshot.Metadata{SourceDigest: strings.Repeat("1", 64), BlobDigest: strings.Repeat("2", 64), Format: snapshot.Format, ArchiveSizeBytes: 10, LogicalSizeBytes: 5, EntryCount: 1, CreatedAt: time.Now().UTC()}}
+	var prepareCalls atomic.Int32
+	worker, err := scmworker.New(scmworker.Config{Store: s, WorkerID: "test-worker", Concurrency: 2, Lease: time.Second, Poll: 5 * time.Millisecond,
+		Prepare: func(context.Context, scm.Repository, scm.Delivery) (gittransport.Prepared, error) {
+			prepareCalls.Add(1)
+			return prepared, nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.Start(ctx)
+	t.Cleanup(worker.Close)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		stored, err := s.GetSCMDelivery(ctx, delivery.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status == scm.DeliveryProcessed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivery did not finish: %+v", stored)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	trigger, err := s.GetSCMRunTriggerByDelivery(ctx, delivery.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.GetRun(ctx, trigger.RunID)
+	if err != nil || run.SourceSnapshotSHA256 == nil || *run.SourceSnapshotSHA256 != prepared.Snapshot.SourceDigest || prepareCalls.Load() != 1 {
+		t.Fatalf("run=%+v err=%v prepare calls=%d", run, err, prepareCalls.Load())
+	}
+	var runs, triggers int
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM pipeline_runs`).Scan(&runs)
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_run_triggers`).Scan(&triggers)
+	if runs != 1 || triggers != 1 {
+		t.Fatalf("runs=%d triggers=%d", runs, triggers)
+	}
+}
+
+func TestSCMCheckClaimMapsRunStateAndRejectsStaleOwner(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "check", RepositoryID: repo.ID, EventType: string(scm.EventPush), CommitSHA: strings.Repeat("a", 40), PayloadSHA256: strings.Repeat("9", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := createRemoteRun(t, s, nil)
+	trigger, err := s.CreateSCMRunTrigger(ctx, scm.RunTrigger{DeliveryID: delivery.ID, RepositoryID: repo.ID, RunID: run.ID, Provider: string(scm.GitHub), CommitSHA: delivery.CommitSHA, InstallationID: "7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := s.ClaimSCMCheck(ctx, "checks", time.Now().UTC(), time.Minute)
+	if err != nil || claim == nil || claim.DesiredCheckStatus != "queued" || claim.ExternalID != run.ID || claim.CheckAttemptCount != 1 {
+		t.Fatalf("queued claim=%+v err=%v", claim, err)
+	}
+	if err := s.CompleteSCMCheck(ctx, trigger.ID, uuid.NewString(), "10", "queued", nil); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale check owner completed: %v", err)
+	}
+	if err := s.CompleteSCMCheck(ctx, trigger.ID, claim.CheckClaimToken, "10", "queued", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE pipeline_runs SET status='RUNNING',started_at=now() WHERE id=$1`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = s.ClaimSCMCheck(ctx, "checks", time.Now().UTC(), time.Minute)
+	if err != nil || claim == nil || claim.DesiredCheckStatus != "in_progress" || claim.DesiredCheckConclusion != nil {
+		t.Fatalf("running claim=%+v err=%v", claim, err)
+	}
+	if err := s.CompleteSCMCheck(ctx, trigger.ID, claim.CheckClaimToken, "10", claim.DesiredCheckStatus, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE pipeline_runs SET status='PASSED',finished_at=now() WHERE id=$1`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = s.ClaimSCMCheck(ctx, "checks", time.Now().UTC(), time.Minute)
+	if err != nil || claim == nil || claim.DesiredCheckStatus != "completed" || claim.DesiredCheckConclusion == nil || *claim.DesiredCheckConclusion != "success" {
+		t.Fatalf("passed claim=%+v err=%v", claim, err)
+	}
+	if err := s.CompleteSCMCheck(ctx, trigger.ID, claim.CheckClaimToken, "10", claim.DesiredCheckStatus, claim.DesiredCheckConclusion); err != nil {
+		t.Fatal(err)
+	}
+	if item, err := s.ClaimSCMCheck(ctx, "checks", time.Now().UTC(), time.Minute); err != nil || item != nil {
+		t.Fatalf("unchanged check reclaimed=%+v err=%v", item, err)
+	}
+}
+
+func TestSCMPullRequestSupersessionCancelsOlderWorkAndRejectsStaleWorker(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := 3
+	createDelivery := func(id, sha, action string, status scm.DeliveryStatus) *scm.Delivery {
+		item, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: id, RepositoryID: repo.ID, EventType: string(scm.EventPullRequest), Action: action, InstallationID: "7", CommitSHA: sha, PullRequestNumber: &pr, PayloadSHA256: strings.Repeat(id[:1], 64), Status: status, ReceivedAt: time.Now().UTC()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	pending := createDelivery("pending-a", strings.Repeat("a", 40), "opened", scm.DeliveryPending)
+	_ = createDelivery("pending-b", strings.Repeat("b", 40), "synchronize", scm.DeliveryPending)
+	stored, err := s.GetSCMDelivery(ctx, pending.ID)
+	if err != nil || stored.Status != scm.DeliveryIgnored {
+		t.Fatalf("older pending=%+v err=%v", stored, err)
+	}
+	claimB, err := s.ClaimSCMDelivery(ctx, "worker-b", time.Now().UTC(), time.Minute)
+	if err != nil || claimB == nil || claimB.DeliveryID != "pending-b" {
+		t.Fatalf("claim B=%+v err=%v", claimB, err)
+	}
+	if err := s.CompleteSCMDelivery(ctx, claimB.ID, claimB.ClaimToken, scm.DeliveryProcessed); err != nil {
+		t.Fatal(err)
+	}
+
+	active := createDelivery("active-c", strings.Repeat("c", 40), "synchronize", scm.DeliveryPending)
+	claimC, err := s.ClaimSCMDelivery(ctx, "worker-c", time.Now().UTC(), time.Minute)
+	if err != nil || claimC == nil {
+		t.Fatalf("claim C=%+v err=%v", claimC, err)
+	}
+	run := createRemoteRun(t, s, nil)
+	if _, err := s.pool.Exec(ctx, `UPDATE pipeline_runs SET status='RUNNING',started_at=now() WHERE id=$1`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSCMRunTrigger(ctx, scm.RunTrigger{DeliveryID: active.ID, RepositoryID: repo.ID, RunID: run.ID, Provider: string(scm.GitHub), CommitSHA: active.CommitSHA, PullRequestNumber: &pr, InstallationID: "7"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = createDelivery("newer-d", strings.Repeat("d", 40), "synchronize", scm.DeliveryPending)
+	stored, err = s.GetSCMDelivery(ctx, active.ID)
+	if err != nil || stored.Status != scm.DeliveryIgnored {
+		t.Fatalf("active delivery=%+v err=%v", stored, err)
+	}
+	run, err = s.GetRun(ctx, run.ID)
+	if err != nil || run.CancelRequestedAt == nil {
+		t.Fatalf("older run=%+v err=%v", run, err)
+	}
+	if err := s.CompleteSCMDelivery(ctx, active.ID, claimC.ClaimToken, scm.DeliveryProcessed); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale worker completed superseded delivery: %v", err)
+	}
+	closed := createDelivery("closed-d", strings.Repeat("d", 40), "closed", scm.DeliveryIgnored)
+	if closed.Status != scm.DeliveryIgnored {
+		t.Fatalf("closed=%+v", closed)
+	}
+}
+
+func TestSCMRepositoryConcurrentNormalization(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	names := []string{"nhatminh06/forgeci", "NHATMINH06/FORGECI", "NhatMinh06/ForgeCI"}
+	errs := make(chan error, 24)
+	var wg sync.WaitGroup
+	for n := 0; n < cap(errs); n++ {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			_, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: name, PipelinePath: "forge.yaml", Enabled: true})
+			errs <- err
+		}(names[n%len(names)])
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil && !errors.Is(err, store.ErrConflict) {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_repositories WHERE provider='github' AND normalized_full_name='nhatminh06/forgeci'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestSCMDeliveryConcurrentConflict(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digests := []string{strings.Repeat("e", 64), strings.Repeat("f", 64)}
+	type result struct {
+		digest string
+		err    error
+	}
+	results := make(chan result, 24)
+	var wg sync.WaitGroup
+	for n := 0; n < cap(results); n++ {
+		wg.Add(1)
+		go func(digest string) {
+			defer wg.Done()
+			_, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "conflict", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: digest, Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+			results <- result{digest, err}
+		}(digests[n%len(digests)])
+	}
+	wg.Wait()
+	close(results)
+	winner, err := s.GetSCMDeliveryByProviderDeliveryID(ctx, scm.GitHub, "conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for item := range results {
+		if item.digest == winner.PayloadSHA256 {
+			if item.err != nil {
+				t.Fatalf("winner err=%v", item.err)
+			}
+		} else if !errors.Is(item.err, store.ErrConflict) {
+			t.Fatalf("loser digest=%s err=%v", item.digest, item.err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_deliveries WHERE provider='github' AND delivery_id='conflict'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestSCMTriggerConcurrentReplay(t *testing.T) {
+	s := integrationStore(t)
+	ctx := context.Background()
+	repo, err := s.CreateSCMRepository(ctx, scm.Repository{Provider: scm.GitHub, FullName: "owner/repo", PipelinePath: "forge.yaml", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.CreateSCMDelivery(ctx, scm.Delivery{Provider: string(scm.GitHub), DeliveryID: "trigger", RepositoryID: repo.ID, EventType: string(scm.EventPush), PayloadSHA256: strings.Repeat("a", 64), Status: scm.DeliveryPending, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := createRemoteRun(t, s, nil)
+	ids := make(chan string, 20)
+	errs := make(chan error, 20)
+	var wg sync.WaitGroup
+	for range cap(ids) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			item, err := s.CreateSCMRunTrigger(ctx, scm.RunTrigger{DeliveryID: delivery.ID, RepositoryID: repo.ID, RunID: run.ID, Provider: string(scm.GitHub), CommitSHA: strings.Repeat("b", 40)})
+			if item != nil {
+				ids <- item.ID
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	close(errs)
+	var id string
+	for value := range ids {
+		if id == "" {
+			id = value
+		}
+		if value != id {
+			t.Fatalf("ids %q %q", id, value)
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM scm_run_triggers WHERE delivery_id=$1`, delivery.ID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
 }
 
 func TestArtifactSetCommitPrecedesPassedAndExpires(t *testing.T) {

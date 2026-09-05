@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,10 +16,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nhatminh06/forgeci/internal/controlplane"
+	"github.com/nhatminh06/forgeci/internal/scm"
+	githubscm "github.com/nhatminh06/forgeci/internal/scm/github"
 	"github.com/nhatminh06/forgeci/internal/store"
 )
 
 const maxBody = 1 << 20
+const repositoryMaxBody = 16 << 10
+const githubWebhookMaxBody = 1 << 20
 
 type Manager interface {
 	Ping(context.Context) error
@@ -34,10 +40,11 @@ type Store interface {
 type JobLogStore interface{ store.JobLogStore }
 
 type Server struct {
-	Manager      Manager
-	Store        Store
-	OpenArtifact func(string) (*os.File, error)
-	Workspace    string
+	Manager             Manager
+	Store               Store
+	OpenArtifact        func(string) (*os.File, error)
+	Workspace           string
+	GitHubWebhookSecret []byte
 }
 
 func (s Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
@@ -53,6 +60,14 @@ func (s Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.list(w, r)
 	case r.URL.Path == "/v1/runners" && r.Method == http.MethodGet:
 		s.runners(w, r)
+	case r.URL.Path == "/v1/repos" && r.Method == http.MethodPost:
+		s.createRepository(w, r)
+	case r.URL.Path == "/v1/repos" && r.Method == http.MethodGet:
+		s.listRepositories(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/repos/") && r.Method == http.MethodDelete:
+		s.deleteRepository(w, r)
+	case r.URL.Path == "/v1/hooks/github" && r.Method == http.MethodPost:
+		s.githubWebhook(w, r)
 	case r.URL.Path == "/v1/cache" && r.Method == http.MethodGet:
 		s.cacheList(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/cache/") && r.Method == http.MethodDelete:
@@ -62,6 +77,168 @@ func (s Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
+	if len(s.GitHubWebhookSecret) == 0 {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, githubWebhookMaxBody)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "webhook request too large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid webhook body")
+		return
+	}
+	if err := githubscm.VerifySignature(s.GitHubWebhookSecret, r.Header.Get("X-Hub-Signature-256"), body); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid webhook signature")
+		return
+	}
+	eventName, deliveryID := r.Header.Get("X-GitHub-Event"), r.Header.Get("X-GitHub-Delivery")
+	if !githubscm.ValidateHeader(eventName, githubscm.EventHeaderMax) || !githubscm.ValidateHeader(deliveryID, githubscm.DeliveryHeaderMax) {
+		writeError(w, http.StatusBadRequest, "invalid GitHub webhook headers")
+		return
+	}
+	normalized, err := githubscm.Normalize(eventName, deliveryID, body, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if normalized.Event.RepositoryFullName == "" {
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored"})
+		return
+	}
+	b, ok := s.scmStore()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "SCM repositories unavailable")
+		return
+	}
+	repository, err := b.GetSCMRepositoryByIdentity(r.Context(), scm.GitHub, normalized.Event.RepositoryFullName)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && !repository.Enabled) {
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	digest := sha256.Sum256(body)
+	event := normalized.Event
+	status := scm.DeliveryPending
+	if normalized.Ignored {
+		status = scm.DeliveryIgnored
+	}
+	_, err = b.CreateSCMDelivery(r.Context(), scm.Delivery{
+		Provider: event.Provider, DeliveryID: event.DeliveryID, RepositoryID: repository.ID,
+		EventType: string(event.EventType), Action: event.Action, InstallationID: event.InstallationID,
+		CommitSHA: event.CommitSHA, Ref: event.Ref, PullRequestNumber: event.PullRequestNumber,
+		PullRequestHeadRef: event.PullRequestHeadRef, PullRequestBaseRef: event.PullRequestBaseRef,
+		PayloadSHA256: hex.EncodeToString(digest[:]), Status: status, ReceivedAt: event.ReceivedAt,
+	})
+	if errors.Is(err, store.ErrConflict) {
+		writeError(w, http.StatusConflict, "conflicting webhook delivery")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+type createRepositoryRequest struct {
+	Provider string `json:"provider"`
+	FullName string `json:"full_name"`
+	Pipeline string `json:"pipeline"`
+}
+
+func (s Server) scmStore() (store.SCMStore, bool) {
+	value, ok := s.Store.(store.SCMStore)
+	return value, ok
+}
+
+func (s Server) createRepository(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.scmStore()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "SCM repositories unavailable")
+		return
+	}
+	var req createRepositoryRequest
+	if err := decodeStrictLimit(w, r, &req, repositoryMaxBody); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "repository request too large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Pipeline == "" {
+		req.Pipeline = "forge.yaml"
+	}
+	provider := scm.Provider(req.Provider)
+	if _, err := scm.NormalizeRepository(provider, req.FullName); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := scm.ValidatePipelinePath(req.Pipeline); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	item, err := b.CreateSCMRepository(r.Context(), scm.Repository{Provider: provider, FullName: req.FullName, PipelinePath: req.Pipeline, Enabled: true})
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeError(w, http.StatusConflict, "repository already registered")
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (s Server) listRepositories(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.scmStore()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "SCM repositories unavailable")
+		return
+	}
+	items, err := b.ListSCMRepositories(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	if items == nil {
+		items = []scm.Repository{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"repositories": items})
+}
+
+func (s Server) deleteRepository(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.scmStore()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "SCM repositories unavailable")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/repos/")
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	if err := b.DeleteSCMRepository(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "repository not found")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s Server) cacheList(w http.ResponseWriter, r *http.Request) {
@@ -352,7 +529,10 @@ func (s Server) downloadArtifact(w http.ResponseWriter, r *http.Request, runID, 
 	_, _ = io.CopyN(w, f, item.ArchiveSizeBytes)
 }
 func decodeStrict(w http.ResponseWriter, r *http.Request, target any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	return decodeStrictLimit(w, r, target, maxBody)
+}
+func decodeStrictLimit(w http.ResponseWriter, r *http.Request, target any, limit int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	defer r.Body.Close()
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
