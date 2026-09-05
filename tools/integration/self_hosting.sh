@@ -20,10 +20,10 @@ trap cleanup EXIT INT TERM
 fail() { echo "self-hosting failure: $*" >&2; cat "$root/server/server.log" "$root/runner-a/runner.log" "$root/runner-b/runner.log" 2>/dev/null || true; docker inspect -f 'container={{.State.Status}} exit={{.State.ExitCode}}' "$pg" 2>/dev/null || true; docker logs "$pg" 2>/dev/null || true; exit 1; }
 wait_for_postgres() {
   for n in $(seq 1 300); do
-    docker logs "$pg" 2>&1 | grep -Fq 'PostgreSQL init process complete; ready for start up.' && break
+    docker logs "$pg" 2>&1 | grep -F 'PostgreSQL init process complete; ready for start up.' >/dev/null && break
     sleep .2
   done
-  docker logs "$pg" 2>&1 | grep -Fq 'PostgreSQL init process complete; ready for start up.' || return 1
+  docker logs "$pg" 2>&1 | grep -F 'PostgreSQL init process complete; ready for start up.' >/dev/null || return 1
   for n in $(seq 1 300); do
     [[ $(docker inspect -f '{{.State.Running}}' "$pg" 2>/dev/null || true) = true ]] &&
       [[ $(docker exec "$pg" psql -U postgres -d forgeci -At -c 'SELECT 1' 2>/dev/null || true) = 1 ]] && return 0
