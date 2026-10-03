@@ -2,6 +2,8 @@
 
 **A self-hosted distributed CI engine built from scratch in Go.**
 
+[Project showcase](https://nhatminh06.github.io/forgeci/) · [Demo guide](docs/demo.md) · [Architecture](docs/architecture.md) · [Self-hosting](docs/self-hosting.md)
+
 ForgeCI explores the systems behind modern CI platforms: DAG scheduling, remote execution, durable state, job leases, immutable source transport, artifacts, caching, live logs, failure recovery, native GitHub integration, and self-hosting.
 
 Rather than wrapping an existing CI service, ForgeCI implements its own control plane, runner protocol, persistence model, source transport, and execution lifecycle.

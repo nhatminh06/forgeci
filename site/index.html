@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ForgeCI — distributed CI engine built in Go</title>
+  <meta name="description" content="ForgeCI is a self-hosted distributed CI engine built from scratch in Go, with durable scheduling, exact-revision execution, remote runners, and evidence-backed correctness properties.">
+  <meta name="theme-color" content="#f3f5f7">
+  <link rel="canonical" href="https://nhatminh06.github.io/forgeci/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://nhatminh06.github.io/forgeci/">
+  <meta property="og:title" content="ForgeCI — distributed CI engine built in Go">
+  <meta property="og:description" content="A CI execution ledger and technical dossier for ForgeCI's distributed control plane, immutable source transport, and correctness proofs.">
+  <meta property="og:image" content="https://nhatminh06.github.io/forgeci/assets/architecture.png">
+  <meta property="og:image:alt" content="ForgeCI system architecture diagram">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="masthead" id="top">
+    <div class="frame masthead-row">
+      <a class="wordmark" href="#top" aria-label="ForgeCI home"><span aria-hidden="true">F/CI</span> ForgeCI</a>
+      <nav aria-label="Primary navigation">
+        <a href="#pipeline">Pipeline</a>
+        <a href="#ledger">Evidence</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#demo">Demo</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="intro ruled-section" aria-labelledby="intro-title">
+      <div class="frame intro-grid">
+        <div>
+          <p class="kicker">Distributed CI / Go / self-hosted</p>
+          <h1 id="intro-title">ForgeCI is a distributed CI engine built from scratch in Go.</h1>
+          <p class="summary">It parses repository-local DAGs, persists orchestration in PostgreSQL, leases work to remote runners, transports immutable source, and reports results back to GitHub.</p>
+          <p class="capability-line">DAG scheduling <span>·</span> remote execution <span>·</span> durable leases <span>·</span> immutable source <span>·</span> artifacts and cache <span>·</span> GitHub-native SCM</p>
+          <div class="actions">
+            <a class="primary-action" href="https://github.com/nhatminh06/forgeci">Repository</a>
+            <a href="#architecture">Architecture</a>
+            <a href="https://github.com/nhatminh06/forgeci/blob/main/docs/demo.md">Demo guide</a>
+          </div>
+        </div>
+
+        <aside class="system-register" aria-labelledby="register-title">
+          <div class="panel-heading"><span>System register</span><span>Implemented</span></div>
+          <h2 id="register-title">Control plane</h2>
+          <dl>
+            <div><dt>trigger</dt><dd>signed GitHub webhook</dd></div>
+            <div><dt>source</dt><dd>exact event revision</dd></div>
+            <div><dt>state</dt><dd>PostgreSQL</dd></div>
+            <div><dt>execution</dt><dd>distributed runners</dd></div>
+            <div><dt>transport</dt><dd>immutable snapshot</dd></div>
+            <div><dt>status</dt><dd>GitHub Check</dd></div>
+          </dl>
+          <p>This is a system summary, not live service status.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="ruled-section" id="pipeline" aria-labelledby="pipeline-title">
+      <div class="frame section-grid">
+        <header class="section-label">
+          <p class="kicker">Execution plan / 01</p>
+          <h2 id="pipeline-title">ForgeCI self-hosting pipeline</h2>
+          <p>The repository's real <a href="https://github.com/nhatminh06/forgeci/blob/main/forge.yaml"><code>forge.yaml</code></a> fans independent validation work across the DAG, then publishes binaries for local and Docker smoke tests.</p>
+        </header>
+        <div class="blueprint-scroll" tabindex="0" aria-label="Pipeline diagram; scroll horizontally if needed">
+          <div class="pipeline-blueprint" role="img" aria-label="Format, vet, and unit jobs begin independently. Unit leads to race. Format, vet, and unit feed build. Build feeds binary-smoke and docker-smoke.">
+            <div class="lane-label">VALIDATE</div><div class="lane-label">ASSEMBLE</div><div class="lane-label">VERIFY</div>
+            <div class="job job-format"><span>01</span><strong>format</strong><small>root job</small></div>
+            <div class="job job-vet"><span>02</span><strong>vet</strong><small>root job</small></div>
+            <div class="job job-unit"><span>03</span><strong>unit</strong><small>cache restore/save</small></div>
+            <div class="job job-race"><span>04</span><strong>race</strong><small>needs unit</small></div>
+            <div class="connector c-format" aria-hidden="true"></div>
+            <div class="connector c-vet" aria-hidden="true"></div>
+            <div class="connector c-unit" aria-hidden="true"></div>
+            <div class="job job-build"><span>05</span><strong>build</strong><small>needs format, vet, unit</small></div>
+            <div class="connector c-output" aria-hidden="true"></div>
+            <div class="job job-binary"><span>06</span><strong>binary-smoke</strong><small>restores self-binaries</small></div>
+            <div class="job job-docker"><span>07</span><strong>docker-smoke</strong><small>Alpine container</small></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="ruled-section dark-section" aria-labelledby="flow-title">
+      <div class="frame">
+        <header class="wide-heading">
+          <div><p class="kicker">Native SCM / 02</p><h2 id="flow-title">One event revision, carried end to end.</h2></div>
+          <p>GitHub-specific authentication and status reporting stay at the boundary. The scheduler and runner protocol operate on provider-neutral runs, jobs, snapshots, and leases.</p>
+        </header>
+        <ol class="system-flow">
+          <li><span>01</span><strong>GitHub push / PR</strong></li>
+          <li><span>02</span><strong>Signed webhook</strong></li>
+          <li><span>03</span><strong>Durable delivery</strong></li>
+          <li><span>04</span><strong>Exact event revision</strong></li>
+          <li><span>05</span><strong>Immutable snapshot</strong></li>
+          <li><span>06</span><strong>DAG scheduling</strong></li>
+          <li><span>07</span><strong>Remote runners</strong></li>
+          <li><span>08</span><strong>Artifacts / cache / logs</strong></li>
+          <li><span>09</span><strong>GitHub Check</strong></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="ruled-section" id="ledger" aria-labelledby="ledger-title">
+      <div class="frame">
+        <header class="wide-heading">
+          <div><p class="kicker">Correctness ledger / 03</p><h2 id="ledger-title">Claims have repository evidence.</h2></div>
+          <p>The ledger points to executable tests, mutation checks, and integration harnesses—not a feature list standing in for proof.</p>
+        </header>
+        <div class="ledger" role="list">
+          <article role="listitem">
+            <div class="ledger-id">P-01</div><div><h3>Exact revision execution</h3><p>If an event references commit A and its branch advances to B, ForgeCI still executes A.</p></div>
+            <div><span class="field">Mechanism</span><p>Exact SHA fetch, detached checkout, SHA verification, immutable snapshot.</p></div>
+            <div class="evidence"><span class="field">Evidence</span><a href="https://github.com/nhatminh06/forgeci/blob/main/internal/scm/git/materialize_test.go">Materialization tests</a><a href="https://github.com/nhatminh06/forgeci/blob/main/tools/integration/m12_mutations.sh">Mutation D/E</a></div>
+          </article>
+          <article role="listitem">
+            <div class="ledger-id">P-02</div><div><h3>Fenced work ownership</h3><p>A stale runner cannot complete work after lease ownership has moved.</p></div>
+            <div><span class="field">Mechanism</span><p>PostgreSQL lease identity, expiry, and runner-matched renewal and completion.</p></div>
+            <div class="evidence"><span class="field">Evidence</span><a href="https://github.com/nhatminh06/forgeci/blob/main/docs/remote-runners.md#lease-and-security-model">Runner lease contract</a><a href="https://github.com/nhatminh06/forgeci/blob/main/internal/store/postgres/postgres_integration_test.go">Lease ownership tests</a></div>
+          </article>
+          <article role="listitem">
+            <div class="ledger-id">P-03</div><div><h3>One delivery → at most one run</h3><p>Retrying the same accepted delivery does not create another pipeline run.</p></div>
+            <div><span class="field">Mechanism</span><p>Run, snapshot association, jobs, dependencies, and SCM trigger persist in one transaction.</p></div>
+            <div class="evidence"><span class="field">Evidence</span><a href="https://github.com/nhatminh06/forgeci/blob/main/internal/store/postgres/scm_triggers.go">Transactional trigger store</a><a href="https://github.com/nhatminh06/forgeci/blob/main/tools/integration/m12_mutations.sh">Mutation I</a></div>
+          </article>
+          <article role="listitem">
+            <div class="ledger-id">P-04</div><div><h3>Cross-runner artifacts</h3><p>A downstream job restores declared output without relying on a shared mutable workspace.</p></div>
+            <div><span class="field">Mechanism</span><p>Durable content-addressed artifact storage with explicit publication and restoration.</p></div>
+            <div class="evidence"><span class="field">Evidence</span><a href="https://github.com/nhatminh06/forgeci/blob/main/tools/integration/self_hosting.sh">Self-hosting harness</a><a href="https://github.com/nhatminh06/forgeci/blob/main/internal/artifact/artifact_test.go">Artifact tests</a></div>
+          </article>
+          <article role="listitem">
+            <div class="ledger-id">P-05</div><div><h3>Durable external status</h3><p>A lost create response or restart does not orphan the desired GitHub Check state.</p></div>
+            <div><span class="field">Mechanism</span><p>Persistent desired state and bounded reconciliation using a deterministic external ID.</p></div>
+            <div class="evidence"><span class="field">Evidence</span><a href="https://github.com/nhatminh06/forgeci/blob/main/internal/scm/github/checks_test.go">Check reconciliation tests</a><a href="https://github.com/nhatminh06/forgeci/blob/main/tools/integration/m12_mutations.sh">Mutation K</a></div>
+          </article>
+          <article role="listitem">
+            <div class="ledger-id">P-06</div><div><h3>ForgeCI runs ForgeCI</h3><p>The real project DAG executes through PostgreSQL, the server, and two remote runner processes.</p></div>
+            <div><span class="field">Mechanism</span><p>Isolated committed source, two submissions, artifact retrieval, cache reuse, and failure fixture.</p></div>
+            <div class="evidence"><span class="field">Evidence</span><a href="https://github.com/nhatminh06/forgeci/blob/main/docs/self-hosting.md">Self-hosting contract</a><a href="https://github.com/nhatminh06/forgeci/blob/main/tools/integration/self_hosting.sh">Executable proof</a></div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="ruled-section architecture-section" id="architecture" aria-labelledby="architecture-title">
+      <div class="frame">
+        <header class="wide-heading">
+          <div><p class="kicker">System blueprint / 04</p><h2 id="architecture-title">Provider boundary above, durable execution below.</h2></div>
+          <div class="boundary-map" aria-label="Architecture layers"><span>SCM / triggers</span><i>↓</i><span>control plane + PostgreSQL</span><i>↓</i><span>fenced job leases</span><i>↓</i><span>remote runners</span><i>↓</i><span>source / artifacts / cache / logs</span></div>
+        </header>
+        <figure class="architecture-figure">
+          <img src="assets/architecture.png" alt="ForgeCI architecture showing the CLI and GitHub SCM entering the control plane, PostgreSQL durable state, content-addressed storage, and remote runners">
+          <figcaption>The canonical diagram is copied from the repository root when the Pages artifact is assembled. <a href="https://github.com/nhatminh06/forgeci/blob/main/docs/architecture.md">Read the architecture notes.</a></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="ruled-section" aria-labelledby="dogfood-title">
+      <div class="frame dogfood-grid">
+        <header class="section-label"><p class="kicker">Dogfood boundary / 05</p><h2 id="dogfood-title">ForgeCI runs ForgeCI.</h2><p>GitHub Actions supplies the outer host. ForgeCI itself captures source, parses <code>forge.yaml</code>, schedules the DAG, distributes jobs, stores outputs, and determines the result.</p></header>
+        <div class="host-boundary">
+          <div class="host"><span>Bootstrap host</span><strong>GitHub Actions</strong><small>provides Linux + Docker</small></div>
+          <div class="down" aria-hidden="true">↓</div>
+          <div class="forge-stack">
+            <span>ForgeCI execution boundary</span>
+            <div><strong>PostgreSQL</strong><strong>ForgeCI server</strong><strong>Runner A</strong><strong>Runner B</strong></div>
+            <p><code>forge.yaml</code> → seven jobs → evaluated result</p>
+          </div>
+          <div class="reference-row"><a href="https://github.com/nhatminh06/forgeci/blob/main/forge.yaml">Pipeline</a><a href="https://github.com/nhatminh06/forgeci/blob/main/docs/self-hosting.md">Contract</a><a href="https://github.com/nhatminh06/forgeci/blob/main/tools/integration/self_hosting.sh">Harness</a></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="ruled-section dark-section" id="demo" aria-labelledby="demo-title">
+      <div class="frame demo-grid">
+        <header class="section-label"><p class="kicker">Demo run sheet / 06</p><h2 id="demo-title">A reproducible walkthrough, not a simulated dashboard.</h2><p>The current proof is the repository's self-hosting harness. The guide separates what can be demonstrated now from a future, more interactive demo harness.</p><a class="inline-action" href="https://github.com/nhatminh06/forgeci/blob/main/docs/demo.md">Open the deterministic demo guide →</a></header>
+        <ol class="run-sheet">
+          <li><span>01 / Trigger</span><div><strong>Submit the real pipeline</strong><p>Use committed source and the root <code>forge.yaml</code>.</p></div></li>
+          <li><span>02 / Distribute</span><div><strong>Claim eligible jobs</strong><p>Two real runner processes execute independent work.</p></div></li>
+          <li><span>03 / Transport</span><div><strong>Move immutable inputs</strong><p>Source snapshots and explicit artifacts cross runner boundaries.</p></div></li>
+          <li><span>04 / Observe</span><div><strong>Read durable state</strong><p>Inspect job placement, stored logs, and run result.</p></div></li>
+          <li><span>05 / Prove</span><div><strong>Check correctness</strong><p>Compare source digests, cache access, and failure propagation.</p></div></li>
+          <li><span>06 / Report</span><div><strong>Trace the SCM path</strong><p>Finish with exact revision and GitHub Check reconciliation evidence.</p></div></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="ruled-section boundaries" aria-labelledby="boundaries-title">
+      <div class="frame wide-heading">
+        <div><p class="kicker">Design boundaries / 07</p><h2 id="boundaries-title">Deliberate non-goals.</h2></div>
+        <ul>
+          <li>Kubernetes runner scheduling</li><li>Autoscaling</li><li>GPU scheduling</li><li>Runner labels / selectors</li><li>Automatic reassignment after runner loss</li><li>General pipeline secrets</li><li>RBAC / multi-tenancy</li><li>Highly available control plane</li><li>Hostile-code isolation</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="frame footer-row"><span>ForgeCI</span><div><a href="https://github.com/nhatminh06/forgeci">Repository</a><a href="https://github.com/nhatminh06">GitHub profile</a></div></div>
+  </footer>
+</body>
+</html>
