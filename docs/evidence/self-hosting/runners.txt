@@ -1,0 +1,3 @@
+NAME	STATUS	OS	ARCH	DOCKER	ACTIVE	CAPACITY
+runner-a	ONLINE	linux	amd64	yes	0	1
+runner-b	ONLINE	linux	amd64	yes	0	1

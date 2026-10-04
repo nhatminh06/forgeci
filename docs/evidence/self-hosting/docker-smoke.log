@@ -1,0 +1,3 @@
+$ test -f docker-input/dist/build-marker.txt && printf 'forgeci-docker-smoke-stdout\n' && printf 'forgeci-docker-smoke-stderr\n' >&2
+forgeci-docker-smoke-stderr
+forgeci-docker-smoke-stdout

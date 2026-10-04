@@ -6,6 +6,7 @@ on:
     paths:
       - "site/**"
       - "architecture.png"
+      - "docs/evidence/self-hosting/summary.json"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -28,7 +29,9 @@ jobs:
       - name: Prepare static site
         run: |
           mkdir -p site/assets
+          mkdir -p site/data
           cp architecture.png site/assets/architecture.png
+          cp docs/evidence/self-hosting/summary.json site/data/self-hosting.json
 
       - name: Configure Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "capture_kind": "self-hosting",
+  "forgeci_commit": "6ded573ea42a49a0b16d727b0381ae73c46e105b",
+  "run_id": "a668a682-b6c0-40a6-8152-bbe3dca0e9c4",
+  "second_run_id": "273b22ec-13d1-4897-8ca9-0e0ad70b2347",
+  "failure_run_id": "718774c4-a5ca-44bd-9e73-9cea2fd1b99c",
+  "source_digest": "0f7d6ab9c6f9cee8b76ae3a0c074decf01199c5769964831a8040ea7e96e3cdc",
+  "status": "PASSED",
+  "runners": [
+    "runner-a",
+    "runner-b"
+  ],
+  "jobs": [
+    {
+      "name": "binary-smoke",
+      "state": "PASSED",
+      "runner": "runner-a"
+    },
+    {
+      "name": "build",
+      "state": "PASSED",
+      "runner": "runner-b"
+    },
+    {
+      "name": "docker-smoke",
+      "state": "PASSED",
+      "runner": "runner-b"
+    },
+    {
+      "name": "format",
+      "state": "PASSED",
+      "runner": "runner-b"
+    },
+    {
+      "name": "race",
+      "state": "PASSED",
+      "runner": "runner-a"
+    },
+    {
+      "name": "unit",
+      "state": "PASSED",
+      "runner": "runner-a"
+    },
+    {
+      "name": "vet",
+      "state": "PASSED",
+      "runner": "runner-b"
+    }
+  ],
+  "artifact": {
+    "name": "self-binaries",
+    "verified": true,
+    "assertion": "downloaded archive contained forge, forge-server, forge-runner, and build-marker.txt"
+  },
+  "cache": {
+    "key": "forgeci-self-unit-gocache-v1",
+    "reused": true,
+    "assertion": "unchanged source digest and advancing cache access metadata across two runs"
+  },
+  "logs": {
+    "job": "docker-smoke",
+    "stdout_marker": "forgeci-docker-smoke-stdout",
+    "stderr_marker": "forgeci-docker-smoke-stderr",
+    "verified": true
+  },
+  "failure": {
+    "independent_pass": "PASSED",
+    "intentional_fail": "FAILED",
+    "blocked_dependent": "BLOCKED",
+    "log_marker": "forgeci-intentional-failure"
+  }
+}

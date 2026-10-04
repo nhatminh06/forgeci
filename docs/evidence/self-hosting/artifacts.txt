@@ -1,0 +1,2 @@
+JOB	NAME	SIZE	STATUS	EXPIRES
+build	self-binaries	24591524	available	2026-10-11T00:04:16Z

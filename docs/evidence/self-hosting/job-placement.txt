@@ -1,0 +1,8 @@
+JOB	RUNNER
+binary-smoke	runner-a
+build	runner-b
+docker-smoke	runner-b
+format	runner-b
+race	runner-a
+unit	runner-a
+vet	runner-b

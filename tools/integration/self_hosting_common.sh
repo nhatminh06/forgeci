@@ -118,8 +118,19 @@ forgeci_self_start() {
 }
 
 forgeci_self_stop() {
-  local pid
+  local pid attempt alive
   for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done
+  for attempt in $(seq 1 50); do
+    alive=0
+    for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do
+      [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null || alive=1
+    done
+    [[ "$alive" -eq 0 ]] && break
+    sleep .1
+  done
+  for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do
+    [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  done
   for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true; done
   [[ -z ${FORGECI_SELF_PG:-} ]] || docker rm -f "$FORGECI_SELF_PG" >/dev/null 2>&1 || true
 }

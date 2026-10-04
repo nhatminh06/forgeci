@@ -1,0 +1,15 @@
+Run
+ID: 718774c4-a5ca-44bd-9e73-9cea2fd1b99c
+Status: FAILED
+Pipeline: tools/integration/fixtures/self_host_failure.yaml
+Created: 2026-10-04T00:04:54Z
+Pipeline SHA-256: 353c017bc0eca5078946fe60a88828f6f543ffb3549acf4c6afb295c5bd865e6
+Source snapshot SHA-256: 0f7d6ab9c6f9cee8b76ae3a0c074decf01199c5769964831a8040ea7e96e3cdc
+Started: 2026-10-04T00:04:54Z
+Finished: 2026-10-04T00:04:54Z
+
+Jobs
+NAME	STATUS	RUNNER
+blocked-dependent	BLOCKED	-
+independent-pass	PASSED	c2c8687b-69a7-4342-8658-21d75ba429e4
+intentional-fail	FAILED	9f8c3ee4-295c-4b45-9b81-180d602d3460
