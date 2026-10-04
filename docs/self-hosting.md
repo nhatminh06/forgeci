@@ -26,6 +26,18 @@ Run the same proof locally:
 
     ./tools/integration/self_hosting.sh
 
+For a presentation environment that remains available for inspection, use:
+
+    ./tools/demo/run.sh
+    ./tools/demo/status.sh
+    ./tools/demo/capture.sh
+    ./tools/demo/stop.sh
+
+The integration gate and interactive demo share the same lifecycle library and
+proof driver. The demo is a persistent presentation wrapper, not a separate
+self-hosting implementation. See [demo.md](demo.md) for the walkthrough and
+safe evidence-capture flow.
+
 Direct forge run is useful for local execution but does not prove PostgreSQL,
 source transport, remote runner leases, durable logs, or cross-runner
 artifact/cache paths.

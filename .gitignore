@@ -3,3 +3,4 @@
 *.out
 .forgeci-cache/
 dist/
+.forgeci-demo/
