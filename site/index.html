@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ForgeCI — distributed CI engine built in Go</title>
+  <title>ForgeCI: distributed CI engine built in Go</title>
   <meta name="description" content="ForgeCI is a self-hosted distributed CI engine built from scratch in Go, with durable scheduling, exact-revision execution, remote runners, and evidence-backed correctness properties.">
   <meta name="theme-color" content="#f3f5f7">
   <link rel="canonical" href="https://nhatminh06.github.io/forgeci/">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://nhatminh06.github.io/forgeci/">
-  <meta property="og:title" content="ForgeCI — distributed CI engine built in Go">
+  <meta property="og:title" content="ForgeCI: distributed CI engine built in Go">
   <meta property="og:description" content="A CI execution ledger and technical dossier for ForgeCI's distributed control plane, immutable source transport, and correctness proofs.">
   <meta property="og:image" content="https://nhatminh06.github.io/forgeci/assets/architecture.png">
   <meta property="og:image:alt" content="ForgeCI system architecture diagram">
@@ -92,7 +92,7 @@
     <section class="ruled-section dark-section" aria-labelledby="flow-title">
       <div class="frame">
         <header class="wide-heading">
-          <div><p class="kicker">Native SCM / 02</p><h2 id="flow-title">One event revision, carried end to end.</h2></div>
+          <div><p class="kicker">Native SCM / 02</p><h2 id="flow-title">Native GitHub event flow</h2></div>
           <p>GitHub-specific authentication and status reporting stay at the boundary. The scheduler and runner protocol operate on provider-neutral runs, jobs, snapshots, and leases.</p>
         </header>
         <ol class="system-flow">
@@ -112,8 +112,8 @@
     <section class="ruled-section" id="ledger" aria-labelledby="ledger-title">
       <div class="frame">
         <header class="wide-heading">
-          <div><p class="kicker">Correctness ledger / 03</p><h2 id="ledger-title">Claims have repository evidence.</h2></div>
-          <p>The ledger points to executable tests, mutation checks, and integration harnesses—not a feature list standing in for proof.</p>
+          <div><p class="kicker">Correctness ledger / 03</p><h2 id="ledger-title">Correctness claims and evidence</h2></div>
+          <p>Each claim links to executable tests, mutation checks, or integration harnesses.</p>
         </header>
         <div class="ledger" role="list">
           <article role="listitem">
@@ -153,12 +153,12 @@
     <section class="ruled-section architecture-section" id="architecture" aria-labelledby="architecture-title">
       <div class="frame">
         <header class="wide-heading">
-          <div><p class="kicker">System blueprint / 04</p><h2 id="architecture-title">Provider boundary above, durable execution below.</h2></div>
+          <div><p class="kicker">System blueprint / 04</p><h2 id="architecture-title">Control-plane and runner boundaries</h2></div>
           <div class="boundary-map" aria-label="Architecture layers"><span>SCM / triggers</span><i>↓</i><span>control plane + PostgreSQL</span><i>↓</i><span>fenced job leases</span><i>↓</i><span>remote runners</span><i>↓</i><span>source / artifacts / cache / logs</span></div>
         </header>
         <figure class="architecture-figure">
           <img src="assets/architecture.png" alt="ForgeCI architecture showing the CLI and GitHub SCM entering the control plane, PostgreSQL durable state, content-addressed storage, and remote runners">
-          <figcaption>The canonical diagram is copied from the repository root when the Pages artifact is assembled. <a href="https://github.com/nhatminh06/forgeci/blob/main/docs/architecture.md">Read the architecture notes.</a></figcaption>
+          <figcaption>The diagram is copied from the repository root when the Pages artifact is assembled. <a href="https://github.com/nhatminh06/forgeci/blob/main/docs/architecture.md">Read the architecture notes.</a></figcaption>
         </figure>
       </div>
     </section>
@@ -166,10 +166,10 @@
     <section class="ruled-section capture-section" id="capture" aria-labelledby="capture-title">
       <div class="frame">
         <header class="wide-heading">
-          <div><p class="kicker">Captured self-hosting run / 05</p><h2 id="capture-title">One committed run, preserved as evidence.</h2></div>
+          <div><p class="kicker">Captured self-hosting run / 05</p><h2 id="capture-title">Captured self-hosting run</h2></div>
           <p>This is a static capture produced by the shared self-hosting proof driver. It is not live status. Every value below is loaded from the committed evidence summary.</p>
         </header>
-        <div id="captured-evidence" class="captured-evidence" aria-live="polite"><p>Loading committed capture…</p></div>
+        <div id="captured-evidence" class="captured-evidence" aria-live="polite"><p>Loading committed capture...</p></div>
         <noscript><p><a href="https://github.com/nhatminh06/forgeci/tree/main/docs/evidence/self-hosting">Open the committed captured evidence.</a></p></noscript>
         <div class="capture-links"><a href="https://github.com/nhatminh06/forgeci/blob/main/docs/evidence/self-hosting/summary.json">Machine-readable summary</a><a href="https://github.com/nhatminh06/forgeci/tree/main/docs/evidence/self-hosting">Raw evidence set</a><a href="https://github.com/nhatminh06/forgeci/blob/main/tools/integration/self_hosting_proof.sh">Proof driver</a></div>
       </div>
@@ -193,7 +193,7 @@
 
     <section class="ruled-section dark-section" id="demo" aria-labelledby="demo-title">
       <div class="frame demo-grid">
-        <header class="section-label"><p class="kicker">Demo run sheet / 07</p><h2 id="demo-title">A reproducible walkthrough, not a simulated dashboard.</h2><p>One command starts the isolated control plane and leaves it available for real CLI inspection. The same proof driver powers integration testing and evidence capture.</p><a class="inline-action" href="https://github.com/nhatminh06/forgeci/blob/main/docs/demo.md">Open the deterministic demo guide →</a></header>
+        <header class="section-label"><p class="kicker">Demo run sheet / 07</p><h2 id="demo-title">Interactive self-hosting walkthrough</h2><p>One command starts the isolated control plane and leaves it available for CLI inspection. Integration testing and evidence capture use the same proof script.</p><a class="inline-action" href="https://github.com/nhatminh06/forgeci/blob/main/docs/demo.md">Open the demo guide →</a></header>
         <ol class="run-sheet">
           <li><span>01 / Trigger</span><div><strong>Submit the real pipeline</strong><p>Use committed source and the root <code>forge.yaml</code>.</p></div></li>
           <li><span>02 / Distribute</span><div><strong>Claim eligible jobs</strong><p>Two real runner processes execute independent work.</p></div></li>

@@ -70,8 +70,8 @@ that log chunks were persisted and read through the control plane.
 
 ## 5. Capture artifact and cache proof
 
-For the compact, assertion-backed sequence, start with a fresh environment and
-let the shared proof driver perform the canonical runs:
+For the assertion-backed sequence, start with a fresh environment and run the
+shared proof script:
 
 ```bash
 ./tools/demo/stop.sh

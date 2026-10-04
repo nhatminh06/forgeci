@@ -12,7 +12,7 @@ ForgeCI walks with `lstat`, excludes `.git` directories, sorts slash-separated r
 
 Untracked files, `.env`, build output, and vendor trees are included. Sockets, FIFOs, devices, and other special nodes fail capture. Symlinks are never followed; only relative targets whose normalized destination stays inside the source root are accepted.
 
-The canonical JSON manifest plus a newline produces the logical `source_snapshot_sha256`. Absolute paths, ownership, user/group names, and timestamps are excluded. Permission bits—including executable bits—are preserved. Ownership, timestamps, xattrs, and ACLs are normalized or omitted.
+The canonical JSON manifest plus a newline produces the logical `source_snapshot_sha256`. Absolute paths, ownership, user/group names, and timestamps are excluded. Permission bits, including executable bits, are preserved. Ownership, timestamps, xattrs, and ACLs are normalized or omitted.
 
 ## Deterministic archive and CAS
 

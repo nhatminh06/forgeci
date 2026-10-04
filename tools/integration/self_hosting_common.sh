@@ -27,10 +27,16 @@ forgeci_self_prepare() {
   git -C "$FORGECI_SELF_REPO" archive HEAD | tar -x -C "$FORGECI_SELF_ROOT/source"
   local required generated
   for required in forge.yaml go.mod cmd/forge cmd/forge-server cmd/forge-runner tools/integration/fixtures/self_host_failure.yaml; do
-    [[ -e "$FORGECI_SELF_ROOT/source/$required" ]] || { printf 'isolated committed source is missing %s\n' "$required" >&2; return 1; }
+    if [[ ! -e "$FORGECI_SELF_ROOT/source/$required" ]]; then
+      printf 'isolated committed source is missing %s\n' "$required" >&2
+      return 1
+    fi
   done
   for generated in .forgeci-cache dist binary-input docker-input build; do
-    [[ ! -e "$FORGECI_SELF_ROOT/source/$generated" ]] || { printf 'isolated committed source contains generated path %s\n' "$generated" >&2; return 1; }
+    if [[ -e "$FORGECI_SELF_ROOT/source/$generated" ]]; then
+      printf 'isolated committed source contains generated path %s\n' "$generated" >&2
+      return 1
+    fi
   done
   local marker="$FORGECI_SELF_BIN_DIR/.forgeci-demo-commit"
   if [[ ${FORGECI_SELF_REUSE_BINARIES:-0} == 1 ]] &&
@@ -61,7 +67,9 @@ forgeci_self_wait_postgres() {
   local attempt
   for attempt in $(seq 1 300); do
     if [[ $(docker inspect -f '{{.State.Running}}' "$FORGECI_SELF_PG" 2>/dev/null || true) == true ]] &&
-      [[ $(docker exec "$FORGECI_SELF_PG" psql -U postgres -d forgeci -At -c 'SELECT 1' 2>/dev/null || true) == 1 ]]; then return 0; fi
+      [[ $(docker exec "$FORGECI_SELF_PG" psql -U postgres -d forgeci -At -c 'SELECT 1' 2>/dev/null || true) == 1 ]]; then
+      return 0
+    fi
     sleep .2
   done
   return 1
@@ -119,7 +127,9 @@ forgeci_self_start() {
 
 forgeci_self_stop() {
   local pid attempt alive
-  for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done
+  for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do
+    [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
+  done
   for attempt in $(seq 1 50); do
     alive=0
     for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do
@@ -131,13 +141,18 @@ forgeci_self_stop() {
   for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do
     [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
   done
-  for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true; done
+  for pid in "${FORGECI_SELF_RUNNER_A_PID:-}" "${FORGECI_SELF_RUNNER_B_PID:-}" "${FORGECI_SELF_SERVER_PID:-}"; do
+    [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
+  done
   [[ -z ${FORGECI_SELF_PG:-} ]] || docker rm -f "$FORGECI_SELF_PG" >/dev/null 2>&1 || true
 }
 
 forgeci_self_diagnostics() {
-  printf '%s\n' '--- forge-server ---' >&2; sed -n '1,240p' "$FORGECI_SELF_ROOT/server/server.log" >&2 2>/dev/null || true
-  printf '%s\n' '--- runner-a ---' >&2; sed -n '1,240p' "$FORGECI_SELF_ROOT/runner-a/runner.log" >&2 2>/dev/null || true
-  printf '%s\n' '--- runner-b ---' >&2; sed -n '1,240p' "$FORGECI_SELF_ROOT/runner-b/runner.log" >&2 2>/dev/null || true
+  printf '%s\n' '--- forge-server ---' >&2
+  sed -n '1,240p' "$FORGECI_SELF_ROOT/server/server.log" >&2 2>/dev/null || true
+  printf '%s\n' '--- runner-a ---' >&2
+  sed -n '1,240p' "$FORGECI_SELF_ROOT/runner-a/runner.log" >&2 2>/dev/null || true
+  printf '%s\n' '--- runner-b ---' >&2
+  sed -n '1,240p' "$FORGECI_SELF_ROOT/runner-b/runner.log" >&2 2>/dev/null || true
   [[ -z ${FORGECI_SELF_PG:-} ]] || docker inspect -f 'container={{.State.Status}} exit={{.State.ExitCode}}' "$FORGECI_SELF_PG" >&2 2>/dev/null || true
 }

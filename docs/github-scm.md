@@ -63,8 +63,8 @@ ID and the stable name `ForgeCI`.
 
 | ForgeCI | GitHub status | GitHub conclusion |
 | --- | --- | --- |
-| `QUEUED` | `queued` | — |
-| `RUNNING` | `in_progress` | — |
+| `QUEUED` | `queued` | - |
+| `RUNNING` | `in_progress` | - |
 | `PASSED` | `completed` | `success` |
 | `FAILED`, `ERROR` | `completed` | `failure` |
 | `CANCELED`, `ABORTED` | `completed` | `cancelled` |

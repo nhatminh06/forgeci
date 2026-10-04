@@ -668,4 +668,4 @@ pipeline DAG
 
 The goal of the project is not to replace GitHub Actions or other mature CI systems.
 
-It is to understand—and implement—the mechanisms that make a distributed CI system correct when concurrency, crashes, retries, remote workers, source reproducibility, and external SCM state all interact.
+It is to understand and implement the mechanisms that make a distributed CI system correct when concurrency, crashes, retries, remote workers, source reproducibility, and external SCM state all interact.
